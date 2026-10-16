@@ -1,0 +1,28 @@
+name: Sync Upstream
+
+on:
+  schedule:
+    - cron: '0 4 * * *' # 每天凌晨 04:00 自动检查并同步上游
+  workflow_dispatch:     # 支持在 GitHub 页面上一键手动点击触发
+
+jobs:
+  sync:
+    name: Sync with upstream repository
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch upstream
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/grrhuipp/cnode.git || true
+          git fetch upstream main
+          git merge upstream/main -m "chore: auto sync from upstream grrhuipp/cnode" --no-edit || git merge --abort
+          git push origin main || true
+          git push origin main:master || true
