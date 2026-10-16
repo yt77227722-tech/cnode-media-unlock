@@ -19,7 +19,6 @@ cnode 是面向 V2Board 面板的高性能代理节点服务端。项目使用 C
 - 默认按多数据 Worker 运行；各数据 Worker 同构，分别拥有监听和转发资源。Linux 使用 `SO_REUSEPORT`；Windows 使用 `SO_REUSEADDR` 作为允许的降级，不保证相同的连接分布。主线程作为唯一主控 Worker，面板、监控与 DNS 共用一个事件循环；数据 Worker 通过有界入口提交 DNS 请求。
 - 部署脚本 `scripts/cnode.sh` 不带参数时更新默认线上二进制及 `geoip.dat`、`geosite.dat`；数据变化后会重启原本运行中的服务以加载新规则，下载失败保留旧数据。`-variant <name>` 可选择 release 变体，`-debug_file true` 会额外下载匹配的 `.debug` 符号文件。
 - 本仓库已内置**流媒体解锁矩阵**（香港、台湾、美国），支持通过 `-region <hk|tw|us>` 快速自动绑定对应的 outbound、inbound 与 routing 分流规则。
-- 完整架构设计与新建节点标准 SOP 请参阅 📖 [**渡云模式（Duyun Mode）完整手册**](docs/DUYUN_MODE.md)。
 
 ## 🚀 渡云模式极速开线（两行命令打通新节点）
 
