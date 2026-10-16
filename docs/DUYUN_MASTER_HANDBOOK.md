@@ -202,3 +202,169 @@ netstat -nat | grep ESTABLISHED | wc -l
   `https://raw.githubusercontent.com/yt77227722-tech/cnode-media-unlock/main/scripts/deploy_media_gateway.sh`
 * **全套解锁配置目录**：
   `https://github.com/yt77227722-tech/cnode-media-unlock/tree/main/config`
+
+---
+
+## 九、 从 0 到 1 克隆/新建一套全新“渡云级”系统全流程准备与建站指南（Genesis Blueprint）
+
+如果你打算**完全脱离渡云**，或者**打造一个属于自己的全新加速器品牌（新站点、新域名、独立用户与财务系统）**，直接按照以下六大板块准备与执行即可：
+
+```mermaid
+flowchart TD
+    Prep["第一阶段：采购 5 样基础原料<br>(域名、源站VPS、SMTP邮箱、易支付接口、中转落地机)"] --> Web["第二阶段：部署主控面板系统<br>(XBoard / V2Board 容器化建站)"]
+    Web --> Config["第三阶段：面板全局初始化<br>(配置通信密钥、SMTP邮件、易支付与套餐组)"]
+    Config --> Node["第四阶段：批量部署落地与中转<br>(调用本手册的 deploy_duyun_node.sh 脚本)"]
+    Node --> Test["第五阶段：全链路通车验收<br>(注册发信、支付出单、订阅导入、流媒体解锁)"]
+```
+
+---
+
+### 板块 1：前期必备的 5 样资产与原料清单
+
+在动手安装系统前，必须提前准备好以下 5 项基础资产：
+
+| 资产类别 | 规格与建议选型 | 用途与作用 | 推荐服务商 / 获取途径 |
+| :--- | :--- | :--- | :--- |
+| **1. 业务域名** | 1 个独立顶尖域名（如 `.com`、`.top`、`.net`） | 用户访问的前端站点、后台管理与客户端订阅拉取入口 | Namesilo、Cloudflare Registrar（DNS 统一托管到 Cloudflare 免费版） |
+| **2. 面板源站 VPS** | **2核 4G 内存**，系统推荐 Ubuntu 22.04 LTS 或 Debian 12 | 托管业务网站、用户数据库（MariaDB）、Redis 快取与异步任务队列 | 搬瓦工、DMIT、OVH、RackNerd 等海外高防/稳定机房（每月约 \$5 ~ \$15） |
+| **3. 发信 SMTP 服务** | 支持标准 SMTP 协议的发信账号 | 用户注册验证码、找回密码、到期续费提醒、工单通知 | • **阿里云国际/国内邮件推送 (DirectMail)**：便宜好用<br>• **AWS SES**：性价比极高（\$0.10/千封）<br>• **Resend / Brevo**：轻量快捷 |
+| **4. 在线支付网关** | 兼容 **易支付（EPay 协议）** 的聚合接口或 USDT 免签 | 用户在线扫码购买套餐（支付宝 / 微信 / USDT）并自动实时开通激活 | • 国内/海外聚合易支付商户（提供 API 网关、商户 ID 与 KEY）<br>• **Epusdt**（开源自建 TRC20 USDT 自动收款） |
+| **5. 中转与落地 VPS** | • **中转 VPS**：1~2 台（AWS EC2 东京/新加坡，或国内优质移动/BGP 转发机）<br>• **落地 VPS**：按需采购（香港、台湾、日本、美国等，至少备 1~2 台） | • 中转负责入口加速与保护真实 IP<br>• 落地负责提供真实出站流量与流媒体解锁 | 各大 VPS 商家（落地机可买超便宜 NAT 机；中转机看重对大陆直连延迟） |
+
+---
+
+### 板块 2：源站主控面板（XBoard / V2Board）一键部署 SOP
+
+在新买的**面板源站 VPS** 上执行以下标准化建站流程（以现代标准容器化 XBoard 为例）：
+
+#### 1. 安装基础依赖与 Docker
+```bash
+# 更新系统并安装 Docker 环境
+curl -fsSL https://get.docker.com | bash
+systemctl enable --now docker
+apt-get install -y curl git jq docker-compose-plugin
+```
+
+#### 2. 一键创建 XBoard 容器栈目录
+```bash
+mkdir -p /opt/xboard && cd /opt/xboard
+
+# 编写 docker-compose.yml 配置文件
+cat > docker-compose.yml <<EOF
+version: '3.8'
+
+services:
+  web:
+    image: cedar2025/xboard:latest
+    container_name: xboard-web
+    restart: always
+    volumes:
+      - ./.env:/www/.env
+      - ./data:/www/data
+    ports:
+      - "7001:7001"
+    depends_on:
+      - mariadb
+      - redis
+
+  mariadb:
+    image: mariadb:10.11
+    container_name: xboard-mariadb
+    restart: always
+    environment:
+      MYSQL_ROOT_PASSWORD: MyStrongPassword2026!
+      MYSQL_DATABASE: xboard
+      MYSQL_USER: xboard
+      MYSQL_PASSWORD: MyStrongPassword2026!
+    volumes:
+      - ./mariadb_data:/var/lib/mysql
+
+  redis:
+    image: redis:7-alpine
+    container_name: xboard-redis
+    restart: always
+    volumes:
+      - ./redis_data:/data
+EOF
+```
+
+#### 3. 执行初始化与创建管理员
+```bash
+# 启动容器并执行系统初始化安装向导
+docker compose up -d
+docker compose exec web php artisan xboard:install
+
+# 根据终端提示输入：
+# - 数据库地址: mariadb
+# - 数据库用户名: xboard
+# - 数据库密码: MyStrongPassword2026!
+# - 管理员邮箱与密码（用于登录后台）
+```
+
+#### 4. 配置 Nginx 反向代理与 SSL 证书
+在 Cloudflare 将你的域名解析到该源站 VPS IP（开启小黄云 CDN 保护），源站反代 `127.0.0.1:7001` 即可安全交付！
+
+---
+
+### 板块 3：面板核心参数初始化设定（关键 4 步）
+
+登录新网站管理后台（`https://你的域名/admin`），进行核心参数设定：
+
+1. **设置全局节点通讯密钥（`Server Token / API Key`）**：
+   * 路径：【系统配置】 ➔ 【节点与协议配置】 ➔ 【通讯密钥】；
+   * 自定义一串高强度随机密钥（例如 `MySuperKey2026Secret999`）；
+   * **作用**：后续所有落地机连接该面板时，全部使用这个统一密钥！
+2. **配置 SMTP 发信邮箱**：
+   * 路径：【系统配置】 ➔ 【邮件配置】；
+   * 填入发信服务器、端口（通常 465 SSL 或 587 TLS）、账号与密码，点击【发送测试邮件】验证成功。
+3. **配置易支付通道**：
+   * 路径：【系统配置】 ➔ 【支付配置】 ➔ 【新增支付方式】 ➔ 选择 **EPay 易支付**；
+   * 填入网关地址（如 `https://pay.xxx.com/submit.php`）、商户 ID 与商户通信密钥。
+4. **套餐体系规划（分组隔离）**：
+   * 建立权限组：`Group 1`（基础组）、`Group 2`（高级组）；
+   * 创建商品套餐：
+     * **基础套餐（VIP1）**：绑定 `Group 1`，包含香港、新加坡、美国普通节点；
+     * **旗舰套餐（VIP2）**：绑定 `Group 2`，包含台湾原生家宽、流媒体独享大带宽专线。
+
+---
+
+### 板块 4：批量开通与接入节点（直接调用本手册工具）
+
+新站点建好后，接入节点的步骤**与渡云模式完全一致**，直接使用本手册前面封装好的脚本：
+
+#### 1. 落地机部署：
+登录新买的任意海外落地小鸡，执行：
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/yt77227722-tech/cnode-media-unlock/main/scripts/deploy_duyun_node.sh) \
+  -api_host "https://你的新主站域名.com" \
+  -api_key "你在第3步设定的通讯密钥" \
+  -name "HK-Node-01" \
+  -node_id 1011 \
+  -region hk \
+  -type both
+```
+
+#### 2. 中转机端口转发：
+登录你的中转机（AWS EC2 或其他中转机），执行：
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/yt77227722-tech/cnode-media-unlock/main/scripts/deploy_duyun_relay.sh) \
+  -listen 65011 \
+  -remote <新落地机IP>:55011
+```
+
+#### 3. 面板录入节点：
+* 进入新面板后台 ➔ 【节点管理】 ➔ 【新增节点】；
+* 填入中转机 IP 与中转端口 `65011`，关联后端父节点 ID `1011`，保存即刻通车！
+
+---
+
+### 板块 5：新站全链路交付验收核对表（Checklist）
+
+在正式对外发布前，逐一核对以下 5 项指标：
+
+- [ ] **1. 用户端注册**：前台注册新账号，能准时收到邮件验证码。
+- [ ] **2. 订单与在线支付**：使用测试账号下单一笔，扫码支付后，后台订单秒级自动变为“已完成”，流量套餐自动入账。
+- [ ] **3. 订阅分发正常**：点击【一键导入 Clash / Sing-box / 小火箭】，客户端能正常下载节点配置且不报错。
+- [ ] **4. 代理网络握手成功**：客户端启动代理，访问 `https://ip.sb` 显示为落地机地区 IP，延迟与测速达标。
+- [ ] **5. 流媒体与 AI 解锁通关**：打开 YouTube（正常秒开）、Netflix（能看非自制剧）、巴哈姆特动画疯（台湾节点 200 解锁）、ChatGPT / Claude（正常对话无阻断）。
+
