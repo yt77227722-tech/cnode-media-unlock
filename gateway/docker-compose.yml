@@ -1,0 +1,10 @@
+version: '3.8'
+
+services:
+  media-gateway:
+    image: teddysun/xray:latest
+    container_name: media-gateway
+    restart: always
+    network_mode: host
+    volumes:
+      - ./config.json:/etc/xray/config.json:ro

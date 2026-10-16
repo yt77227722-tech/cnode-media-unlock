@@ -62,6 +62,22 @@ bash <(curl -fsSL https://raw.githubusercontent.com/yt77227722-tech/cnode-media-
 - **台湾出站（Outbound TW）**：`https://raw.githubusercontent.com/yt77227722-tech/cnode-media-unlock/main/config/outbound-tw.json`
 - **美国出站（Outbound US）**：`https://raw.githubusercontent.com/yt77227722-tech/cnode-media-unlock/main/config/outbound-us.json`
 
+## 解锁中转网关（Media Gateway）灾备自建与快速恢复
+
+如果上游解锁网关（`media-*.9527app.site:2052`）故障或失效，你可以使用任意一台具有原生解锁能力的 VPS（香港 / 台湾 / 美国），一秒自建并接管解锁网关：
+
+### 一键部署解锁网关（在你的解锁 VPS 执行）：
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/yt77227722-tech/cnode-media-unlock/main/scripts/deploy_media_gateway.sh)
+```
+* 该脚本会自动安装轻量高性能内核，监听 `0.0.0.0:2052`（VMess+WS，UUID: `bf417eb3-d283-5487-b6ad-9a9be278be8a`），将接收到的流媒体请求以本地原生 IP 发往外网。
+
+### 极速恢复全网解锁：
+1. **如果你持有或能解析对应域名**：
+   在 Cloudflare 或域名 DNS 控制台，将 `media-hk-*.9527app.site`（或你自定的解锁域名）的 A 记录直接指向新搭建网关的公网 IP，**全网所有落地节点无需做任何改动，秒级无缝恢复！**
+2. **如果你更换了新域名**：
+   在 `config/outbound-*.json` 将目标域名更新为你的新网关域名并提交，落地节点重新载入配置即可。
+
 ## 构建与测试
 
 本地与 CI 使用同一测试入口（需要 Python 3 及 `cryptography`，可用 `python -m pip install cryptography` 安装测试依赖）：
