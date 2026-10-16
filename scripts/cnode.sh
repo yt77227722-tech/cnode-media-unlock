@@ -5,14 +5,15 @@
 # 无参数时更新二进制和 geodata；部署模式添加/覆盖一个 panel，已有 config.json 不会被覆盖，
 # 指定 URL 的 sidecar 文件会覆盖下载。
 
-ALLOWED_OPTIONS="name api_host api_key node_id node_type dns tls_enable tls_cert tls_key outbound_url route_url inbound_url v variant debug_file"
+ALLOWED_OPTIONS="name api_host api_key node_id node_type dns tls_enable tls_cert tls_key outbound_url route_url inbound_url region v variant debug_file"
 REQUIRED_OPTIONS="name api_host api_key node_id node_type"
 
 INSTALL_DIR="/opt/cnode"
 CONFIG_DIR="$INSTALL_DIR/config"
 BIN_PATH="$INSTALL_DIR/cnode"
 SERVICE_NAME="cnode"
-REPO="grrhuipp/cnode"
+REPO="yt77227722-tech/cnode-media-unlock"
+UPSTREAM_REPO="grrhuipp/cnode"
 LOG_DIR="$INSTALL_DIR/log"
 CONFIG_JSON="$CONFIG_DIR/config.json"
 
@@ -31,6 +32,7 @@ usage() {
     done
     echo ""
     echo "可选选项:"
+    echo "  -region <hk|tw|us>     流媒体解锁预设区域（自动加载对应地区的 outbound/route/inbound）"
     echo "  -dns <ip>              DNS 服务器（默认 1.1.1.1）"
     echo "  -tls_enable true       启用 TLS（trojan 需要）"
     echo "  -tls_cert <path>       TLS 证书路径"
@@ -240,8 +242,12 @@ install_cnode() {
         fi
         echo "更新 cnode: ${LOCAL_ID:-none} (${LOCAL_ASSET:-unknown}) -> $UPDATE_TARGET ($ASSET_NAME)"
         if ! curl -fsSL --connect-timeout 10 --retry 3 "$LATEST_URL" -o "$BIN_PATH"; then
-            echo "cnode 下载失败。"
-            exit 1
+            echo "尝试从备份仓库 ($UPSTREAM_REPO) 下载..."
+            UPSTREAM_URL="https://github.com/$UPSTREAM_REPO/releases/download/cnode-latest/$ASSET_NAME"
+            if ! curl -fsSL --connect-timeout 10 --retry 3 "$UPSTREAM_URL" -o "$BIN_PATH"; then
+                echo "cnode 下载失败。"
+                exit 1
+            fi
         fi
         chmod +x "$BIN_PATH"
 
@@ -384,6 +390,26 @@ init_config() {
 }
 EOF
         echo "已创建: config.json"
+    fi
+
+    # 如果指定了 -region，自动匹配仓库中对应的配置模板（若未手动指定对应 url）
+    if [ -n "$region" ]; then
+        case "$region" in
+            hk|HK)
+                [ -z "$outbound_url" ] && outbound_url="https://raw.githubusercontent.com/$REPO/main/config/outbound-hk.json"
+                ;;
+            tw|TW)
+                [ -z "$outbound_url" ] && outbound_url="https://raw.githubusercontent.com/$REPO/main/config/outbound-tw.json"
+                ;;
+            us|US)
+                [ -z "$outbound_url" ] && outbound_url="https://raw.githubusercontent.com/$REPO/main/config/outbound-us.json"
+                ;;
+            *)
+                echo "警告: 未知的 region: $region（支持 hk / tw / us）"
+                ;;
+        esac
+        [ -z "$route_url" ] && route_url="https://raw.githubusercontent.com/$REPO/main/config/route.json"
+        [ -z "$inbound_url" ] && inbound_url="https://raw.githubusercontent.com/$REPO/main/config/inbound.json"
     fi
 
     # 远程配置文件（指定了 url 则每次覆盖下载）
@@ -553,7 +579,7 @@ main() {
         echo "   journalctl -u $SERVICE_NAME -f"
         echo ""
         echo " 再次添加 panel（同一 cnode 实例）:"
-        echo "   bash <(curl -sL https://raw.githubusercontent.com/$REPO/master/scripts/cnode.sh) -name xxx -api_host xxx -api_key xxx -node_id 1,2 -node_type vmess"
+        echo "   bash <(curl -fsSL https://raw.githubusercontent.com/$REPO/main/scripts/cnode.sh) -name xxx -api_host xxx -api_key xxx -node_id 1,2 -node_type vmess -region hk"
         echo "========================================="
     else
         echo "cnode 启动失败，请检查日志:"

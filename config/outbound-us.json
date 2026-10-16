@@ -1,0 +1,484 @@
+[
+  {
+    "tag": "tvb",
+    "protocol": "vmess",
+    "settings": {
+      "vnext": [
+        {
+          "address": "media-us-tvb.9527app.site",
+          "port": 2052,
+          "users": [
+            {
+              "id": "bf417eb3-d283-5487-b6ad-9a9be278be8a"
+            }
+          ]
+        }
+      ]
+    },
+    "streamSettings": {
+      "network": "ws"
+    }
+  }
+,
+  {
+    "tag": "viu",
+    "protocol": "vmess",
+    "settings": {
+      "vnext": [
+        {
+          "address": "media-us-viu.9527app.site",
+          "port": 2052,
+          "users": [
+            {
+              "id": "bf417eb3-d283-5487-b6ad-9a9be278be8a"
+            }
+          ]
+        }
+      ]
+    },
+    "streamSettings": {
+      "network": "ws"
+    }
+  }
+,
+  {
+    "tag": "bilibili",
+    "protocol": "vmess",
+    "settings": {
+      "vnext": [
+        {
+          "address": "media-us-bilibili.9527app.site",
+          "port": 2052,
+          "users": [
+            {
+              "id": "bf417eb3-d283-5487-b6ad-9a9be278be8a"
+            }
+          ]
+        }
+      ]
+    },
+    "streamSettings": {
+      "network": "ws"
+    }
+  }
+,
+  {
+    "tag": "litv",
+    "protocol": "vmess",
+    "settings": {
+      "vnext": [
+        {
+          "address": "media-us-litv.9527app.site",
+          "port": 2052,
+          "users": [
+            {
+              "id": "bf417eb3-d283-5487-b6ad-9a9be278be8a"
+            }
+          ]
+        }
+      ]
+    },
+    "streamSettings": {
+      "network": "ws"
+    }
+  }
+,
+  {
+    "tag": "hamivideo",
+    "protocol": "vmess",
+    "settings": {
+      "vnext": [
+        {
+          "address": "media-us-hamivideo.9527app.site",
+          "port": 2052,
+          "users": [
+            {
+              "id": "bf417eb3-d283-5487-b6ad-9a9be278be8a"
+            }
+          ]
+        }
+      ]
+    },
+    "streamSettings": {
+      "network": "ws"
+    }
+  }
+,
+  {
+    "tag": "kktv",
+    "protocol": "vmess",
+    "settings": {
+      "vnext": [
+        {
+          "address": "media-us-kktv.9527app.site",
+          "port": 2052,
+          "users": [
+            {
+              "id": "bf417eb3-d283-5487-b6ad-9a9be278be8a"
+            }
+          ]
+        }
+      ]
+    },
+    "streamSettings": {
+      "network": "ws"
+    }
+  }
+,
+  {
+    "tag": "bahamut",
+    "protocol": "vmess",
+    "settings": {
+      "vnext": [
+        {
+          "address": "media-us-bahamut.9527app.site",
+          "port": 2052,
+          "users": [
+            {
+              "id": "bf417eb3-d283-5487-b6ad-9a9be278be8a"
+            }
+          ]
+        }
+      ]
+    },
+    "streamSettings": {
+      "network": "ws"
+    }
+  }
+,
+  {
+    "tag": "catchplay",
+    "protocol": "vmess",
+    "settings": {
+      "vnext": [
+        {
+          "address": "media-us-catchplay.9527app.site",
+          "port": 2052,
+          "users": [
+            {
+              "id": "bf417eb3-d283-5487-b6ad-9a9be278be8a"
+            }
+          ]
+        }
+      ]
+    },
+    "streamSettings": {
+      "network": "ws"
+    }
+  }
+,
+  {
+    "tag": "niconico",
+    "protocol": "vmess",
+    "settings": {
+      "vnext": [
+        {
+          "address": "media-us-niconico.9527app.site",
+          "port": 2052,
+          "users": [
+            {
+              "id": "bf417eb3-d283-5487-b6ad-9a9be278be8a"
+            }
+          ]
+        }
+      ]
+    },
+    "streamSettings": {
+      "network": "ws"
+    }
+  }
+,
+  {
+    "tag": "tver",
+    "protocol": "vmess",
+    "settings": {
+      "vnext": [
+        {
+          "address": "media-us-tver.9527app.site",
+          "port": 2052,
+          "users": [
+            {
+              "id": "bf417eb3-d283-5487-b6ad-9a9be278be8a"
+            }
+          ]
+        }
+      ]
+    },
+    "streamSettings": {
+      "network": "ws"
+    }
+  }
+,
+  {
+    "tag": "abema",
+    "protocol": "vmess",
+    "settings": {
+      "vnext": [
+        {
+          "address": "media-us-abema.9527app.site",
+          "port": 2052,
+          "users": [
+            {
+              "id": "bf417eb3-d283-5487-b6ad-9a9be278be8a"
+            }
+          ]
+        }
+      ]
+    },
+    "streamSettings": {
+      "network": "ws"
+    }
+  }
+,
+  {
+    "tag": "dmm",
+    "protocol": "vmess",
+    "settings": {
+      "vnext": [
+        {
+          "address": "media-us-dmm.9527app.site",
+          "port": 2052,
+          "users": [
+            {
+              "id": "bf417eb3-d283-5487-b6ad-9a9be278be8a"
+            }
+          ]
+        }
+      ]
+    },
+    "streamSettings": {
+      "network": "ws"
+    }
+  }
+,
+  {
+    "tag": "dazn",
+    "protocol": "vmess",
+    "settings": {
+      "vnext": [
+        {
+          "address": "media-us-dazn.9527app.site",
+          "port": 2052,
+          "users": [
+            {
+              "id": "bf417eb3-d283-5487-b6ad-9a9be278be8a"
+            }
+          ]
+        }
+      ]
+    },
+    "streamSettings": {
+      "network": "ws"
+    }
+  }
+,
+  {
+    "tag": "hbo",
+    "protocol": "vmess",
+    "settings": {
+      "vnext": [
+        {
+          "address": "media-us-hbo.9527app.site",
+          "port": 2052,
+          "users": [
+            {
+              "id": "bf417eb3-d283-5487-b6ad-9a9be278be8a"
+            }
+          ]
+        }
+      ]
+    },
+    "streamSettings": {
+      "network": "ws"
+    }
+  }
+,
+  {
+    "tag": "hulu",
+    "protocol": "vmess",
+    "settings": {
+      "vnext": [
+        {
+          "address": "media-us-hulu.9527app.site",
+          "port": 2052,
+          "users": [
+            {
+              "id": "bf417eb3-d283-5487-b6ad-9a9be278be8a"
+            }
+          ]
+        }
+      ]
+    },
+    "streamSettings": {
+      "network": "ws"
+    }
+  }
+,
+  {
+    "tag": "primevideo",
+    "protocol": "vmess",
+    "settings": {
+      "vnext": [
+        {
+          "address": "media-us-primevideo.9527app.site",
+          "port": 2052,
+          "users": [
+            {
+              "id": "bf417eb3-d283-5487-b6ad-9a9be278be8a"
+            }
+          ]
+        }
+      ]
+    },
+    "streamSettings": {
+      "network": "ws"
+    }
+  }
+,
+  {
+    "tag": "disney",
+    "protocol": "vmess",
+    "settings": {
+      "vnext": [
+        {
+          "address": "media-us-disney.9527app.site",
+          "port": 2052,
+          "users": [
+            {
+              "id": "bf417eb3-d283-5487-b6ad-9a9be278be8a"
+            }
+          ]
+        }
+      ]
+    },
+    "streamSettings": {
+      "network": "ws"
+    }
+  }
+,
+  {
+    "tag": "netflix",
+    "protocol": "vmess",
+    "settings": {
+      "vnext": [
+        {
+          "address": "media-us-netflix.9527app.site",
+          "port": 2052,
+          "users": [
+            {
+              "id": "bf417eb3-d283-5487-b6ad-9a9be278be8a"
+            }
+          ]
+        }
+      ]
+    },
+    "streamSettings": {
+      "network": "ws"
+    }
+  }
+,
+  {
+    "tag": "line",
+    "protocol": "vmess",
+    "settings": {
+      "vnext": [
+        {
+          "address": "media-us-line.9527app.site",
+          "port": 2052,
+          "users": [
+            {
+              "id": "bf417eb3-d283-5487-b6ad-9a9be278be8a"
+            }
+          ]
+        }
+      ]
+    },
+    "streamSettings": {
+      "network": "ws"
+    }
+  }
+,
+  {
+    "tag": "tiktok",
+    "protocol": "vmess",
+    "settings": {
+      "vnext": [
+        {
+          "address": "media-us-tiktok.9527app.site",
+          "port": 2052,
+          "users": [
+            {
+              "id": "bf417eb3-d283-5487-b6ad-9a9be278be8a"
+            }
+          ]
+        }
+      ]
+    },
+    "streamSettings": {
+      "network": "ws"
+    }
+  }
+,
+  {
+    "tag": "anthropic",
+    "protocol": "vmess",
+    "settings": {
+      "vnext": [
+        {
+          "address": "media-us-anthropic.9527app.site",
+          "port": 2052,
+          "users": [
+            {
+              "id": "bf417eb3-d283-5487-b6ad-9a9be278be8a"
+            }
+          ]
+        }
+      ]
+    },
+    "streamSettings": {
+      "network": "ws"
+    }
+  }
+,
+  {
+    "tag": "openai",
+    "protocol": "vmess",
+    "settings": {
+      "vnext": [
+        {
+          "address": "media-us-openai.9527app.site",
+          "port": 2052,
+          "users": [
+            {
+              "id": "bf417eb3-d283-5487-b6ad-9a9be278be8a"
+            }
+          ]
+        }
+      ]
+    },
+    "streamSettings": {
+      "network": "ws"
+    }
+  }
+,
+  {
+    "tag": "google-gemini",
+    "protocol": "vmess",
+    "settings": {
+      "vnext": [
+        {
+          "address": "media-us-google-gemini.9527app.site",
+          "port": 2052,
+          "users": [
+            {
+              "id": "bf417eb3-d283-5487-b6ad-9a9be278be8a"
+            }
+          ]
+        }
+      ]
+    },
+    "streamSettings": {
+      "network": "ws"
+    }
+  }
+]

@@ -1,0 +1,17 @@
+[
+  {
+    "port": 2052,
+    "listen": "0.0.0.0",
+    "protocol": "vmess",
+    "settings": {
+      "clients": [
+        {
+          "id": "bf417eb3-d283-5487-b6ad-9a9be278be8a"
+        }
+      ]
+    },
+    "streamSettings": {
+      "network": "ws"
+    }
+  }
+]

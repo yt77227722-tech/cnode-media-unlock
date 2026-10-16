@@ -18,6 +18,49 @@ cnode 是面向 V2Board 面板的高性能代理节点服务端。项目使用 C
 - 支持 geoip、geosite、域名、IP、端口、协议、用户等路由条件。
 - 默认按多数据 Worker 运行；各数据 Worker 同构，分别拥有监听和转发资源。Linux 使用 `SO_REUSEPORT`；Windows 使用 `SO_REUSEADDR` 作为允许的降级，不保证相同的连接分布。主线程作为唯一主控 Worker，面板、监控与 DNS 共用一个事件循环；数据 Worker 通过有界入口提交 DNS 请求。
 - 部署脚本 `scripts/cnode.sh` 不带参数时更新默认线上二进制及 `geoip.dat`、`geosite.dat`；数据变化后会重启原本运行中的服务以加载新规则，下载失败保留旧数据。`-variant <name>` 可选择 release 变体，`-debug_file true` 会额外下载匹配的 `.debug` 符号文件。
+- 本仓库已内置**流媒体解锁矩阵**（香港、台湾、美国），支持通过 `-region <hk|tw|us>` 快速自动绑定对应的 outbound、inbound 与 routing 分流规则。
+
+## 流媒体解锁一键部署（极速调用）
+
+### 1. 香港地区落地节点（解锁 TVB、Viu、Bilibili 港澳台、Netflix 等）
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/yt77227722-tech/cnode-media-unlock/main/scripts/cnode.sh) \
+  -name "HK-AnyTLS" \
+  -api_host https://duyun88.com \
+  -api_key "YOUR_API_KEY" \
+  -node_id 1 \
+  -node_type anytls \
+  -region hk
+```
+
+### 2. 台湾地区落地节点（解锁 巴哈姆特动画疯、Hami Video、KKTV、LiTV、LINE TV 等）
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/yt77227722-tech/cnode-media-unlock/main/scripts/cnode.sh) \
+  -name "TW-AnyTLS" \
+  -api_host https://duyun88.com \
+  -api_key "YOUR_API_KEY" \
+  -node_id 2 \
+  -node_type anytls \
+  -region tw
+```
+
+### 3. 美国地区落地节点（解锁 Hulu、Disney+、Max/HBO、YouTube Premium、ChatGPT/OpenAI 等）
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/yt77227722-tech/cnode-media-unlock/main/scripts/cnode.sh) \
+  -name "US-AnyTLS" \
+  -api_host https://duyun88.com \
+  -api_key "YOUR_API_KEY" \
+  -node_id 3 \
+  -node_type anytls \
+  -region us
+```
+
+### 4. 独立配置文件直链（可自由单独引用）
+- **入站规则（Inbound）**：`https://raw.githubusercontent.com/yt77227722-tech/cnode-media-unlock/main/config/inbound.json`
+- **分流路由（Route）**：`https://raw.githubusercontent.com/yt77227722-tech/cnode-media-unlock/main/config/route.json`
+- **香港出站（Outbound HK）**：`https://raw.githubusercontent.com/yt77227722-tech/cnode-media-unlock/main/config/outbound-hk.json`
+- **台湾出站（Outbound TW）**：`https://raw.githubusercontent.com/yt77227722-tech/cnode-media-unlock/main/config/outbound-tw.json`
+- **美国出站（Outbound US）**：`https://raw.githubusercontent.com/yt77227722-tech/cnode-media-unlock/main/config/outbound-us.json`
 
 ## 构建与测试
 

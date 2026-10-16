@@ -36,9 +36,12 @@ compile_commands.json
 CTestTestfile.cmake
 _deps/
 
-# Config（忽略实际配置，只保留 .example）
-config/*
-!config/*.example
+# Config（保留解锁配置模板）
+config/*.bak
+config/*.tmp
+
+# Temporary assets
+release-assets/
 
 # Logs and temp
 tmp/

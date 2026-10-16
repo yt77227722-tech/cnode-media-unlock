@@ -1,0 +1,201 @@
+{
+  "domainStrategy": "IPOnDemand",
+  "rules": [
+    {
+      "type": "field",
+      "outboundTag": "m0",
+      "ip": [
+        "10.10.1.100"
+      ]
+    },
+    {
+      "type": "field",
+      "outboundTag": "m1",
+      "ip": [
+        "192.168.31.149"
+      ]
+    },
+    {
+      "type": "field",
+      "outboundTag": "m2",
+      "ip": [
+        "192.168.31.101"
+      ]
+    },
+    {
+      "type": "field",
+      "outboundTag": "m3",
+      "ip": [
+        "15.235.230.250"
+      ]
+    },
+    {
+      "type": "field",
+      "outboundTag": "m4",
+      "ip": [
+        "192.168.31.102"
+      ]
+    },
+    {
+      "type": "field",
+      "outboundTag": "tvb",
+      "domain": [
+        "geosite:tvb"
+      ]
+    },
+    {
+      "type": "field",
+      "outboundTag": "viu",
+      "domain": [
+        "geosite:viu"
+      ]
+    },
+    {
+      "type": "field",
+      "outboundTag": "bilibili",
+      "domain": [
+        "geosite:bilibili"
+      ]
+    },
+    {
+      "type": "field",
+      "outboundTag": "litv",
+      "domain": [
+        "geosite:litv"
+      ]
+    },
+    {
+      "type": "field",
+      "outboundTag": "hamivideo",
+      "domain": [
+        "geosite:hamivideo"
+      ]
+    },
+    {
+      "type": "field",
+      "outboundTag": "kktv",
+      "domain": [
+        "geosite:kktv"
+      ]
+    },
+    {
+      "type": "field",
+      "outboundTag": "bahamut",
+      "domain": [
+        "geosite:bahamut"
+      ]
+    },
+    {
+      "type": "field",
+      "outboundTag": "catchplay",
+      "domain": [
+        "geosite:catchplay"
+      ]
+    },
+    {
+      "type": "field",
+      "outboundTag": "niconico",
+      "domain": [
+        "geosite:niconico"
+      ]
+    },
+    {
+      "type": "field",
+      "outboundTag": "tver",
+      "domain": [
+        "geosite:tver"
+      ]
+    },
+    {
+      "type": "field",
+      "outboundTag": "abema",
+      "domain": [
+        "geosite:abema"
+      ]
+    },
+    {
+      "type": "field",
+      "outboundTag": "dmm",
+      "domain": [
+        "geosite:dmm"
+      ]
+    },
+    {
+      "type": "field",
+      "outboundTag": "dazn",
+      "domain": [
+        "geosite:dazn"
+      ]
+    },
+    {
+      "type": "field",
+      "outboundTag": "hbo",
+      "domain": [
+        "geosite:hbo"
+      ]
+    },
+    {
+      "type": "field",
+      "outboundTag": "hulu",
+      "domain": [
+        "geosite:hulu"
+      ]
+    },
+    {
+      "type": "field",
+      "outboundTag": "primevideo",
+      "domain": [
+        "geosite:primevideo"
+      ]
+    },
+    {
+      "type": "field",
+      "outboundTag": "disney",
+      "domain": [
+        "geosite:disney"
+      ]
+    },
+    {
+      "type": "field",
+      "outboundTag": "netflix",
+      "domain": [
+        "geosite:netflix"
+      ]
+    },
+    {
+      "type": "field",
+      "outboundTag": "line",
+      "domain": [
+        "geosite:line"
+      ]
+    },
+    {
+      "type": "field",
+      "outboundTag": "tiktok",
+      "domain": [
+        "geosite:tiktok"
+      ]
+    },
+    {
+      "type": "field",
+      "outboundTag": "anthropic",
+      "domain": [
+        "geosite:anthropic"
+      ]
+    },
+    {
+      "type": "field",
+      "outboundTag": "openai",
+      "domain": [
+        "geosite:openai"
+      ]
+    },
+    {
+      "type": "field",
+      "outboundTag": "google-gemini",
+      "domain": [
+        "geosite:google-gemini"
+      ]
+    }
+  ]
+}
