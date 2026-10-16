@@ -71,12 +71,20 @@ case "$REGION" in
     *)     OUTBOUND_URL="https://raw.githubusercontent.com/$REPO/main/config/outbound-hk.json" ;;
 esac
 
-CNODE_SCRIPT_URL="https://raw.githubusercontent.com/grrhuipp/cnode/master/scripts/cnode.sh"
+CNODE_SCRIPT_URL="https://raw.githubusercontent.com/$REPO/main/scripts/cnode.sh"
+UPSTREAM_CNODE_URL="https://raw.githubusercontent.com/grrhuipp/cnode/master/scripts/cnode.sh"
 
 # 3. 部署节点
+CNODE_RUNNER=$(mktemp /tmp/cnode_deploy.XXXXXX.sh)
+if ! curl -fsSL --connect-timeout 10 --retry 2 "$CNODE_SCRIPT_URL" -o "$CNODE_RUNNER" || [ ! -s "$CNODE_RUNNER" ]; then
+    echo ">> 优先从个人仓库下载失败，自动回退到官方上游脚本..."
+    curl -fsSL --connect-timeout 10 --retry 3 "$UPSTREAM_CNODE_URL" -o "$CNODE_RUNNER"
+fi
+chmod +x "$CNODE_RUNNER"
+
 if [ "$NODE_TYPE" = "anytls" ] || [ "$NODE_TYPE" = "both" ]; then
     echo ">> 正在配置 AnyTLS 协议..."
-    bash <(curl -fsSL "$CNODE_SCRIPT_URL") \
+    bash "$CNODE_RUNNER" \
       -name "dy-anytls-$NAME" \
       -api_host "$API_HOST" \
       -api_key "$API_KEY" \
@@ -90,7 +98,7 @@ fi
 
 if [ "$NODE_TYPE" = "ss" ] || [ "$NODE_TYPE" = "both" ]; then
     echo ">> 正在配置 Shadowsocks 协议..."
-    bash <(curl -fsSL "$CNODE_SCRIPT_URL") \
+    bash "$CNODE_RUNNER" \
       -name "dy-ss-$NAME" \
       -api_host "$API_HOST" \
       -api_key "$API_KEY" \
@@ -100,6 +108,8 @@ if [ "$NODE_TYPE" = "ss" ] || [ "$NODE_TYPE" = "both" ]; then
       -outbound_url "$OUTBOUND_URL" \
       -route_url "$ROUTE_URL"
 fi
+
+rm -f "$CNODE_RUNNER"
 
 systemctl restart cnode.service
 sleep 2
