@@ -332,7 +332,7 @@ const bool kTrojanRegistered = (acpp::proxyman::outbound::RegisterProxy(
         auto read_trojan_server = [&](const acpp::json::object& obj,
                                       acpp::TrojanOutboundConfig& config) {
             config.address = json_string(obj, "address");
-            const auto port = acpp::ReadJsonPort(obj, {"port"});
+            const auto port = acpp::ReadJsonPort(obj, "port");
             if (port.Invalid()) {
                 return false;
             }
@@ -341,12 +341,6 @@ const bool kTrojanRegistered = (acpp::proxyman::outbound::RegisterProxy(
             }
             password = json_string(obj, "password");
             server_name = json_string(obj, "serverName");
-            if (server_name.empty()) {
-                server_name = json_string(obj, "server_name");
-            }
-            if (server_name.empty()) {
-                server_name = json_string(obj, "sni");
-            }
             allow_insecure = json_bool(
                 obj,
                 "allowInsecure",
@@ -397,16 +391,17 @@ const bool kTrojanRegistered = (acpp::proxyman::outbound::RegisterProxy(
             return std::nullopt;
         }
 
-        return acpp::proxyman::outbound::PreparedOutboundCreator{
-            [trojan_config = std::move(trojan_config)](
-                std::string_view tag,
+        return acpp::proxyman::outbound::MakePreparedOutboundCreator<
+            acpp::TrojanOutboundConfig,
+            +[](std::string_view tag,
+                const acpp::TrojanOutboundConfig& cfg_state,
                 acpp::net::io_context& /*io_context*/,
                 acpp::app::dns::DNS& dns,
                 std::chrono::seconds timeout) -> std::unique_ptr<acpp::Outbound> {
-                auto runtime_config = trojan_config;
+                auto runtime_config = cfg_state;
                 runtime_config.timeout = timeout;
                 return std::make_unique<acpp::proxy::trojan::outbound::Handler>(
                     std::string(tag), runtime_config, dns);
-            }};
+            }>(std::move(trojan_config));
     }), true);
 }  // namespace

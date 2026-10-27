@@ -316,10 +316,16 @@ struct Handler::ClientSession {
         logical.CheckWrite();
 
         try {
-            auto scheme_snapshot = padding_state_->scheme;
             const uint32_t this_packet = NextPacketIndex();
-            auto ok = co_await WriteMultiBufferAsFramesWithPadding(
-                *stream, *scheme_snapshot, this_packet, kCmdPSH, sid, std::move(mb));
+            std::expected<void, ErrorCode> ok;
+            if (padding_state_->scheme->RecordFor(this_packet).empty()) {
+                ok = co_await WriteMultiBufferAsFrameBatch(
+                    *stream, kCmdPSH, sid, std::move(mb));
+            } else {
+                auto scheme_snapshot = padding_state_->scheme;
+                ok = co_await WriteMultiBufferAsFramesWithPadding(
+                    *stream, *scheme_snapshot, this_packet, kCmdPSH, sid, std::move(mb));
+            }
             if (!ok) {
                 CloseAll(ok.error());
                 co_return std::unexpected(ok.error());
@@ -353,10 +359,16 @@ struct Handler::ClientSession {
         logical.CheckWrite();
 
         try {
-            auto scheme_snapshot = padding_state_->scheme;
             const uint32_t this_packet = NextPacketIndex();
-            auto ok = co_await WriteBuffersAsFramesWithPadding(
-                *stream, *scheme_snapshot, this_packet, kCmdPSH, sid, buffers);
+            std::expected<void, ErrorCode> ok;
+            if (padding_state_->scheme->RecordFor(this_packet).empty()) {
+                ok = co_await WriteBuffersAsFramesWithPadding(
+                    *stream, *padding_state_->scheme, this_packet, kCmdPSH, sid, buffers);
+            } else {
+                auto scheme_snapshot = padding_state_->scheme;
+                ok = co_await WriteBuffersAsFramesWithPadding(
+                    *stream, *scheme_snapshot, this_packet, kCmdPSH, sid, buffers);
+            }
             if (!ok) {
                 CloseAll(ok.error());
                 co_return std::unexpected(ok.error());
@@ -415,7 +427,7 @@ struct Handler::ClientSession {
             }
 
             auto discard_current = [&]() -> net::awaitable<std::expected<void, ErrorCode>> {
-                co_return co_await DiscardFramePayload(*stream, header->length);
+                return DiscardFramePayload(*stream, header->length);
             };
 
             if (header->sid == 0) {
@@ -970,20 +982,24 @@ const bool kOutboundRegistered = (acpp::proxyman::outbound::RegisterProxy(
                 .allow_insecure = false,
                 .alpn = {},
             });
-        return acpp::proxyman::outbound::PreparedOutboundCreator{
-            [settings = std::move(*settings),
-             stream_settings = std::move(prepared_stream_settings)](
-                std::string_view tag,
+        struct PreparedAnyTlsState {
+            acpp::proxy::anytls::outbound::Settings settings;
+            acpp::StreamSettings stream_settings;
+        };
+        return acpp::proxyman::outbound::MakePreparedOutboundCreator<
+            PreparedAnyTlsState,
+            +[](std::string_view tag,
+                const PreparedAnyTlsState& state,
                 acpp::net::io_context& io_context,
                 acpp::app::dns::DNS& dns,
                 std::chrono::seconds dial_timeout) -> std::unique_ptr<acpp::Outbound> {
                 return std::make_unique<acpp::proxy::anytls::outbound::Handler>(
                     std::string(tag),
                     io_context,
-                    settings,
-                    stream_settings,
+                    state.settings,
+                    state.stream_settings,
                     dial_timeout,
                     dns);
-            }};
+            }>(PreparedAnyTlsState{std::move(*settings), std::move(prepared_stream_settings)});
     }), true);
 }  // namespace

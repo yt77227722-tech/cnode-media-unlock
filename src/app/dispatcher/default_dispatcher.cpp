@@ -24,6 +24,7 @@
 #include <asio/steady_timer.hpp>
 #include <asio/this_coro.hpp>
 #include <asio/use_awaitable.hpp>
+#include <charconv>
 #include <chrono>
 #include <limits>
 #include <new>
@@ -75,7 +76,7 @@ void ApplySniffOverride(
 std::chrono::seconds ResolveRelayIdleTimeout(
     const TimeoutsConfig& timeouts,
     uint32_t pressure_idle_timeout) {
-    auto idle_timeout = timeouts.StreamIdleTimeout();
+    auto idle_timeout = timeouts.IdleTimeout();
     if (pressure_idle_timeout > 0) {
         idle_timeout = std::min(
             idle_timeout, std::chrono::seconds(pressure_idle_timeout));
@@ -87,13 +88,6 @@ net::awaitable<std::vector<net::ip::address>> ResolveRoutingAddresses(
     app::dns::DNS& dns_service,
     session::Context& ctx) {
     const auto& target = ctx.outbound.target;
-    if (target.resolved_addr) {
-        co_return std::vector<net::ip::address>{*target.resolved_addr};
-    }
-    if (!target.IsDomain()) {
-        co_return std::vector<net::ip::address>{};
-    }
-
     const int64_t started_at_us = NowMicros();
     auto dns_result = co_await dns_service.Resolve(target.host);
     // DNS may return a failed result after cancellation. Do not publish that
@@ -119,32 +113,23 @@ net::awaitable<std::vector<net::ip::address>> ResolveRoutingAddresses(
 }
 
 struct ActiveSessionScope {
-    session::Context& ctx;
     app::SessionTrackingState& session_tracking;
-    bool is_active = false;
+    app::SessionTrackingState::ActiveSession node{};
 
     ActiveSessionScope(session::Context& session_ctx,
-                       app::SessionTrackingState& tracking)
-        : ctx(session_ctx)
-        , session_tracking(tracking) {
-        if (ctx.inbound.user_id > 0) {
+                       app::SessionTrackingState& tracking) noexcept
+        : session_tracking(tracking) {
+        if (session_ctx.inbound.user_id > 0) {
             session_tracking.RegisterActiveSession(
-                ctx.conn_id,
-                ctx.inbound.tag,
-                ctx.inbound.user_id,
-                ctx.traffic);
-            is_active = true;
+                node,
+                session_ctx.inbound.tag,
+                session_ctx.inbound.user_id,
+                session_ctx.traffic);
         }
     }
 
     ~ActiveSessionScope() noexcept {
-        if (!is_active) {
-            return;
-        }
-
-        session_tracking.UnregisterActiveSession(
-            ctx.conn_id,
-            ctx.traffic);
+        session_tracking.UnregisterActiveSession(node);
     }
 };
 
@@ -453,10 +438,10 @@ net::awaitable<void> DefaultDispatcher::DispatchPreparedLink(
     const auto relay_idle_timeout = ResolveRelayIdleTimeout(
         timeouts, pressure_idle_timeout);
     if (pressure_idle_timeout > 0 &&
-        relay_idle_timeout < timeouts.StreamIdleTimeout()) {
+        relay_idle_timeout < timeouts.IdleTimeout()) {
         LOG_CONN_DEBUG(ctx,
                        "[Session] Pressure mode: relay_idle={}s -> {}s",
-                       timeouts.StreamIdleTimeout().count(),
+                       timeouts.IdleTimeout().count(),
                        relay_idle_timeout.count());
     }
     const auto relay_write_timeout =
@@ -530,10 +515,21 @@ DefaultDispatcher::RouteResult DefaultDispatcher::FinishRoute(
         case detail::SelectionSource::Forced:
             ctx.outbound.route_rule = "fixed";
             break;
-        case detail::SelectionSource::Rule:
-            ctx.outbound.route_rule =
-                "rule:" + std::to_string(selection.rule_index);
+        case detail::SelectionSource::Rule: {
+            char rule_buf[24] = "rule:";
+            const auto [ptr, ec] = std::to_chars(
+                rule_buf + 5,
+                rule_buf + sizeof(rule_buf),
+                selection.rule_index);
+            if (ec == std::errc{}) {
+                ctx.outbound.route_rule.assign(
+                    rule_buf,
+                    static_cast<size_t>(ptr - rule_buf));
+            } else {
+                ctx.outbound.route_rule = "rule:0";
+            }
             break;
+        }
         case detail::SelectionSource::Fallback:
             ctx.outbound.route_rule = "fallback";
             break;
@@ -620,24 +616,21 @@ net::awaitable<DefaultDispatcher::RouteResult> DefaultDispatcher::RouteAsync(
             return last;
         };
 
+    std::optional<detail::OutboundSelection> initial_selection;
     if (strategy == routing::DomainStrategy::IPIfNonMatch) {
-        auto initial = SelectRoute(ctx, policy);
-        if (initial.source != detail::SelectionSource::Fallback) {
-            co_return FinishRoute(ctx, initial);
+        initial_selection = SelectRoute(ctx, policy);
+        if (initial_selection->source != detail::SelectionSource::Fallback) {
+            co_return FinishRoute(ctx, *initial_selection);
         }
-
-        auto addresses = co_await ResolveRoutingAddresses(dns_service_, ctx);
-        if (!addresses.empty()) {
-            co_return FinishRoute(ctx, select_with_addresses(addresses));
-        }
-        co_return FinishRoute(ctx, SelectRoute(ctx, policy));
     }
 
     auto addresses = co_await ResolveRoutingAddresses(dns_service_, ctx);
     if (!addresses.empty()) {
         co_return FinishRoute(ctx, select_with_addresses(addresses));
     }
-    co_return FinishRoute(ctx, SelectRoute(ctx, policy));
+    co_return FinishRoute(
+        ctx,
+        initial_selection ? *initial_selection : SelectRoute(ctx, policy));
 }
 
 }  // namespace acpp::app::dispatcher

@@ -190,7 +190,6 @@ net::awaitable<bool> EncodeRequestBodyChunk(EncodeRequestBodyState& state,
 
     ssize_t enc_len = state.cipher->Encrypt(data, len, write_scratch + length_header_size);
     if (enc_len < 0) {
-        ReleaseIdleBuffer(write_output_buf, 0);
         co_return false;
     }
 
@@ -201,7 +200,6 @@ net::awaitable<bool> EncodeRequestBodyChunk(EncodeRequestBodyState& state,
                            total_len,
                            write_scratch,
                            encoded_length_size)) {
-        ReleaseIdleBuffer(write_output_buf, 0);
         co_return false;
     }
 
@@ -211,7 +209,6 @@ net::awaitable<bool> EncodeRequestBodyChunk(EncodeRequestBodyState& state,
 
     const size_t output_size = encoded_length_size + static_cast<size_t>(enc_len) + padding_len;
     const bool ok = co_await WriteFull(stream, write_scratch, output_size);
-    ReleaseIdleBuffer(write_output_buf, 0);
     co_return ok;
 }
 
@@ -485,7 +482,6 @@ net::awaitable<buf::MultiBuffer> DecodeResponseBody(DecodeResponseBodyState& sta
         }
 
         const bool ok = co_await ReadFull(stream, eof_crypto, chunk_len);
-        ReleaseIdleBuffer(eof_buf, 0);
         if (!ok) {
             state.eof = true;
             throw IoSystemError(io_error::connection_reset, "VMess client stream read error");
@@ -516,7 +512,6 @@ net::awaitable<buf::MultiBuffer> DecodeResponseBody(DecodeResponseBodyState& sta
     }
 
     if (!co_await ReadFull(stream, crypto_scratch, chunk_len)) {
-        ReleaseIdleBuffer(crypto_buf, 0);
         LOG_NET_DEBUG("VMess client: DecodeResponseBody ReadFull failed chunk_len={} "
                          "(TCP 连接在 chunk body 传输中断开)", chunk_len);
         state.eof = true;
@@ -524,55 +519,25 @@ net::awaitable<buf::MultiBuffer> DecodeResponseBody(DecodeResponseBodyState& sta
     }
 
     const size_t data_len = chunk_len - padding_len;
-    const size_t expected_plain_len = data_len - overhead;
-
-    if (crypto_pool && expected_plain_len <= buf::Buffer::kSize) {
-        ssize_t dec_len = state.cipher->Decrypt(crypto_scratch, data_len, crypto_scratch);
-        if (dec_len < 0) {
-            ReleaseIdleBuffer(crypto_buf, 0);
-            state.eof = true;
-            throw IoSystemError(io_error::connection_reset, "VMess client stream read error");
-        }
+    const ssize_t dec_len = state.cipher->Decrypt(crypto_scratch, data_len, crypto_scratch);
+    if (dec_len < 0) {
+        state.eof = true;
+        throw IoSystemError(io_error::connection_reset, "VMess client stream read error");
+    }
+    if (crypto_pool) {
         crypto_pool->Produce(static_cast<uint32_t>(dec_len));
         co_return buf::MultiBuffer{std::move(crypto_pool)};
     }
 
-    memory::ByteVector plain_buf;
-    uint8_t* plain = PrepareScratch(plain_buf, expected_plain_len);
-    ssize_t dec_len = state.cipher->Decrypt(crypto_scratch, data_len, plain);
-    if (dec_len < 0) {
-        ReleaseIdleBuffer(crypto_buf, 0);
-        ReleaseIdleBuffer(plain_buf, 0);
-        state.eof = true;
-        throw IoSystemError(io_error::connection_reset, "VMess client stream read error");
-    }
-    ReleaseIdleBuffer(crypto_buf, 0);
-
-    buf::BufferGuard out{buf::Buffer::New()};
-    if (!out) {
-        ReleaseIdleBuffer(plain_buf, 0);
-        throw std::bad_alloc();
-    }
-
     const size_t dec_size = static_cast<size_t>(dec_len);
-    const size_t first_copy = std::min<size_t>(dec_size, out->Available());
-    std::memcpy(out->Tail().data(), plain, first_copy);
-    out->Produce(static_cast<uint32_t>(first_copy));
-
     buf::MultiBuffer out_mb;
     out_mb.reserve((dec_size + buf::Buffer::kSize - 1) / buf::Buffer::kSize);
-    out_mb.push_back(std::move(out));
-    if (first_copy < dec_size &&
-        !buf::AppendSpanToMultiBuffer(
-            std::span<const uint8_t>(plain + first_copy, dec_size - first_copy),
+    if (!buf::AppendSpanToMultiBuffer(
+            std::span<const uint8_t>(crypto_scratch, dec_size),
             out_mb)) {
-        ReleaseIdleBuffer(plain_buf, 0);
         co_return buf::MultiBuffer{};
     }
-    ReleaseIdleBuffer(plain_buf, 0);
-    buf::MultiBuffer result = std::move(out_mb);
-    out_mb.clear();
-    co_return result;
+    co_return out_mb;
 }
 
 net::awaitable<VMessHandshakeResult> EncodeRequestHeader(EncodeRequestHeaderState& state,
@@ -772,29 +737,12 @@ net::awaitable<VMessHandshakeResult> EncodeRequestHeader(EncodeRequestHeaderStat
 
     // 加密长度（使用 AAD = auth_id）
     uint8_t len_enc[18];
-    EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
-    if (!ctx) {
-        co_return fail(ErrorCode::INTERNAL);
-    }
-    if (EVP_EncryptInit_ex(ctx, EVP_aes_128_gcm(), nullptr, nullptr, nullptr) != 1 ||
-        EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, 12, nullptr) != 1 ||
-        EVP_EncryptInit_ex(ctx, nullptr, nullptr, len_key.data(), len_iv) != 1) {
-        EVP_CIPHER_CTX_free(ctx);
+    if (!AES128GCMEncrypt(len_key.data(), len_iv,
+                          auth_id.data(), auth_id.size(),
+                          len_plain, sizeof(len_plain),
+                          len_enc, len_enc + 2)) {
         co_return fail(ErrorCode::PROTOCOL_ENCODE_FAILED);
     }
-
-    // AAD = auth_id
-    int out_len;
-    if (EVP_EncryptUpdate(ctx, nullptr, &out_len, auth_id.data(),
-                          static_cast<int>(auth_id.size())) != 1 ||
-        EVP_EncryptUpdate(ctx, len_enc, &out_len, len_plain,
-                          static_cast<int>(sizeof(len_plain))) != 1 ||
-        EVP_EncryptFinal_ex(ctx, len_enc + out_len, &out_len) != 1 ||
-        EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_GET_TAG, 16, len_enc + 2) != 1) {
-        EVP_CIPHER_CTX_free(ctx);
-        co_return fail(ErrorCode::PROTOCOL_ENCODE_FAILED);
-    }
-    EVP_CIPHER_CTX_free(ctx);
 
     // 加密请求头
     const std::array<std::string_view, 3> header_key_path{
@@ -815,29 +763,12 @@ net::awaitable<VMessHandshakeResult> EncodeRequestHeader(EncodeRequestHeaderStat
     // 加密头部（使用 AAD = auth_id）
     std::array<uint8_t, kVMessHandshakeHeaderEncMax> header_enc{};
     const size_t header_enc_len = header_len + 16;
-    ctx = EVP_CIPHER_CTX_new();
-    if (!ctx) {
-        co_return fail(ErrorCode::INTERNAL);
-    }
-    if (EVP_EncryptInit_ex(ctx, EVP_aes_128_gcm(), nullptr, nullptr, nullptr) != 1 ||
-        EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, 12, nullptr) != 1 ||
-        EVP_EncryptInit_ex(ctx, nullptr, nullptr, header_key.data(), header_iv) != 1) {
-        EVP_CIPHER_CTX_free(ctx);
+    if (!AES128GCMEncrypt(header_key.data(), header_iv,
+                          auth_id.data(), auth_id.size(),
+                          header.data(), header_len,
+                          header_enc.data(), header_enc.data() + header_len)) {
         co_return fail(ErrorCode::PROTOCOL_ENCODE_FAILED);
     }
-
-    // AAD = auth_id
-    if (EVP_EncryptUpdate(ctx, nullptr, &out_len, auth_id.data(),
-                          static_cast<int>(auth_id.size())) != 1 ||
-        EVP_EncryptUpdate(ctx, header_enc.data(), &out_len, header.data(),
-                          static_cast<int>(header_len)) != 1 ||
-        EVP_EncryptFinal_ex(ctx, header_enc.data() + out_len, &out_len) != 1 ||
-        EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_GET_TAG, 16,
-                            header_enc.data() + header_len) != 1) {
-        EVP_CIPHER_CTX_free(ctx);
-        co_return fail(ErrorCode::PROTOCOL_ENCODE_FAILED);
-    }
-    EVP_CIPHER_CTX_free(ctx);
 
     // 发送: AuthID (16) + EncLen (18) + ConnectionNonce (8) + EncHeader
     std::array<uint8_t, kVMessHandshakePacketMax> packet{};
@@ -886,18 +817,12 @@ net::awaitable<bool> DecodeResponseHeader(DecodeResponseHeaderState& state,
 
     // 解密长度
     uint8_t len_dec[2];
-    EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
-    EVP_DecryptInit_ex(ctx, EVP_aes_128_gcm(), nullptr, nullptr, nullptr);
-    EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, 12, nullptr);
-    EVP_DecryptInit_ex(ctx, nullptr, nullptr, len_key, len_iv);
-    EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, 16, len_enc + 2);
-
-    int out_len;
-    EVP_DecryptUpdate(ctx, len_dec, &out_len, len_enc, 2);
-    int ret = EVP_DecryptFinal_ex(ctx, len_dec + out_len, &out_len);
-    EVP_CIPHER_CTX_free(ctx);
-
-    if (ret <= 0) {
+    size_t len_dec_len = 0;
+    if (!AES128GCMDecryptTo(len_key, len_iv, sizeof(len_iv),
+                            len_enc, sizeof(len_enc),
+                            nullptr, 0,
+                            len_dec, sizeof(len_dec), len_dec_len) ||
+        len_dec_len != sizeof(len_dec)) {
         co_return false;
     }
 
@@ -925,17 +850,12 @@ net::awaitable<bool> DecodeResponseHeader(DecodeResponseHeaderState& state,
     KDF(state.response_iv.data(), 16, resp_header_iv_path, header_iv, 12);
 
     std::array<uint8_t, kVMessResponseHeaderMax> header_dec{};
-    ctx = EVP_CIPHER_CTX_new();
-    EVP_DecryptInit_ex(ctx, EVP_aes_128_gcm(), nullptr, nullptr, nullptr);
-    EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, 12, nullptr);
-    EVP_DecryptInit_ex(ctx, nullptr, nullptr, header_key, header_iv);
-    EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, 16, header_enc.data() + header_len);
-
-    EVP_DecryptUpdate(ctx, header_dec.data(), &out_len, header_enc.data(), static_cast<int>(header_len));
-    ret = EVP_DecryptFinal_ex(ctx, header_dec.data() + out_len, &out_len);
-    EVP_CIPHER_CTX_free(ctx);
-
-    if (ret <= 0) {
+    size_t header_dec_len = 0;
+    if (!AES128GCMDecryptTo(header_key, header_iv, sizeof(header_iv),
+                            header_enc.data(), static_cast<size_t>(header_len) + 16,
+                            nullptr, 0,
+                            header_dec.data(), header_dec.size(), header_dec_len) ||
+        header_dec_len != header_len) {
         co_return false;
     }
 

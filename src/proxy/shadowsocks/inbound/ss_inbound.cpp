@@ -37,7 +37,7 @@ class ShadowsocksOnlineSession {
 public:
     ShadowsocksOnlineSession(ss::Validator& validator,
                              std::string_view tag,
-                             int64_t user_id,
+                             uint64_t user_id,
                              std::string_view client_ip)
         : validator_(&validator)
         , tag_(tag)
@@ -62,7 +62,7 @@ public:
 private:
     ss::Validator* validator_;
     memory::ThreadLocalString tag_;
-    int64_t user_id_;
+    uint64_t user_id_;
     memory::ThreadLocalString client_ip_;
 };
 
@@ -143,7 +143,7 @@ proxy::shadowsocks::inbound::Handler::Process(
     LOG_CONN_DEBUG(ctx, "[SS][{}] Process start from {}", tag, client_ip);
 
     if (limiter_ && ctx.inbound.HasProxyProtocolClientIP() &&
-        limiter_->GetLimiter().IsBanned(ctx.inbound.tag, ctx.inbound.source_ip)) {
+        limiter_->IsBanned(ctx.inbound.tag, ctx.inbound.source_ip)) {
         LOG_NET_DEBUG("{} from {}:{} rejected ip_banned [{}]",
             FormatTimestamp(ctx.accept_time_us),
             ctx.inbound.source_ip, ctx.inbound.source_port, ctx.inbound.tag);
@@ -175,7 +175,7 @@ proxy::shadowsocks::inbound::Handler::Process(
     auto request_reader = std::move(session_result->body_reader);
     std::unique_ptr<transport::MultiBufferWriter> response_writer;
     {
-        const auto* matched = session_result->user;
+        const auto* matched = session_result->user.get();
         if (!matched) {
             LOG_NET_WARN("[{}] SS auth failed from {}", tag, client_ip);
             if (limiter_ && ctx.inbound.HasProxyProtocolClientIP()) {
@@ -189,7 +189,7 @@ proxy::shadowsocks::inbound::Handler::Process(
         ctx.inbound.user_email = profile.email;
         ctx.content.speed_limit = profile.speed_limit;
 
-        int64_t uid = profile.user_id;
+        const auto uid = static_cast<uint64_t>(profile.user_id);
         if (!validator_.CanAcceptDevice(tag, uid, ctx.inbound.source_ip, profile.device_limit)) {
             LOG_NET_DEBUG("{} from {}:{} rejected device_limit [{}] user={} limit={} online_devices={}",
                 FormatTimestamp(ctx.accept_time_us),
@@ -219,7 +219,7 @@ proxy::shadowsocks::inbound::Handler::Process(
     }
     // Both directions now own their cipher/key state, including the lazy
     // response header. Authentication ownership must end before UoT/relay waits.
-    session_result->SetUser({});
+    session_result->user.reset();
 
     if (const auto uot_version = proxy::uot::VersionFromMagicAddress(
             ctx.outbound.target)) {

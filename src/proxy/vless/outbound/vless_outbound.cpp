@@ -810,7 +810,7 @@ const bool kVlessRegistered = (acpp::proxyman::outbound::RegisterProxy(
                 vnext_p->as_array()[0].is_object()) {
             const auto& server = vnext_p->as_array()[0].as_object();
             vless_config.address = json_string(server, "address");
-            const auto port = acpp::ReadJsonPort(server, {"port"});
+            const auto port = acpp::ReadJsonPort(server, "port");
             if (port.Invalid()) {
                 return std::nullopt;
             }
@@ -838,7 +838,7 @@ const bool kVlessRegistered = (acpp::proxyman::outbound::RegisterProxy(
             }
         } else {
             vless_config.address = json_string(s, "address");
-            const auto port = acpp::ReadJsonPort(s, {"port"});
+            const auto port = acpp::ReadJsonPort(s, "port");
             if (port.Invalid()) {
                 return std::nullopt;
             }
@@ -846,9 +846,6 @@ const bool kVlessRegistered = (acpp::proxyman::outbound::RegisterProxy(
                 vless_config.port = port.value;
             }
             uuid = json_string(s, "id");
-            if (uuid.empty()) {
-                uuid = json_string(s, "id");
-            }
             encryption = json_string(s, "encryption");
             vless_config.flow = json_string(s, "flow");
             packet_encoding = json_packet_encoding(s);
@@ -926,16 +923,17 @@ const bool kVlessRegistered = (acpp::proxyman::outbound::RegisterProxy(
             return std::nullopt;
         }
 
-        return acpp::proxyman::outbound::PreparedOutboundCreator{
-            [vless_config = std::move(vless_config)](
-                std::string_view tag,
+        return acpp::proxyman::outbound::MakePreparedOutboundCreator<
+            acpp::VlessOutboundConfig,
+            +[](std::string_view tag,
+                const acpp::VlessOutboundConfig& cfg_state,
                 acpp::net::io_context& /*io_context*/,
                 acpp::app::dns::DNS& dns,
                 std::chrono::seconds timeout) -> std::unique_ptr<acpp::Outbound> {
-                auto runtime_config = vless_config;
+                auto runtime_config = cfg_state;
                 runtime_config.timeout = timeout;
                 return std::make_unique<acpp::proxy::vless::outbound::Handler>(
                     std::string(tag), runtime_config, dns);
-            }};
+            }>(std::move(vless_config));
     }), true);
 }  // namespace

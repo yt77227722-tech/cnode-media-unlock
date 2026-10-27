@@ -40,7 +40,6 @@ constexpr size_t kMuxQueueHighWaterBytes = 4 * 1024 * 1024;
 constexpr size_t kMuxQueueLowWaterBytes  = 2 * 1024 * 1024;
 constexpr size_t kMuxQueueEmergencyBytes = 8 * 1024 * 1024;
 constexpr size_t kMuxQueueShrinkItems    = 128;
-constexpr size_t kMuxFrameBufKeepCap     = 512;
 constexpr size_t kMuxReplyOverhead       = 128;
 
 [[nodiscard]] constexpr bool QueueBytesWouldExceed(
@@ -1010,7 +1009,7 @@ net::awaitable<RelayResult> ProcessInboundImpl(
 
     (void)client_control.ConsumePhaseDeadline();
     client_control.ClearPhaseDeadline();
-    auto relay_idle_timeout = timeouts.StreamIdleTimeout();
+    auto relay_idle_timeout = timeouts.IdleTimeout();
     if (pressure_idle_timeout > 0) {
         relay_idle_timeout = std::min(
             relay_idle_timeout, std::chrono::seconds(pressure_idle_timeout));
@@ -1082,7 +1081,7 @@ net::awaitable<RelayResult> ProcessInboundImpl(
     auto process_frames = [&](AwaitableTaskGroup& tasks) -> net::awaitable<void> {
         auto release_write_frame = [&]() noexcept {
             write_frame.clear();
-            ReleaseIdleBuffer(write_frame, kMuxFrameBufKeepCap);
+            ReleaseIdleBuffer(write_frame);
         };
         auto write_frame_to_client =
             [&](memory::ByteVector& frame) -> net::awaitable<bool> {
