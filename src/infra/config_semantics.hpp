@@ -1,8 +1,8 @@
 #pragma once
 
-#include "acppnode/infra/config_types.hpp"
-#include "acppnode/infra/outbound_source_config.hpp"
-#include "acppnode/infra/runtime_config_types.hpp"
+#include "infra/config_types.hpp"
+#include "infra/outbound_source_config.hpp"
+#include "infra/runtime_config_types.hpp"
 
 #include <cstddef>
 #include <span>
@@ -10,7 +10,6 @@
 #include <string_view>
 #include <vector>
 
-namespace acpp {
 
 enum class ConfigSemanticError {
     None,
@@ -32,11 +31,6 @@ struct ConfigSemanticValidation {
     [[nodiscard]] bool Ok() const noexcept {
         return error == ConfigSemanticError::None;
     }
-};
-
-struct IgnoredRouteRule {
-    size_t index = 0;
-    std::string tag;
 };
 
 enum class StaticInboundSemanticError {
@@ -66,13 +60,6 @@ struct StaticInboundSemanticValidation {
     std::span<const RouteRuleConfig> rules,
     std::span<const StaticInboundConfig> inbounds);
 
-// A routing sidecar may outlive one or more removed outbounds. Those stale
-// rules are unusable, but must not prevent the rest of the node from starting.
-// Remove them during cold-path normalization before publishing the runtime.
-[[nodiscard]] std::vector<IgnoredRouteRule> IgnoreUnknownRoutingRules(
-    std::span<const infra::OutboundSourceConfig> outbounds,
-    std::vector<RouteRuleConfig>& rules);
 [[nodiscard]] StaticInboundSemanticValidation ValidateStaticInboundSemantics(
     std::span<const StaticInboundConfig> inbounds);
 
-}  // namespace acpp

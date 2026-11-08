@@ -1,75 +1,57 @@
 #pragma once
 
-#include "acppnode/common/defaults.hpp"
-#include "acppnode/proxy/outbound.hpp"
+#include "proxy/outbound.hpp"
 #include "../account.hpp"
 #include "../types.hpp"
-#include "acppnode/transport/internet/stream_settings.hpp"
-#include "acppnode/transport/internet/outbound_bind.hpp"
+#include "transport/internet/outbound_sender.hpp"
 
+#include <openssl/aes.h>
+#include "common/unsafe.hpp"
 #include <chrono>
-#include <cstdint>
-#include <optional>
-#include <span>
-#include <string>
-#include <string_view>
+#include <memory>
 
-namespace acpp {
-
-namespace app::dns {
-class DNS;
-}  // namespace app::dns
 
 // ============================================================================
-// VMess Outbound 配置
+// VMess Outbound 配置（传输层与 sendThrough 属于 Handler 的 sender settings）
 // ============================================================================
 struct VMessOutboundConfig {
-    std::string address;           // 服务器地址
-    std::optional<net::ip::address> literal_address; // 冷路径解析的 IP 字面量
-    uint16_t port = 443;           // 服务器端口
+    OutboundServer server;
     vmess::Security security = vmess::Security::AES_128_GCM;
-
-    // 传输层配置（JSON 格式保持不变）
-    StreamSettings stream_settings;
-    OutboundBind send_through;
-
-    // 传输层拨号/握手超时
-    std::chrono::seconds timeout{defaults::kDialTimeout};
 };
 
 // ============================================================================
-// VMess Outbound（传输层：TCP + 可选 WS）
+// VMess Outbound
 // ============================================================================
 namespace proxy::vmess::outbound {
 
-class Handler final : public ::acpp::Outbound {
-public:
-    Handler(std::string tag,
-            const ::acpp::VMessOutboundConfig& config,
-            const ::acpp::vmess::MemoryAccount& user,
-            ::acpp::app::dns::DNS& dns_service);
+struct PreparedSettings {
+    VMessOutboundConfig config;
+    ::vmess::MemoryAccount user;
+    AES_KEY auth_id_key{};  // Encrypt schedule of user.auth_key, built on prepare.
 
-    // Outbound 接口
-    ::acpp::net::awaitable<::acpp::OutboundProcessResult> Process(
-        ::acpp::net::io_context& io_context,
-        const ::acpp::tcp::endpoint* inbound_local_addr,
-        ::acpp::session::Context& ctx,
-        const ::acpp::TimeoutsConfig& timeouts,
-        ::acpp::transport::Link inbound,
-        ::acpp::StatsShard& stats,
-        const ::acpp::RelayConfig& relay_config,
-        ::acpp::buf::MultiBuffer first_payload,
+    ~PreparedSettings() noexcept {
+        ::SecureZeroMemory(&auth_id_key, sizeof(auth_id_key));
+    }
+};
+
+class Handler final : public ::Outbound {
+public:
+    explicit Handler(std::shared_ptr<const PreparedSettings> prepared);
+
+    ::net::awaitable<::OutboundProcessResult> Process(
+        ::session::Context& ctx,
+        ::transport::Link inbound,
+        ::OutboundDialer& dialer,
+        const ::TimeoutsConfig& timeouts,
+        ::StatsShard& stats,
+        const ::RelayConfig& relay_config,
+        ::buf::MultiBufferBatch first_payload,
         std::chrono::seconds relay_idle_timeout,
         std::chrono::seconds relay_write_timeout) override;
-    std::string_view Tag() const noexcept override { return tag_; }
 
 private:
-    std::string tag_;
-    const ::acpp::VMessOutboundConfig config_;
-    const ::acpp::vmess::MemoryAccount user_;
-    ::acpp::app::dns::DNS& dns_service_;
+    std::shared_ptr<const PreparedSettings> prepared_;
 };
 
 }  // namespace proxy::vmess::outbound
 
-}  // namespace acpp

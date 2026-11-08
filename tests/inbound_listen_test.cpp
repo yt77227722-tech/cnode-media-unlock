@@ -1,42 +1,38 @@
-#include "acppnode/transport/internet/inbound_listen.hpp"
-#include "acppnode/app/port_binding.hpp"
+#include <gtest/gtest.h>
+
+#include "transport/internet/inbound_listen.hpp"
 #include "worker/tcp_listener.hpp"
 
 #include <array>
+#include <chrono>
 #include <string_view>
 
-int main() {
+TEST(InboundListen, Contract) {
     for (const auto value : std::array<std::string_view, 2>{"", "auto"}) {
-        auto listen = acpp::InboundListen::Parse(value);
-        if (!listen || !listen->IsAuto() || listen->Candidates().size() != 2 ||
+        auto listen = ::InboundListen::Parse(value);
+        ASSERT_FALSE((!listen || !listen->IsAuto() || listen->Candidates().size() != 2 ||
             !listen->Candidates()[0].is_v4() || !listen->Candidates()[0].is_unspecified() ||
-            !listen->Candidates()[1].is_v6() || !listen->Candidates()[1].is_unspecified()) {
-            return 1;
-        }
+            !listen->Candidates()[1].is_v6() || !listen->Candidates()[1].is_unspecified()));
     }
 
-    auto ipv4 = acpp::InboundListen::Parse("127.0.0.1");
-    if (!ipv4 || ipv4->IsAuto() || ipv4->Candidates().size() != 1 ||
-        !ipv4->Candidates()[0].is_v4() || !ipv4->Candidates()[0].is_loopback()) {
-        return 2;
-    }
+    auto ipv4 = ::InboundListen::Parse("127.0.0.1");
+    ASSERT_FALSE((!ipv4 || ipv4->IsAuto() || ipv4->Candidates().size() != 1 ||
+        !ipv4->Candidates()[0].is_v4() || !ipv4->Candidates()[0].is_loopback()));
 
-    auto ipv6 = acpp::InboundListen::Parse("::1");
-    if (!ipv6 || ipv6->IsAuto() || ipv6->Candidates().size() != 1 ||
-        !ipv6->Candidates()[0].is_v6() || !ipv6->Candidates()[0].is_loopback()) {
-        return 3;
-    }
+    auto ipv6 = ::InboundListen::Parse("::1");
+    ASSERT_FALSE((!ipv6 || ipv6->IsAuto() || ipv6->Candidates().size() != 1 ||
+        !ipv6->Candidates()[0].is_v6() || !ipv6->Candidates()[0].is_loopback()));
 
-    auto mapped = acpp::InboundListen::Parse("::ffff:127.0.0.1");
-    if (!mapped || mapped->Candidates().size() != 1 ||
-        !mapped->Candidates()[0].is_v4() || !mapped->Candidates()[0].is_loopback()) {
-        return 4;
-    }
+    auto mapped = ::InboundListen::Parse("::ffff:127.0.0.1");
+    ASSERT_FALSE((!mapped || mapped->Candidates().size() != 1 ||
+        !mapped->Candidates()[0].is_v4() || !mapped->Candidates()[0].is_loopback()));
 
     for (const auto value :
-         std::array<std::string_view, 4>{"not-an-ip", "127.0.0.1junk", "AUTO", " auto"}) {
-        if (acpp::InboundListen::Parse(value)) return 5;
+         std::array<std::string_view, 3>{"not-an-ip", "127.0.0.1junk", " auto"}) {
+        ASSERT_FALSE((::InboundListen::Parse(value)));
     }
+    auto upper = ::InboundListen::Parse("AUTO");
+    ASSERT_FALSE((!upper || !upper->IsAuto()));
 
     struct OverlapCase { std::string_view left, right; bool overlaps; };
     for (const auto& item : std::array{
@@ -51,67 +47,67 @@ int main() {
              OverlapCase{"auto", "auto", true},
              OverlapCase{"::ffff:127.0.0.1", "127.0.0.1", true},
              OverlapCase{"fe80::1%1", "fe80::1%2", false}}) {
-        const auto left = acpp::InboundListen::Parse(item.left);
-        const auto right = acpp::InboundListen::Parse(item.right);
-        if (!left || !right || left->Overlaps(*right) != item.overlaps ||
-            right->Overlaps(*left) != item.overlaps) return 16;
+        const auto left = ::InboundListen::Parse(item.left);
+        const auto right = ::InboundListen::Parse(item.right);
+        ASSERT_FALSE((!left || !right || left->Overlaps(*right) != item.overlaps ||
+            right->Overlaps(*left) != item.overlaps));
     }
 
     for (const auto value : std::array<std::string_view, 7>{"127.0.0.1:9", "[127.0.0.1]", "[::1]", "127.0.0.1 ",
              "fe80::1%invalid", std::string_view("127.0.0.1\0ignored", 17),
              std::string_view("::1\0ignored", 11)}) {
-        if (acpp::InboundListen::Parse(value)) return 20;
+        ASSERT_FALSE((::InboundListen::Parse(value)));
     }
 
-    auto socket_binding = acpp::MakePortBinding(
-        443, "vmess", "stable-inbound", *ipv4);
-    auto protocol_update = acpp::MakePortBinding(
-        443, "trojan", "stable-inbound", *ipv4);
-    auto port_update = acpp::MakePortBinding(
-        8443, "vmess", "stable-inbound", *ipv4);
-    auto address_update = acpp::MakePortBinding(
-        443, "vmess", "stable-inbound", *ipv6);
-    auto tag_update = acpp::MakePortBinding(
-        443, "vmess", "other-inbound", *ipv4);
-    if (!socket_binding.UsesSameSocket(protocol_update) ||
-        socket_binding.UsesSameSocket(port_update) ||
-        socket_binding.UsesSameSocket(address_update) ||
-        socket_binding.UsesSameSocket(tag_update)) {
-        return 6;
-    }
-
-    acpp::net::io_context io_context;
-    acpp::worker_detail::TcpListenerOwner worker("test-inbound");
+    ::net::io_context io_context;
+    ::worker_detail::TcpListenerOwner worker;
     auto acceptor = worker.CreateAcceptor("stable-listener", io_context);
-    if (!acceptor || worker.FindAcceptor("stable-listener") != acceptor ||
-        !worker.OwnsAcceptor("stable-listener", acceptor.get())) return 7;
+    ASSERT_FALSE((!acceptor || !worker.OwnsAcceptor("stable-listener", acceptor.get())));
 
-    acpp::IoErrorCode ec;
-    acceptor->open(acpp::tcp::v4(), ec);
-    if (ec || !acceptor->is_open()) return 8;
+    ::IoErrorCode ec;
+    acceptor->open(::tcp::v4(), ec);
+    ASSERT_FALSE((ec || !acceptor->is_open()));
     acceptor->bind(
-        acpp::tcp::endpoint(acpp::net::ip::address_v4::loopback(), 0), ec);
-    if (ec) return 9;
-    acceptor->listen(acpp::net::socket_base::max_listen_connections, ec);
-    if (ec) return 10;
+        ::tcp::endpoint(::net::ip::address_v4::loopback(), 0), ec);
+    ASSERT_FALSE((ec));
+    acceptor->listen(::net::socket_base::max_listen_connections, ec);
+    ASSERT_FALSE((ec));
 
-    if (worker.CreateAcceptor("stable-listener", io_context) != nullptr) return 11;
-    if (worker.FindAcceptor("stable-listener") != acceptor ||
-        !acceptor->is_open()) return 12;
+    ASSERT_FALSE((worker.CreateAcceptor("stable-listener", io_context) != nullptr));
+    ASSERT_FALSE((!worker.OwnsAcceptor("stable-listener", acceptor.get()) ||
+        !acceptor->is_open()));
 
     bool accept_cancelled = false;
     acceptor->async_accept(
-        [&](acpp::IoErrorCode accept_ec, acpp::tcp::socket) {
+        [&](::IoErrorCode accept_ec, ::tcp::socket) {
             accept_cancelled =
-                accept_ec == acpp::io_error::operation_aborted;
+                accept_ec == ::io_error::operation_aborted;
         });
 
     worker.CloseAcceptor("stable-listener");
-    if (worker.FindAcceptor("stable-listener") != nullptr) return 13;
-    if (!acceptor || acceptor->is_open() ||
-        worker.OwnsAcceptor("stable-listener", acceptor.get())) return 14;
+    ASSERT_FALSE((!acceptor || acceptor->is_open() ||
+        worker.OwnsAcceptor("stable-listener", acceptor.get())));
     io_context.run();
-    if (!accept_cancelled) return 15;
+    ASSERT_FALSE((!accept_cancelled));
+    ::worker_detail::TcpListenerOwner::AcceptorPtr retained;
+    bool retired_accept_cancelled = false;
+    {
+        ::worker_detail::TcpListenerOwner retiring;
+        retained = retiring.CreateAcceptor("retained-until-completion", io_context);
+        retained->open(::tcp::v4(), ec);
+        ASSERT_FALSE((ec));
+        retained->bind(
+            ::tcp::endpoint(::net::ip::address_v4::loopback(), 0), ec);
+        ASSERT_FALSE((ec));
+        retained->listen(::net::socket_base::max_listen_connections, ec);
+        ASSERT_FALSE((ec));
+        retained->async_accept(
+            [&](::IoErrorCode error, ::tcp::socket) {
+                retired_accept_cancelled = error == ::io_error::operation_aborted;
+            });
+    }
+    io_context.restart();
+    io_context.run_for(std::chrono::milliseconds(500));
+    ASSERT_FALSE((!retired_accept_cancelled || retained->is_open()));
 
-    return 0;
 }

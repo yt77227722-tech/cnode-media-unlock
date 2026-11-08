@@ -1,6 +1,8 @@
+#include <gtest/gtest.h>
+
 #include "proxy/shadowsocks/outbound/udp_request.hpp"
 #include "proxy/shadowsocks/ss_udp.hpp"
-#include "acppnode/app/dns/dns_worker.hpp"
+#include "app/dns/dns_worker.hpp"
 
 #include <asio/co_spawn.hpp>
 #include <asio/redirect_error.hpp>
@@ -17,7 +19,6 @@
 #include <vector>
 
 namespace {
-using namespace acpp;
 using namespace std::chrono_literals;
 using UdpRequest = proxy::shadowsocks::outbound::UdpRequest;
 
@@ -85,7 +86,7 @@ buf::MultiBuffer MakePayload(
 
 std::vector<uint8_t> Flatten(const buf::MultiBuffer& payload) {
     std::vector<uint8_t> bytes;
-    bytes.reserve(buf::TotalLen(payload));
+    bytes.reserve(payload.byte_size());
     for (const auto* buffer : payload) {
         const auto part = buffer->Bytes();
         bytes.insert(bytes.end(), part.begin(), part.end());
@@ -384,7 +385,7 @@ bool RunCase(std::string_view name, Test&& test) {
 }
 }  // namespace
 
-int main() {
+TEST(SsUdpRequest, Contract) {
     size_t failures = 0;
     failures += !RunCase("authenticated response round trip", TestAuthenticatedRoundTrip);
     failures += !RunCase("single read budget with same-server garbage", TestReadBudgetAgainstSameServerGarbage);
@@ -392,5 +393,5 @@ int main() {
     failures += !RunCase("same-source garbage does not extend idle", TestSameSourceGarbageCannotExtendIdle);
     failures += !RunCase("IPv4 wire-size rejection and recovery", TestMaximumWirePayload);
     std::cout << "SS UDP request cases: " << (5 - failures) << "/5 passed\n";
-    return failures == 0 ? 0 : 1;
+    { ASSERT_TRUE(failures == 0); return; }
 }

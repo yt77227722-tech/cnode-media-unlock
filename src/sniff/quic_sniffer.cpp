@@ -1,18 +1,19 @@
-#include "acppnode/sniff/sniffer.hpp"
-#include "acppnode/common/allocator.hpp"
-#include "acppnode/core/constants.hpp"
+#include "sniff/sniffer.hpp"
+#include "common/allocator.hpp"
+#include "common/byte_reader.hpp"
+#include "core/constants.hpp"
 
 #include <openssl/evp.h>
 #include <openssl/hmac.h>
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cstring>
-#include <memory>
+#include <bit>
 #include <span>
 #include <string_view>
 
-namespace acpp {
 namespace {
 
 struct QuicVersion {
@@ -59,13 +60,6 @@ constexpr QuicVersion kV2{
     return nullptr;
 }
 
-[[nodiscard]] uint32_t ReadU32(std::span<const uint8_t> data, size_t offset) noexcept {
-    return (static_cast<uint32_t>(data[offset]) << 24) |
-           (static_cast<uint32_t>(data[offset + 1]) << 16) |
-           (static_cast<uint32_t>(data[offset + 2]) << 8) |
-           static_cast<uint32_t>(data[offset + 3]);
-}
-
 [[nodiscard]] bool ReadVarint(std::span<const uint8_t> data,
                               size_t& offset,
                               uint64_t& value) noexcept {
@@ -77,7 +71,6 @@ constexpr QuicVersion kV2{
     for (size_t i = 1; i < length; ++i) {
         value = (value << 8) | data[offset + i];
     }
-    if (value > 65535) return false;
     offset += length;
     return true;
 }
@@ -150,6 +143,17 @@ bool AesEcbEncrypt(std::span<const uint8_t, 16> key,
            out_len == 16;
 }
 
+constexpr size_t kMaxCrypto = 64 * 1024;
+constexpr size_t kMaxInputs = 64;
+
+// Explicit reservation prevents vector's geometric growth from exceeding the cap.
+void Grow(memory::ByteVector& bytes, size_t size) {
+    if (size > bytes.capacity()) {
+        bytes.reserve(std::bit_ceil(std::max(size, size_t{256})));
+    }
+    bytes.resize(size);
+}
+
 bool AesGcmDecrypt(std::span<const uint8_t, 16> key,
                    std::span<const uint8_t, 12> nonce,
                    uint8_t unmasked_first_byte,
@@ -157,7 +161,7 @@ bool AesGcmDecrypt(std::span<const uint8_t, 16> key,
                    std::span<const uint8_t> unmasked_pn,
                    std::span<const uint8_t> ciphertext,
                    memory::ByteVector& plaintext) {
-    if (ciphertext.size() < 16) return false;
+    if (ciphertext.size() <= 16) return false; // A QUIC packet must contain a frame.
     const auto tag = ciphertext.subspan(ciphertext.size() - 16, 16);
     const auto body = ciphertext.first(ciphertext.size() - 16);
     plaintext.resize(body.size());
@@ -192,193 +196,231 @@ bool AesGcmDecrypt(std::span<const uint8_t, 16> key,
 }  // namespace
 
 SniffResult QuicSniffer::Sniff(std::span<const uint8_t> data) {
-    SniffResult result;
-    if (data.empty()) {
-        return result;
+    auto fail = [&]() {
+        stopped_ = true;
+        crypto_.clear();
+        crypto_.shrink_to_fit();
+        coverage_.clear();
+        coverage_.shrink_to_fit();
+        return SniffResult{};
+    };
+    if (stopped_) return {};
+    // As in the read budget, consume one final datagram crossing the threshold.
+    // Every individual buffer stays <=64 KiB and total input stays <128 KiB.
+    if (data.empty() || input_count_ == kMaxInputs || data.size() > kMaxCrypto ||
+        input_bytes_ >= kMaxCrypto) {
+        return fail();
     }
+    ++input_count_;
+    input_bytes_ += data.size();
 
-    memory::ByteVector crypto;
+    // Released on return: no plaintext is held while waiting for the next datagram.
     memory::ByteVector decrypted;
-    bool decrypted_initial = false;
-
     size_t offset = 0;
+    bool decrypted_initial = false;
+    bool valid_long_packet = false;
+    uint32_t datagram_version = version_;
+    std::span<const uint8_t> datagram_dcid(dcid_.data(), dcid_size_);
     while (offset < data.size()) {
         const auto remaining = data.subspan(offset);
-        if (remaining.size() < 6) break;
-        const uint8_t type_byte = remaining[0];
-        if ((type_byte & 0x80) == 0 || (type_byte & 0x40) == 0) {
-            return result;
+        // A coalesced short-header packet or datagram padding has no Initial
+        // length to follow. Do not discard CRYPTO already authenticated here.
+        if ((remaining[0] & 0xc0) != 0xc0) {
+            if (decrypted_initial || valid_long_packet) break;
+            return fail();
         }
-        const uint32_t version = ReadU32(remaining, 1);
+        if (remaining.size() < 7) return fail();
+        const uint32_t version = ByteReader(remaining.subspan(1, 4)).ReadU32BE();
         const auto* spec = LookupVersion(version);
-        if (!spec) return result;
+        if (!spec) return fail();
+        const uint8_t packet_type = (remaining[0] >> 4) & 3;
+        const bool is_initial = packet_type == spec->type_initial;
+        // Retry has no Length field and cannot contribute to this Initial.
+        if (packet_type == (version == kV2.ver ? 0 : 3)) {
+            if (decrypted_initial || valid_long_packet) break;
+            return fail();
+        }
 
         size_t cursor = 5;
-        if (cursor >= remaining.size()) return result;
         const uint8_t dcid_len = remaining[cursor++];
-        if (cursor + dcid_len > remaining.size()) return result;
+        if (dcid_len > dcid_.size() || dcid_len > remaining.size() - cursor)
+            return fail();
         const auto dcid = remaining.subspan(cursor, dcid_len);
         cursor += dcid_len;
-        if (cursor >= remaining.size()) return result;
+        if (cursor == remaining.size()) return fail();
         const uint8_t scid_len = remaining[cursor++];
-        if (cursor + scid_len > remaining.size()) return result;
+        if (scid_len > 20 || scid_len > remaining.size() - cursor) return fail();
         cursor += scid_len;
-
-        const uint8_t packet_type = (type_byte & 0x30) >> 4;
-        const bool is_initial = packet_type == spec->type_initial;
         if (is_initial) {
             uint64_t token_len = 0;
             if (!ReadVarint(remaining, cursor, token_len) ||
-                cursor + static_cast<size_t>(token_len) > remaining.size()) {
-                return result;
-            }
+                token_len > remaining.size() - cursor) return fail();
             cursor += static_cast<size_t>(token_len);
         }
-
         uint64_t packet_len = 0;
-        if (!ReadVarint(remaining, cursor, packet_len) || packet_len < 4) {
-            return result;
-        }
+        if (!ReadVarint(remaining, cursor, packet_len) ||
+            packet_len > remaining.size() - cursor) return fail();
         const size_t hdr_len = cursor;
-        if (remaining.size() < hdr_len + static_cast<size_t>(packet_len)) {
-            result.need_more = decrypted_initial;
-            return result;
-        }
         const size_t next_offset = offset + hdr_len + static_cast<size_t>(packet_len);
+        // Protected packet numbers and tags require at least this much space
+        // for a header-protection sample, even when the payload is opaque.
+        if (packet_len < 20) return fail();
+        if (datagram_version != 0 &&
+            (version != datagram_version || dcid.size() != datagram_dcid.size() ||
+             !std::equal(dcid.begin(), dcid.end(), datagram_dcid.begin()))) return fail();
+        datagram_version = version;
+        datagram_dcid = dcid;
         if (!is_initial) {
+            valid_long_packet = true;
             offset = next_offset;
             continue;
         }
-        if (remaining.size() < hdr_len + 4 + 16) return result;
-
-        std::array<uint8_t, 32> initial_secret{};
-        if (!HkdfExtract(spec->salt, dcid, initial_secret)) return result;
-        std::array<uint8_t, 32> client_secret{};
-        if (!HkdfExpandLabel(initial_secret, "client in", client_secret)) return result;
-        std::array<uint8_t, 16> hp_key{};
-        std::array<uint8_t, 16> key{};
-        std::array<uint8_t, 12> iv{};
-        if (!HkdfExpandLabel(client_secret, spec->hp_label, hp_key) ||
-            !HkdfExpandLabel(client_secret, spec->key_label, key) ||
-            !HkdfExpandLabel(client_secret, spec->iv_label, iv)) {
-            return result;
+        if (version_ == 0) {
+            std::array<uint8_t, 32> initial_secret{};
+            std::array<uint8_t, 32> client_secret{};
+            if (!HkdfExtract(spec->salt, dcid, initial_secret) ||
+                !HkdfExpandLabel(initial_secret, "client in", client_secret) ||
+                !HkdfExpandLabel(client_secret, spec->hp_label, hp_key_) ||
+                !HkdfExpandLabel(client_secret, spec->key_label, key_) ||
+                !HkdfExpandLabel(client_secret, spec->iv_label, iv_)) return fail();
         }
 
-        std::array<uint8_t, 16> sample{};
         std::array<uint8_t, 16> mask{};
-        std::memcpy(sample.data(), remaining.data() + hdr_len + 4, 16);
-        if (!AesEcbEncrypt(hp_key, sample, mask)) return result;
-        const uint8_t unmasked_first_byte =
-            static_cast<uint8_t>(type_byte ^ (mask[0] & 0x0f));
-        const int pn_len = (unmasked_first_byte & 0x03) + 1;
-        std::array<uint8_t, 4> unmasked_pn{};
-        std::array<uint8_t, 12> nonce = iv;
-        for (int i = 0; i < pn_len; ++i) {
-            const uint8_t pn_byte = static_cast<uint8_t>(
-                remaining[hdr_len + static_cast<size_t>(i)] ^
-                mask[static_cast<size_t>(i) + 1]);
-            unmasked_pn[static_cast<size_t>(i)] = pn_byte;
-            nonce[12 - pn_len + i] ^= pn_byte;
+        const std::span<const uint8_t, 16> sample(remaining.data() + hdr_len + 4, 16);
+        if (!AesEcbEncrypt(hp_key_, sample, mask)) return fail();
+        const uint8_t first = static_cast<uint8_t>(remaining[0] ^ (mask[0] & 0x0f));
+        if ((first & 0x0c) != 0) return fail();
+        const size_t pn_len = (first & 3) + 1;
+        std::array<uint8_t, 4> pn_bytes{};
+        uint64_t packet_number = 0;
+        for (size_t i = 0; i < pn_len; ++i) {
+            pn_bytes[i] = remaining[hdr_len + i] ^ mask[i + 1];
+            packet_number = (packet_number << 8) | pn_bytes[i];
         }
-        const size_t ext_hdr_len = hdr_len + static_cast<size_t>(pn_len);
-        const auto ciphertext = remaining.subspan(
-            ext_hdr_len, static_cast<size_t>(packet_len) - static_cast<size_t>(pn_len));
-        if (!AesGcmDecrypt(
-                key,
-                nonce,
-                unmasked_first_byte,
-                remaining.subspan(1, hdr_len - 1),
-                std::span<const uint8_t>(unmasked_pn.data(), static_cast<size_t>(pn_len)),
-                ciphertext,
-                decrypted)) {
-            return result;
+        // RFC 9000 Appendix A.3: truncated packet numbers may wrap even in
+        // Initial retransmissions; reordered packets use the same number space.
+        const uint64_t expected = version_ == 0 ? 0 : largest_pn_ + 1;
+        const uint64_t window = uint64_t{1} << (pn_len * 8);
+        const uint64_t half_window = window / 2;
+        packet_number |= expected & ~(window - 1);
+        if (packet_number + half_window <= expected &&
+            packet_number < (uint64_t{1} << 62) - window) {
+            packet_number += window;
+        } else if (packet_number > expected + half_window && packet_number >= window) {
+            packet_number -= window;
         }
+        auto nonce = iv_;
+        for (size_t i = 0; i < 8; ++i)
+            nonce[nonce.size() - 1 - i] ^= static_cast<uint8_t>(packet_number >> (8 * i));
+        if (!AesGcmDecrypt(key_, nonce, first, remaining.subspan(1, hdr_len - 1),
+                std::span<const uint8_t>(pn_bytes.data(), pn_len),
+                remaining.subspan(hdr_len + pn_len,
+                                  static_cast<size_t>(packet_len) - pn_len),
+                decrypted)) return fail();
+        if (version_ == 0) {
+            version_ = version;
+            dcid_size_ = dcid_len;
+            std::copy(dcid.begin(), dcid.end(), dcid_.begin());
+        }
+        largest_pn_ = std::max(largest_pn_, packet_number);
         decrypted_initial = true;
+
+        const auto plaintext = std::span<const uint8_t>(decrypted);
         size_t frame = 0;
-        while (frame < decrypted.size()) {
-            uint8_t frame_type = decrypted[frame++];
-            while (frame_type == 0x00 && frame < decrypted.size()) {
-                frame_type = decrypted[frame++];
-            }
-            auto payload = std::span<const uint8_t>(decrypted).subspan(frame);
-            size_t local = 0;
-            auto consume_varint = [&](uint64_t& value) {
-                if (!ReadVarint(payload, local, value)) return false;
-                return true;
+        while (frame < plaintext.size()) {
+            uint64_t frame_type = 0;
+            if (!ReadVarint(plaintext, frame, frame_type)) return fail();
+            auto consume = [&](uint64_t& value) {
+                return ReadVarint(plaintext, frame, value);
             };
             switch (frame_type) {
-                case 0x00:
-                    break;
-                case 0x01:
+                case 0x00: // PADDING
+                case 0x01: // PING
                     break;
                 case 0x02:
                 case 0x03: {
                     uint64_t ignored = 0;
-                    uint64_t ack_range_count = 0;
-                    if (!consume_varint(ignored) || !consume_varint(ignored) ||
-                        !consume_varint(ack_range_count) || !consume_varint(ignored)) {
-                        return result;
-                    }
-                    for (uint64_t i = 0; i < ack_range_count; ++i) {
-                        if (!consume_varint(ignored) || !consume_varint(ignored)) {
-                            return result;
-                        }
-                    }
-                    if (frame_type == 0x03) {
-                        if (!consume_varint(ignored) || !consume_varint(ignored) ||
-                            !consume_varint(ignored)) {
-                            return result;
-                        }
-                    }
-                    frame += local;
+                    uint64_t ranges = 0;
+                    if (!consume(ignored) || !consume(ignored) ||
+                        !consume(ranges) || !consume(ignored) ||
+                        ranges > (plaintext.size() - frame) / 2) return fail();
+                    for (uint64_t i = 0; i < ranges; ++i)
+                        if (!consume(ignored) || !consume(ignored)) return fail();
+                    if (frame_type == 0x03 &&
+                        (!consume(ignored) || !consume(ignored) || !consume(ignored)))
+                        return fail();
                     break;
                 }
                 case 0x06: {
-                    uint64_t crypto_offset = 0;
-                    uint64_t crypto_len = 0;
-                    if (!consume_varint(crypto_offset) || !consume_varint(crypto_len)) {
-                        return result;
+                    uint64_t start = 0;
+                    uint64_t length = 0;
+                    if (!consume(start) || !consume(length) ||
+                        start > kMaxCrypto || length > kMaxCrypto - start ||
+                        length > plaintext.size() - frame) return fail();
+                    if (length == 0) break;
+                    const size_t end = static_cast<size_t>(start + length);
+                    if (contiguous_ >= 4 &&
+                        end > 4 + ((static_cast<size_t>(crypto_[1]) << 16) |
+                                   (static_cast<size_t>(crypto_[2]) << 8) | crypto_[3])) {
+                        return fail();
                     }
-                    if (local + crypto_len > payload.size()) return result;
-                    const auto needed = crypto_offset + crypto_len;
-                    if (needed > 32767) return result;
-                    if (crypto.size() < needed) crypto.resize(static_cast<size_t>(needed));
-                    std::memcpy(crypto.data() + crypto_offset,
-                                payload.data() + local,
-                                static_cast<size_t>(crypto_len));
-                    frame += local + static_cast<size_t>(crypto_len);
+                    if (crypto_.size() < end) {
+                        Grow(crypto_, end);
+                        Grow(coverage_, (end + 7) / 8);
+                    }
+                    for (size_t i = static_cast<size_t>(start); i < end; ++i) {
+                        const uint8_t bit = static_cast<uint8_t>(1u << (i & 7));
+                        const uint8_t byte = plaintext[frame++];
+                        if ((coverage_[i / 8] & bit) != 0) {
+                            if (crypto_[i] != byte) return fail();
+                        } else {
+                            crypto_[i] = byte;
+                            coverage_[i / 8] |= bit;
+                        }
+                    }
+                    while (contiguous_ < crypto_.size() &&
+                           (coverage_[contiguous_ / 8] & (1u << (contiguous_ & 7))) != 0)
+                        ++contiguous_;
                     break;
                 }
-                case 0x1c: {
-                    uint64_t ignored = 0;
-                    uint64_t reason_len = 0;
-                    if (!consume_varint(ignored) || !consume_varint(ignored) ||
-                        !consume_varint(reason_len) ||
-                        local + reason_len > payload.size()) {
-                        return result;
-                    }
-                    frame += local + static_cast<size_t>(reason_len);
-                    break;
-                }
+                // CONNECTION_CLOSE and unsupported Initial frames are terminal.
                 default:
-                    return result;
+                    return fail();
             }
         }
 
-        TlsSniffer tls;
-        if (auto sni = tls.ParseHandshake(crypto); sni) {
-            result.success = true;
-            result.protocol = constants::protocol::kQuic;
-            result.domain.assign(*sni);
-            return result;
+        if (contiguous_ != 0 && crypto_[0] != 1) return fail();
+        if (contiguous_ >= 4) {
+            const size_t handshake_size =
+                (static_cast<size_t>(crypto_[1]) << 16) |
+                (static_cast<size_t>(crypto_[2]) << 8) | crypto_[3];
+            if (handshake_size > kMaxCrypto - 4 ||
+                crypto_.size() > handshake_size + 4) return fail();
+            if (contiguous_ >= handshake_size + 4) {
+                auto sni = ParseClientHelloServerName(
+                    std::span<const uint8_t>(crypto_).first(handshake_size + 4));
+                if (!sni) return fail();
+                SniffResult result;
+                result.success = true;
+                result.protocol = constants::protocol::kQuic;
+                result.domain.assign(*sni);
+                stopped_ = true;
+                crypto_.clear();
+                crypto_.shrink_to_fit();
+                coverage_.clear();
+                coverage_.shrink_to_fit();
+                return result;
+            }
         }
         offset = next_offset;
     }
-    if (decrypted_initial) {
-        result.need_more = true;
-        result.protocol = constants::protocol::kQuic;
-    }
+    // A same-connection 0-RTT-only datagram may be reordered between Initial
+    // fragments. It contributes no CRYPTO, but does not invalidate prior state.
+    if (version_ == 0 || input_count_ == kMaxInputs || input_bytes_ >= kMaxCrypto)
+        return fail();
+    SniffResult result;
+    result.need_more = true;
+    result.protocol = constants::protocol::kQuic;
     return result;
 }
 
-}  // namespace acpp

@@ -1,11 +1,15 @@
 #pragma once
 
+#include <openssl/base.h>
+#include "common/unsafe.hpp"
+
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <string_view>
 #include <vector>
 
-namespace acpp::vless {
+namespace vless {
 
 enum class VlessEncryptionMode : uint8_t {
     Native,
@@ -39,15 +43,43 @@ struct VlessEncryptionPadding {
     int to = 0;
 };
 
+struct VlessClientPfsKey {
+    std::vector<uint8_t> public_key;
+    std::shared_ptr<EVP_PKEY> mlkem_key;
+};
+
+struct VlessServerPfsKey {
+    std::vector<uint8_t> private_key;
+    std::vector<uint8_t> public_key;
+    std::shared_ptr<EVP_PKEY> mlkem_key;
+
+    VlessServerPfsKey() = default;
+    VlessServerPfsKey(std::vector<uint8_t> priv,
+                      std::vector<uint8_t> pub,
+                      std::shared_ptr<EVP_PKEY> mlkem) noexcept
+        : private_key(std::move(priv))
+        , public_key(std::move(pub))
+        , mlkem_key(std::move(mlkem)) {}
+    VlessServerPfsKey(const VlessServerPfsKey&) = default;
+    VlessServerPfsKey& operator=(const VlessServerPfsKey&) = default;
+    VlessServerPfsKey(VlessServerPfsKey&&) noexcept = default;
+    VlessServerPfsKey& operator=(VlessServerPfsKey&&) noexcept = default;
+    ~VlessServerPfsKey() noexcept {
+        if (!private_key.empty()) {
+            ::SecureZeroMemory(private_key.data(), private_key.size());
+        }
+    }
+};
+
 struct VlessEncryptionConfig {
     VlessEncryptionRole role = VlessEncryptionRole::Client;
     VlessEncryptionMode mode = VlessEncryptionMode::Native;
     bool zero_rtt = false;
     int64_t seconds_from = 0;
     int64_t seconds_to = 0;
-    std::vector<std::vector<uint8_t>> keys;
+    std::vector<VlessClientPfsKey> client_keys;
+    std::vector<VlessServerPfsKey> server_keys;
     std::vector<VlessEncryptionPadding> padding_lens;
-    std::vector<VlessEncryptionPadding> padding_gaps;
 };
 
 struct VlessEncryptionParseResult {
@@ -61,9 +93,6 @@ struct VlessEncryptionParseResult {
 
 [[nodiscard]] bool IsNoVlessEncryption(std::string_view value) noexcept;
 
-[[nodiscard]] uint32_t VlessEncryptionXorModeValue(
-    VlessEncryptionMode mode) noexcept;
-
 [[nodiscard]] VlessEncryptionParseResult ParseVlessClientEncryption(
     std::string_view encryption);
 
@@ -73,4 +102,4 @@ struct VlessEncryptionParseResult {
 [[nodiscard]] std::string_view VlessEncryptionParseErrorMessage(
     VlessEncryptionParseError error) noexcept;
 
-}  // namespace acpp::vless
+}  // namespace vless

@@ -1,15 +1,15 @@
 #pragma once
 
-#include "acppnode/common/allocator.hpp"
+#include "common/allocator.hpp"
 
 #include <array>
 #include <cstddef>
 #include <cstdint>
-#include <expected>
+#include <tl/expected.hpp>
 #include <span>
 #include <string_view>
 
-namespace acpp::transport::internet {
+namespace transport::internet {
 
 inline constexpr size_t kMaxGrpcHunkMessageSize = 4 * 1024 * 1024;
 
@@ -21,11 +21,16 @@ public:
     GrpcHunkDecoder(const GrpcHunkDecoder&) = delete;
     GrpcHunkDecoder& operator=(const GrpcHunkDecoder&) = delete;
 
-    [[nodiscard]] std::expected<size_t, std::string_view> Feed(std::span<const uint8_t> bytes);
+    [[nodiscard]] tl::expected<size_t, std::string_view> Feed(std::span<const uint8_t> bytes);
     [[nodiscard]] std::span<const uint8_t> Payload() const noexcept;
     void Consume(size_t size) noexcept;
     void Clear() noexcept;
     [[nodiscard]] bool AtMessageBoundary() const noexcept { return prefix_size_ == 0; }
+    [[nodiscard]] size_t NextFeedLimit() const noexcept {
+        return prefix_size_ < prefix_.size()
+            ? (prefix_.size() - prefix_size_)
+            : (message_size_ - message_.size());
+    }
 
 private:
     std::array<uint8_t, 5> prefix_{};
@@ -36,4 +41,4 @@ private:
     size_t data_end_ = 0;
 };
 
-}  // namespace acpp::transport::internet
+}  // namespace transport::internet

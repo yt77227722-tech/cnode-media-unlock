@@ -1,16 +1,17 @@
 #pragma once
 
-#include "acppnode/api/api.hpp"
-#include "acppnode/app/proxyman/inbound/prepared_config.hpp"
-#include "acppnode/service/controller/config.hpp"
+#include "api/api.hpp"
+#include "app/prepared_inbound.hpp"
+#include "app/proxyman/inbound/prepared_config.hpp"
+#include "app/proxyman/outbound/prepared_config.hpp"
+#include "node_state.hpp"
+#include "infra/panel_config.hpp"
 
 #include <memory>
 #include <string>
 #include <vector>
 
-namespace acpp {
 class Worker;
-class ConnectionLimiter;
 
 namespace controller {
 
@@ -20,24 +21,29 @@ class NodeRuntime {
 public:
     NodeRuntime(net::io_context& io_context,
                 const std::vector<std::unique_ptr<Worker>>& workers,
-                const std::vector<std::unique_ptr<ConnectionLimiter>>& limiters,
-                const PanelConfig& config)
-        : io_context_(io_context), workers_(workers), limiters_(limiters), config_(config) {}
+                const PanelConfig& config,
+                NodeState& state,
+                const bool& stopping)
+        : io_context_(io_context), workers_(workers), config_(config), state_(state),
+          stopping_(stopping) {}
 
     net::awaitable<void> RemoveInbound(const std::string& tag);
     net::awaitable<void> RemoveOutbound(const std::string& tag);
-    net::awaitable<bool> AddInbound(const api::NodeInfo& config);
-    net::awaitable<bool> AddOutbound(const std::string& tag);
-    net::awaitable<void> UpdateRules(const std::string& tag, const std::vector<api::DetectRule>& rules);
-    void ApplyUsers(const std::string& tag, const proxyman::inbound::UserSet& users);
-    void ClearUsers(const std::string& tag, const std::string& protocol);
+    net::awaitable<bool> AddInbound(const PreparedInbound& inbound);
+    net::awaitable<void> AddOutbound(const proxyman::outbound::PreparedOutboundConfig& prepared);
+    net::awaitable<void> UpdateRules(const std::string& tag, const std::vector<rule::DetectRule>& rules);
+    net::awaitable<void> ApplyUsers(const std::string& tag, const proxyman::inbound::UserSet& users);
+    net::awaitable<void> ClearUsers(const std::string& tag, const std::string& protocol);
+    net::awaitable<void> RecoverUsers();
+    [[nodiscard]] bool IsStopping() const noexcept { return stopping_; }
 
 private:
+    void ThrowIfStopping() const;
     net::io_context& io_context_;
     const std::vector<std::unique_ptr<Worker>>& workers_;
-    const std::vector<std::unique_ptr<ConnectionLimiter>>& limiters_;
     const PanelConfig& config_;
+    NodeState& state_;
+    const bool& stopping_;
 };
 
 }  // namespace controller
-}  // namespace acpp

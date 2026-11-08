@@ -1,86 +1,111 @@
-#include "acppnode/infra/config.hpp"
-#include "acppnode/core/naming.hpp"
-#include "acppnode/infra/log.hpp"
+#include "infra/config.hpp"
+#include "core/naming.hpp"
+#include "infra/log.hpp"
 
 #include "config_semantics.hpp"
 
 #include <algorithm>
 #include <unordered_set>
 
-namespace acpp {
 
-bool Config::Validate() const {
-    if (workers_ == 0 || workers_ > defaults::kMaxWorkers) {
-        LOG_ERROR("Worker count must be between 1 and {}", defaults::kMaxWorkers);
+namespace {
+
+std::vector<std::string> GetUsedRouteRuleTags(
+    const RoutingConfig& routing,
+    const std::vector<std::string> RouteRuleConfig::* field) {
+    std::vector<std::string> tags;
+    for (const auto& rule : routing.rules) {
+        for (const auto& tag : rule.*field) {
+            if (std::ranges::find(tags, tag) == tags.end()) {
+                tags.push_back(tag);
+            }
+        }
+    }
+    return tags;
+}
+
+}  // namespace
+
+bool ValidateConfig(const Config& config) {
+    if (config.workers == 0 || config.workers > defaults::kMaxWorkers) {
+        LOG_CONSOLE_ERROR("Worker count must be between 1 and {}", defaults::kMaxWorkers);
         return false;
     }
 
-    if (dns_.servers.empty()) {
-        LOG_ERROR("At least one DNS server is required");
+    if (config.dns.servers.empty()) {
+        LOG_CONSOLE_ERROR("At least one DNS server is required");
         return false;
     }
 
-    if (timeouts_.handshake == 0 || timeouts_.dial == 0) {
-        LOG_ERROR("Timeout values must be positive");
+    if (config.timeouts.handshake == 0 ||
+        config.timeouts.dial == 0 ||
+        config.timeouts.read == 0 ||
+        config.timeouts.write == 0 ||
+        config.timeouts.idle == 0 ||
+        config.timeouts.uplink_only == 0 ||
+        config.timeouts.downlink_only == 0 ||
+        config.dns.timeout == 0) {
+        LOG_CONSOLE_ERROR("Timeout values must be positive");
         return false;
     }
 
-    if (dns_.min_ttl > dns_.max_ttl) {
-        LOG_ERROR("DNS minTTL must be less than or equal to maxTTL");
+    if (config.dns.min_ttl > config.dns.max_ttl) {
+        LOG_CONSOLE_ERROR("DNS minTTL must be less than or equal to maxTTL");
         return false;
     }
 
     std::unordered_set<std::string> panel_nodes;
-    for (const auto& panel : panels_) {
+    for (const auto& panel : config.panels) {
         if (!panel.Validate()) {
             return false;
         }
         for (const int node_id : panel.NodeIDs.Values()) {
-            auto key = naming::BuildPanelNodeStatsKey(panel.Name, node_id);
+            auto key = naming::BuildPanelNodeAccountingKey(panel.Name, node_id);
             if (!panel_nodes.insert(key).second) {
-                LOG_ERROR("Duplicate panel node identity: {}", key);
+                const PanelLogContext log_context{panel.Name, panel.APIHost, node_id, panel.NodeType};
+                LOG_PANEL_ERROR(log_context, "Duplicate panel node identity");
                 return false;
             }
         }
     }
 
-    const auto inbound_semantic = ValidateStaticInboundSemantics(static_inbounds_);
+    const auto inbound_semantic = ValidateStaticInboundSemantics(config.static_inbounds);
     if (!inbound_semantic.Ok()) {
-        LOG_ERROR("Static inbound {}", inbound_semantic.Message());
+        LOG_CONSOLE_ERROR("Static inbound {}", inbound_semantic.Message());
         return false;
     }
 
     const auto semantic = ValidateOutboundSelectionSemantics(
-        outbounds_, routing_.rules, static_inbounds_);
+        config.outbounds, config.routing.rules, config.static_inbounds);
     switch (semantic.error) {
         case ConfigSemanticError::None:
             break;
         case ConfigSemanticError::NoOutbounds:
-            LOG_ERROR("At least one outbound is required");
+            LOG_CONSOLE_ERROR("At least one outbound is required");
             return false;
         case ConfigSemanticError::EmptyOutboundTag:
-            LOG_ERROR("Outbound at index {} has an empty tag", semantic.index);
+            LOG_CONSOLE_ERROR("Outbound at index {} has an empty tag", semantic.index);
             return false;
         case ConfigSemanticError::ReservedOutboundTag:
-            LOG_ERROR("Outbound at index {} uses reserved panel tag '{}'", semantic.index, semantic.tag);
+            LOG_CONSOLE_ERROR("Outbound at index {} uses reserved panel tag '{}'", semantic.index, semantic.tag);
             return false;
         case ConfigSemanticError::DuplicateOutboundTag:
-            LOG_ERROR("Duplicate outbound tag '{}' at index {}",
+            LOG_CONSOLE_ERROR("Duplicate outbound tag '{}' at index {}",
                       semantic.tag, semantic.index);
             return false;
         case ConfigSemanticError::EmptyRouteOutboundTag:
-            LOG_ERROR("Routing rule at index {} has an empty outbound tag",
+            LOG_CONSOLE_ERROR("Routing rule at index {} has an empty outbound tag",
                       semantic.index);
             return false;
         case ConfigSemanticError::UnknownRouteOutboundTag:
-            LOG_ERROR("Routing rule at index {} references unknown outbound '{}'",
+            LOG_CONSOLE_ERROR("Routing rule at index {} references unknown outbound '{}'",
                       semantic.index, semantic.tag);
             return false;
         case ConfigSemanticError::EmptyStaticInboundOutboundTag:
-            LOG_ERROR("Static inbound at index {} has an empty outboundTag", semantic.index);
+            LOG_CONSOLE_ERROR("Static inbound at index {} has an empty outboundTag", semantic.index);
             return false;
         case ConfigSemanticError::UnknownStaticInboundOutboundTag:
-            LOG_ERROR("Static inbound at index {} references unknown outboundTag '{}'",
+            LOG_CONSOLE_ERROR("Static inbound at index {} references unknown outboundTag '{}'",
                       semantic.index, semantic.tag);
             return false;
     }
@@ -88,28 +113,11 @@ bool Config::Validate() const {
     return true;
 }
 
-std::vector<std::string> Config::GetUsedGeoIPTags() const {
-    std::vector<std::string> tags;
-    for (const auto& rule : routing_.rules) {
-        for (const auto& tag : rule.geoip) {
-            if (!std::ranges::contains(tags, tag)) {
-                tags.push_back(tag);
-            }
-        }
-    }
-    return tags;
+std::vector<std::string> GetUsedGeoIPTags(const RoutingConfig& routing) {
+    return GetUsedRouteRuleTags(routing, &RouteRuleConfig::geoip);
 }
 
-std::vector<std::string> Config::GetUsedGeoSiteTags() const {
-    std::vector<std::string> tags;
-    for (const auto& rule : routing_.rules) {
-        for (const auto& tag : rule.geosite) {
-            if (!std::ranges::contains(tags, tag)) {
-                tags.push_back(tag);
-            }
-        }
-    }
-    return tags;
+std::vector<std::string> GetUsedGeoSiteTags(const RoutingConfig& routing) {
+    return GetUsedRouteRuleTags(routing, &RouteRuleConfig::geosite);
 }
 
-}  // namespace acpp

@@ -1,7 +1,9 @@
+#include <gtest/gtest.h>
+
 #include "anytls_codec.hpp"
 #include "padding.hpp"
-#include "acppnode/transport/async_stream.hpp"
-#include "acppnode/transport/link_error.hpp"
+#include "transport/async_stream.hpp"
+#include "transport/link_error.hpp"
 
 #include <asio/co_spawn.hpp>
 #include <asio/post.hpp>
@@ -12,7 +14,6 @@
 #include <stdexcept>
 
 namespace {
-using namespace acpp;
 std::array<void*, 128> allocations{};
 size_t live = 0;
 bool tracking = false;
@@ -104,7 +105,7 @@ buf::MultiBuffer Payload(size_t count) {
     return result;
 }
 
-template<class T> ErrorCode Result(const std::expected<T, ErrorCode>& value) {
+template<class T> ErrorCode Result(const tl::expected<T, ErrorCode>& value) {
     return value ? ErrorCode::OK : value.error();
 }
 
@@ -178,7 +179,7 @@ bool RunDeferredBatch() {
     const bool idle_before_await = stream.transferred == 0;
     bool returned = false;
     ErrorCode code = ErrorCode::INTERNAL;
-    net::co_spawn(io, std::move(pending), [&](std::exception_ptr error, std::expected<void, ErrorCode> result) {
+    net::co_spawn(io, std::move(pending), [&](std::exception_ptr error, tl::expected<void, ErrorCode> result) {
         returned = error == nullptr;
         code = Result(result);
     });
@@ -230,21 +231,21 @@ bool Run(int operation, Fault fault, size_t threshold) {
 }
 }
 
-int main() {
+TEST(AnytlsCodecErrors, Contract) {
     size_t passed = 0, total = 0;
     passed += RunFrameBatch(); ++total;
     passed += RunDeferredBatch(); ++total;
     for (int operation = 0; operation < 18; ++operation) {
-        passed += Run(operation, Fault::None, 0); ++total;
+        passed += ::Run(operation, Fault::None, 0); ++total;
         for (int fault = 1; fault < 8; ++fault) {
             for (size_t threshold : {size_t(0), size_t(3)}) {
-                passed += Run(operation, Fault(fault), threshold); ++total;
+                passed += ::Run(operation, Fault(fault), threshold); ++total;
             }
         }
     }
     for (int fault = 1; fault < 8; ++fault) {
-        passed += Run(16, Fault(fault), 65536); ++total;
+        passed += ::Run(16, Fault(fault), 65536); ++total;
     }
     std::printf("codec cases=%zu passed=%zu failed=%zu released=%d\n", total, passed, total - passed, live == 0);
-    return passed == total ? 0 : 1;
+    { ASSERT_TRUE(passed == total); return; }
 }

@@ -1,37 +1,41 @@
 #pragma once
 
-#include "acppnode/common/asio_types.hpp"
-#include "acppnode/common/buf/multi_buffer.hpp"
-#include "acppnode/common/target_address.hpp"
-#include "acppnode/transport/link.hpp"
+#include "common/asio_types.hpp"
+#include "common/buf/multi_buffer.hpp"
+#include "common/target_address.hpp"
+#include "transport/async_stream.hpp"
+#include "transport/link.hpp"
 
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <span>
 
-namespace acpp::trojan {
+namespace trojan {
 
 struct FramedUdpPacket {
     TargetAddress target;
     buf::MultiBuffer payload;
 };
 
-// Trojan UDP wire frames are contiguous on the stream but their logical
-// payload may span many internal 8KB Buffers.
+// Owns stream fragments until one complete tagged datagram, including an empty
+// payload, can be transferred. An empty container is reserved for stream EOF.
 class UdpFramer {
 public:
-    void Feed(const uint8_t* data, size_t len);
+    void Feed(buf::MultiBuffer input);
     [[nodiscard]] bool Next(FramedUdpPacket& out);
+    void Finish() const;
 
 private:
-    void Parse();
-    void CompactPending();
-
-    memory::ByteVector pending_;
-    size_t pending_offset_ = 0;
-    memory::ThreadLocalDeque<FramedUdpPacket> queue_;
-    bool shrink_queue_on_drain_ = false;
+    buf::MultiBuffer pending_;
+    std::optional<TargetAddress> target_;
+    size_t payload_size_ = 0;
+    bool failed_ = false;
 };
+
+net::awaitable<buf::MultiBuffer> ReadUdpDatagram(
+    AsyncStream& stream,
+    UdpFramer& framer);
 
 net::awaitable<void> WriteUdpDatagram(
     transport::MultiBufferWriter& writer,
@@ -42,4 +46,4 @@ net::awaitable<void> WriteUdpDatagram(
     const TargetAddress& target,
     std::span<const net::const_buffer> payload);
 
-}  // namespace acpp::trojan
+}  // namespace trojan

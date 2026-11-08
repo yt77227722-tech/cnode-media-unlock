@@ -1,22 +1,21 @@
-#include "acppnode/app/bootstrap_panels.hpp"
+#include "app/bootstrap_panels.hpp"
 
-#include "acppnode/api/panel_factory.hpp"
-#include "acppnode/service/controller/controller.hpp"
-#include "acppnode/service/controller/config.hpp"
-#include "acppnode/infra/config.hpp"
-#include "acppnode/infra/log.hpp"
+#include "api/panel_factory.hpp"
+#include "service/controller/controller.hpp"
+#include "infra/panel_config.hpp"
+#include "infra/config.hpp"
+#include "infra/log.hpp"
 
-namespace acpp {
 
 void SetupPanels(net::io_context& main_ctx,
                  Controller& controller,
                  const Config& config,
                  app::dns::DNS& panel_dns_service) {
-    if (config.GetPanels().empty()) {
+    if (config.panels.empty()) {
         return;
     }
 
-    for (const auto& panel_config : config.GetPanels()) {
+    for (const auto& panel_config : config.panels) {
         for (int node_id : panel_config.NodeIDs.Values()) {
             api::Config api_config;
             api_config.Name = panel_config.Name;
@@ -31,18 +30,11 @@ void SetupPanels(net::io_context& main_ctx,
 
             auto panel = api::CreatePanelClient(main_ctx, api_config, panel_dns_service);
             controller.AddPanel(std::move(panel), node_panel_config);
+            const PanelLogContext log_context{panel_config.Name, panel_config.APIHost,
+                node_id, panel_config.NodeType};
+            LOG_PANEL_INFO(log_context, "Panel node configured");
         }
 
-        std::string node_ids_str;
-        const auto node_ids = panel_config.NodeIDs.Values();
-        for (size_t i = 0; i < node_ids.size(); ++i) {
-            if (i > 0) node_ids_str += ", ";
-            node_ids_str += std::to_string(node_ids[i]);
-        }
-        LOG_CONSOLE("Panel {}: configured | {} | nodes [{}] | {}",
-                    panel_config.Name, panel_config.NodeType,
-                    node_ids_str, panel_config.APIHost);
     }
 }
 
-}  // namespace acpp

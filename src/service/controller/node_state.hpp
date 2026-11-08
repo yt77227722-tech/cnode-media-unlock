@@ -1,7 +1,9 @@
 #pragma once
 
-#include "acppnode/api/api.hpp"
-#include "acppnode/app/proxyman/inbound/prepared_config.hpp"
+#include "api/api.hpp"
+#include "app/prepared_inbound.hpp"
+#include "app/runtime_publication.hpp"
+#include "app/proxyman/outbound/prepared_config.hpp"
 
 #include <array>
 #include <cstdint>
@@ -10,16 +12,20 @@
 #include <string>
 #include <vector>
 
-namespace acpp::controller {
+namespace controller {
 
 // Constructed before runtime mutations and immutable after publication.
 struct NodeSnapshot {
     api::NodeInfo config;
     std::vector<api::UserInfo> users;
     std::string users_etag;
-    std::vector<api::DetectRule> rules;
+    std::string config_etag;
+    std::vector<rule::DetectRule> rules;
     std::string protocol;
     std::string tag;
+    // Prepared by the shared inbound builder; carries the prepared users.
+    std::shared_ptr<const PreparedInbound> inbound;
+    std::shared_ptr<const proxyman::outbound::PreparedOutboundConfig> outbound;
 };
 
 enum class NodeRuntimePhase { Stopped, Ready, Updating, RecoveryRequired };
@@ -30,9 +36,10 @@ struct NodeState {
     // A failed transition can leave only its old and candidate tags behind.
     // No new transition starts until both have been cleaned successfully.
     std::array<std::shared_ptr<const NodeSnapshot>, 2> pending_cleanup;
+    std::optional<UserPublicationRollback> user_recovery;
 
     [[nodiscard]] bool HasPendingCleanup() const noexcept {
-        return pending_cleanup[0] || pending_cleanup[1];
+        return pending_cleanup[0] || pending_cleanup[1] || user_recovery.has_value();
     }
 
     // Controller-executor admission uses the same snapshots as recovery.
@@ -51,10 +58,8 @@ struct NodeState {
 
 struct PreparedNodeChange {
     std::shared_ptr<const NodeSnapshot> next;
-    proxyman::inbound::UserSet users;
-    std::optional<proxyman::inbound::UserSet> previous_users;
     bool replace_users = true;
     bool replace_rules = true;
 };
 
-}  // namespace acpp::controller
+}  // namespace controller

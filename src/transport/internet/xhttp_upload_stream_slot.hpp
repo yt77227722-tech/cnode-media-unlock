@@ -1,11 +1,12 @@
 #pragma once
 
-#include "acppnode/transport/async_stream.hpp"
+#include "transport/async_stream.hpp"
+#include "common/allocator.hpp"
 
 #include <memory>
 #include <utility>
 
-namespace acpp::detail {
+namespace detail {
 
 // Worker-local single-upload owner. Readers take a shared snapshot across
 // co_await so Close can cancel and detach the stream without destroying an
@@ -13,11 +14,22 @@ namespace acpp::detail {
 template <typename Stream>
 class BasicXHttpUploadStreamSlot final {
 public:
-    [[nodiscard]] bool Attach(std::unique_ptr<Stream> stream) {
+    [[nodiscard]] bool Attach(std::unique_ptr<Stream>&& stream) {
         if (!stream || current_) {
             return false;
         }
-        current_ = std::shared_ptr<Stream>(std::move(stream));
+        // Commit the unique owner only after the PMR control block exists.
+        struct DeleteAfterCommit {
+            bool committed = false;
+            void operator()(Stream* value) const noexcept {
+                if (committed) delete value;
+            }
+        };
+        std::shared_ptr<Stream> shared(stream.get(), DeleteAfterCommit{},
+                                      memory::ThreadLocalAllocator<Stream>{});
+        std::get_deleter<DeleteAfterCommit>(shared)->committed = true;
+        (void)stream.release();
+        current_ = std::move(shared);
         return true;
     }
 
@@ -46,4 +58,4 @@ private:
 
 using XHttpUploadStreamSlot = BasicXHttpUploadStreamSlot<AsyncStream>;
 
-}  // namespace acpp::detail
+}  // namespace detail

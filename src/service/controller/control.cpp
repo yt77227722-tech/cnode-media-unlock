@@ -1,81 +1,109 @@
 #include "controller_impl.hpp"
 #include "../../common/awaitable_batch.hpp"
 
-#include "acppnode/app/traffic_types.hpp"
-#include "acppnode/app/worker.hpp"
-#include "acppnode/infra/log.hpp"
-#include "acppnode/common/online_device.hpp"
-#include "acppnode/common/serverstatus.hpp"
+#include "app/traffic_types.hpp"
+#include "app/worker.hpp"
+#include "core/naming.hpp"
+#include "infra/log.hpp"
+#include "common/online_device.hpp"
 
-#include <algorithm>
+#include <asio/bind_cancellation_slot.hpp>
+#include <asio/co_spawn.hpp>
+
 #include <cstdint>
 #include <exception>
-#include <string_view>
-#include <unordered_map>
+#include <iterator>
+#include <format>
 #include <vector>
 
-namespace acpp {
 
-net::awaitable<std::vector<api::UserTraffic>>
-Controller::Impl::getTraffic(const std::string& tag) {
-    using TrafficSnapshot = Worker::UserTrafficSnapshot;
-    std::vector<TrafficSnapshot> per_worker(workers_.size());
-
-    std::vector<net::awaitable<void>> tasks;
-    tasks.reserve(workers_.size());
-    for (size_t i = 0; i < workers_.size(); ++i) {
-        tasks.push_back(
-            [](Worker* w, const std::string& t,
-               TrafficSnapshot& out) -> net::awaitable<void> {
-                out = co_await w->PostTask(w->GetTrafficTask(t));
-            }(workers_[i].get(), tag, per_worker[i])
-        );
-    }
-    co_await RunAwaitableBatch(
-        io_context_.get_executor(), std::move(tasks));
-
-    size_t merged_hint = 0;
-    for (const auto& traffic : per_worker) {
-        merged_hint += traffic.size();
-    }
-
-    std::unordered_map<int64_t, api::UserTraffic> merged;
-    merged.reserve(merged_hint);
-    for (const auto& traffic : per_worker) {
-        for (const auto& [uid, t] : traffic) {
-            auto& m   = merged[uid];
-            m.UID      = uid;
-            m.Upload  += t.upload;
-            m.Download += t.download;
+net::awaitable<bool>
+Controller::Impl::collectTraffic(PanelRuntime& panel, bool* appended_out) {
+    // Do not abandon a durable append before its matching Worker commit.
+    // Shutdown joins this critical section before taking its final snapshot.
+    co_await net::this_coro::reset_cancellation_state(net::disable_cancellation());
+    // Only this panel loop may snapshot/commit its accounting key. The disk
+    // executor never touches Worker-owned state and has bounded admission.
+    bool appended = false;
+    for (const auto& worker : workers_) {
+        auto* w = worker.get();
+        auto snapshot = co_await w->PostTask(w->SnapshotTraffic(panel.accounting_key));
+        if (snapshot.empty()) continue;
+        std::exception_ptr append_failure;
+        try {
+            co_await journal_executor_->Run([&panel, &snapshot] {
+                panel.traffic_journal->Append(snapshot);
+                return true;
+            });
+        } catch (...) {
+            append_failure = std::current_exception();
+        }
+        if (append_failure) {
+            // The snapshot token may be the last owner after a connection has
+            // closed. Return it to the Worker ledger before unwinding.
+            try {
+                co_await w->PostTask(
+                    w->RollbackTraffic(panel.accounting_key, snapshot));
+            } catch (...) {
+                panel.traffic_journal->Suspend();
+                throw;
+            }
+            std::rethrow_exception(append_failure);
+        }
+        appended = true;
+        if (appended_out) *appended_out = true;
+        // A successful append is durable. A failed commit must suspend further
+        // collection, otherwise the same in-memory delta could be persisted twice.
+        try {
+            co_await w->PostTask(w->CommitTraffic(panel.accounting_key, snapshot));
+        } catch (...) {
+            panel.traffic_journal->Suspend();
+            throw;
         }
     }
+    co_return appended;
+}
 
-    std::vector<api::UserTraffic> result;
-    result.reserve(merged.size());
-    for (const auto& [uid, td] : merged) {
-        if (td.Upload > 0 || td.Download > 0) {
-            result.push_back(td);
+net::awaitable<void> Controller::Impl::FlushTraffic() {
+    co_await net::this_coro::reset_cancellation_state(net::disable_cancellation());
+    std::exception_ptr failure;
+    for (const auto& panel : panels_) {
+        try {
+            co_await collectTraffic(*panel);
+        } catch (const std::exception& error) {
+            if (!failure) failure = std::current_exception();
+            const PanelLogContext log_context{panel->config.Name, panel->config.APIHost,
+                panel->config.NodeIDs.Front(), panel->config.NodeType};
+            LOG_PANEL_ERROR(log_context, "Final traffic persistence failed: {}", error.what());
+        } catch (...) {
+            if (!failure) failure = std::current_exception();
+            const PanelLogContext log_context{panel->config.Name, panel->config.APIHost,
+                panel->config.NodeIDs.Front(), panel->config.NodeType};
+            LOG_PANEL_ERROR(log_context, "Final traffic persistence failed: unknown error");
         }
     }
-    co_return result;
+    if (failure) std::rethrow_exception(failure);
 }
 
 net::awaitable<controller::OnlineSnapshot>
 Controller::Impl::GetOnlineSnapshot(const std::string& tag) {
+    ThrowIfStopping();
     std::vector<std::vector<OnlineDevice>> per_worker(workers_.size());
 
     std::vector<net::awaitable<void>> tasks;
     tasks.reserve(workers_.size());
     for (size_t i = 0; i < workers_.size(); ++i) {
         tasks.push_back(
-            [](Worker* w, const std::string& t,
+            [](Impl* controller, Worker* w, std::string t,
                std::vector<OnlineDevice>& out) -> net::awaitable<void> {
-                out = co_await w->PostTask(w->GetOnlineDeviceTask(t));
-            }(workers_[i].get(), tag, per_worker[i])
+                controller->ThrowIfStopping();
+                out = co_await w->PostTask(w->GetOnlineDevices(std::move(t)));
+            }(this, workers_[i].get(), tag, per_worker[i])
         );
     }
     co_await RunAwaitableBatch(
         io_context_.get_executor(), std::move(tasks));
+    ThrowIfStopping();
 
     size_t total_online = 0;
     for (const auto& online : per_worker) {
@@ -84,141 +112,130 @@ Controller::Impl::GetOnlineSnapshot(const std::string& tag) {
 
     std::vector<OnlineDevice> devices;
     devices.reserve(total_online);
-    for (const auto& online : per_worker) {
-        devices.insert(devices.end(), online.begin(), online.end());
+    for (auto& online : per_worker) {
+        devices.insert(devices.end(),
+                       std::make_move_iterator(online.begin()),
+                       std::make_move_iterator(online.end()));
     }
     co_return controller::BuildOnlineSnapshot(std::move(devices));
 }
 
-net::awaitable<std::vector<api::DetectResult>>
-Controller::Impl::GetDetectResult(const std::string& tag) {
-    std::vector<std::vector<api::DetectResult>> per_worker(workers_.size());
+net::awaitable<void> Controller::Impl::userInfoMonitor(PanelRuntime& panel,
+                                                       std::string tag) {
+    const PanelLogContext log_context{panel.config.Name, panel.config.APIHost,
+        panel.config.NodeIDs.Front(), panel.config.NodeType};
 
-    std::vector<net::awaitable<void>> tasks;
-    tasks.reserve(workers_.size());
-    for (size_t i = 0; i < workers_.size(); ++i) {
-        tasks.push_back(
-            [](Worker* w, const std::string& t,
-               std::vector<api::DetectResult>& out) -> net::awaitable<void> {
-                out = co_await w->PostTask(w->GetDetectResultTask(t));
-            }(workers_[i].get(), tag, per_worker[i])
-        );
-    }
-    co_await RunAwaitableBatch(
-        io_context_.get_executor(), std::move(tasks));
-
-    size_t total = 0;
-    for (const auto& results : per_worker) {
-        total += results.size();
-    }
-
-    std::vector<api::DetectResult> merged;
-    merged.reserve(total);
-    for (const auto& results : per_worker) {
-        for (const auto& result : results) {
-            const auto duplicate = std::find_if(
-                merged.begin(), merged.end(),
-                [&](const api::DetectResult& current) {
-                    return current.UID == result.UID &&
-                           current.RuleID == result.RuleID;
+    ThrowIfStopping();
+    // Drain never-attempted crash/backpressure records before collecting more;
+    // otherwise a full journal of ready records could never free its capacity.
+    auto& ns = panel.stats;
+    controller::TrafficJournal::Batch batch;
+    bool traffic_ok = false;
+    bool journal_ok = true;
+    try {
+        batch = co_await journal_executor_->Run([&panel] {
+            return panel.traffic_journal->Prepare();
+        });
+        if (batch.records.empty()) {
+            // reset_cancellation_state in collectTraffic applies to its entire
+            // coroutine thread, not just that function. Join a shielded child so a
+            // durable append always reaches CommitTraffic without disabling stop
+            // cancellation for this loop's subsequent panel requests.
+            bool appended = false;
+            try {
+                co_await net::co_spawn(io_context_,
+                    collectTraffic(panel, &appended),
+                    net::bind_cancellation_slot(net::cancellation_slot{}, net::use_awaitable));
+            } catch (const std::exception& e) {
+                if (stopping_) throw;
+                journal_ok = false;
+                LOG_PANEL_WARN(log_context, "Traffic collection failed: operation=push reason={}", e.what());
+            }
+            ThrowIfStopping();
+            if (appended) {
+                batch = co_await journal_executor_->Run([&panel] {
+                    return panel.traffic_journal->Prepare();
                 });
-            if (duplicate == merged.end()) {
-                merged.push_back(result);
             }
         }
-    }
-    co_return merged;
-}
-
-net::awaitable<void> Controller::Impl::userInfoMonitor(PanelRuntime& panel,
-                                                 const std::string& tag) {
-    const int node_id = panel.config.NodeIDs.Front();
-    const auto& panel_name = panel.config.Name;
-
-    bool node_status_ok = false;
-    try {
-        api::NodeStatus node_status = serverstatus::GetSystemInfo();
-        node_status_ok = co_await panel.client->ReportNodeStatus(node_status);
-        if (!node_status_ok) {
-            LOG_WARN("Panel {}/{} report: node failed", panel_name, node_id);
+        ThrowIfStopping();
+        if (!batch.records.empty()) {
+            co_await journal_executor_->Run([&panel, &batch] {
+                panel.traffic_journal->Begin(batch);
+                return true;
+            });
+        }
+        const auto& traffic_data = batch.traffic;
+        uint64_t batch_up = 0;
+        uint64_t batch_down = 0;
+        for (const auto& td : traffic_data) {
+            batch_up += td.Upload;
+            batch_down += td.Download;
+        }
+        if (!batch.records.empty() || journal_ok) {
+            try {
+                // Marked unknown durably BEFORE any network transmission. Even non-2xx
+                // may follow partial server-side accounting; never retry these deltas.
+                // An empty push still clears the panel's previous online-user count.
+                traffic_ok = co_await panel.client->ReportUserTraffic(traffic_data);
+            } catch (const std::exception& e) {
+                if (stopping_) {
+                    if (!traffic_ok && !batch.records.empty()) {
+                        LOG_PANEL_ERROR(log_context, "Traffic accounting API acceptance unknown: records={} retained without retry; directory={}",
+                                        batch.records.size(), panel.traffic_journal->Directory().string());
+                    }
+                    throw;
+                }
+                LOG_PANEL_WARN(log_context, "Traffic report failed: operation=push reason={}", e.what());
+            }
+        }
+        if (!traffic_ok && !batch.records.empty()) {
+            LOG_PANEL_ERROR(log_context, "Traffic accounting API acceptance unknown: records={} retained without retry; directory={}",
+                            batch.records.size(), panel.traffic_journal->Directory().string());
+        }
+        if (traffic_ok) {
+            ns.bytes_up += batch_up;
+            ns.bytes_down += batch_down;
+            if (!batch.records.empty()) {
+                co_await journal_executor_->Run([&panel, &batch] {
+                    panel.traffic_journal->Acknowledge(batch);
+                    return true;
+                });
+            }
+        }
+        ThrowIfStopping();
+        if (traffic_ok) {
+            LOG_PANEL_DEBUG(log_context, "Traffic report accepted: users={}", traffic_data.size());
         }
     } catch (const std::exception& e) {
-        LOG_WARN("Panel {}/{} report: node failed | {}",
-                 panel_name, node_id, e.what());
-    }
-
-    auto traffic_data = co_await getTraffic(tag);
-    bool traffic_ok = false;
-    {
-        auto& ns = panel.stats;
-        // Match V2Board/v2node: node online users are the unique UIDs that
-        // produced traffic during this push interval.
-        ns.online_count = traffic_data.size();
-        for (const auto& td : traffic_data) {
-            ns.bytes_up   += td.Upload;
-            ns.bytes_down += td.Download;
-        }
+        if (stopping_) throw;
+        journal_ok = false;
+        LOG_PANEL_ERROR(log_context, "Traffic journal failed: operation=push reason={}", e.what());
     }
 
     auto online = co_await GetOnlineSnapshot(tag);
+    ns.online_count = online.user_count;
+    const auto& traffic_data = batch.traffic;
 
-    try {
-        // An empty push clears the panel's previous online-user count.
-        traffic_ok = co_await panel.client->ReportUserTraffic(traffic_data);
-        if (traffic_ok) {
-            LOG_DEBUG("Panel {}/{} report: traffic ok | users {}",
-                      panel_name, node_id, traffic_data.size());
-        }
-    } catch (const std::exception& e) {
-        LOG_WARN("Panel {}/{} report: traffic failed | {}",
-                 panel_name, node_id, e.what());
-    }
-
+    ThrowIfStopping();
     bool online_ok = false;
     try {
         online_ok = co_await panel.client->ReportNodeOnlineUsers(online.entries);
+        ThrowIfStopping();
     } catch (const std::exception& e) {
-        LOG_WARN("Panel {}/{} report: online failed | {}",
-                 panel_name, node_id, e.what());
+        if (stopping_) throw;
+        LOG_PANEL_WARN(log_context, "Online report failed: operation=push reason={}", e.what());
     }
 
-    auto detect_results = co_await GetDetectResult(tag);
-    const bool illegal_attempted = !detect_results.empty();
-    bool illegal_ok = !illegal_attempted;
-    if (!detect_results.empty()) {
-        try {
-            illegal_ok = co_await panel.client->ReportIllegal(detect_results);
-            if (illegal_ok) {
-                LOG_DEBUG("Panel {}/{} report: illegal ok | events {}",
-                          panel_name, node_id, detect_results.size());
-            }
-        } catch (const std::exception& e) {
-            LOG_WARN("Panel {}/{} report: illegal failed | {}",
-                     panel_name, node_id, e.what());
-        }
-    }
-    const auto result_text = [](bool attempted, bool ok) -> std::string_view {
-        if (!attempted) {
-            return "idle";
-        }
-        return ok ? "ok" : "failed";
-    };
-    const bool report_ok = node_status_ok && traffic_ok && online_ok && illegal_ok;
-    LOG_CONSOLE(
-        "Panel {}/{} report: {} | node {} | traffic {}/{} | online {}/{} | "
-        "devices {} | illegal {}/{}",
-        panel_name,
-        node_id,
+    const bool report_ok = traffic_ok && journal_ok && online_ok;
+    LOG_PANEL_INFO(log_context,
+        "Panel report: state={} operation=push traffic={} traffic_users={} online={} online_users={} devices={}",
         report_ok ? "ok" : "degraded",
-        node_status_ok ? "ok" : "failed",
-        traffic_ok ? "ok" : "failed",
+        (traffic_ok && journal_ok) ? "ok" : "failed",
         traffic_data.size(),
         online_ok ? "ok" : "failed",
         online.user_count,
-        online.entries.size(),
-        result_text(illegal_attempted, illegal_ok),
-        detect_results.size());
+        online.entries.size());
     co_return;
 }
 
-}  // namespace acpp

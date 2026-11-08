@@ -1,6 +1,8 @@
 #include "vless_encryption.hpp"
 
 #include "vless_encryption_crypto.hpp"
+#include "common/binary_text_codec.hpp"
+#include "transport/internet/http_headers.hpp"
 
 #include <algorithm>
 #include <charconv>
@@ -8,7 +10,7 @@
 #include <limits>
 #include <string>
 
-namespace acpp::vless {
+namespace vless {
 namespace {
 
 constexpr std::string_view kEncryptionName = "mlkem768x25519plus";
@@ -41,95 +43,36 @@ constexpr int kMaxPaddingLength = 18 + 65535;
     return true;
 }
 
-[[nodiscard]] int Base64RawUrlValue(char c) noexcept {
-    if (c >= 'A' && c <= 'Z') {
-        return c - 'A';
-    }
-    if (c >= 'a' && c <= 'z') {
-        return c - 'a' + 26;
-    }
-    if (c >= '0' && c <= '9') {
-        return c - '0' + 52;
-    }
-    if (c == '-') {
-        return 62;
-    }
-    if (c == '_') {
-        return 63;
-    }
-    return -1;
-}
-
-[[nodiscard]] std::optional<std::vector<uint8_t>> DecodeRawUrlBase64(
-    std::string_view value) {
-    if (value.empty() || value.find('=') != std::string_view::npos ||
-        value.size() % 4 == 1) {
-        return std::nullopt;
-    }
-
-    std::vector<uint8_t> out;
-    out.reserve(value.size() * 3 / 4);
-    uint32_t bits = 0;
-    int bit_count = 0;
-    for (char c : value) {
-        const int v = Base64RawUrlValue(c);
-        if (v < 0) {
-            return std::nullopt;
-        }
-        bits = (bits << 6) | static_cast<uint32_t>(v);
-        bit_count += 6;
-        if (bit_count >= 8) {
-            bit_count -= 8;
-            out.push_back(static_cast<uint8_t>((bits >> bit_count) & 0xff));
-        }
-    }
-    return out;
-}
-
 [[nodiscard]] VlessEncryptionParseError ParseMode(
     std::string_view value,
     VlessEncryptionMode& out) noexcept {
-    if (value == "native") {
+    if (transport::internet::EqualsAsciiCI(value, "native")) {
         out = VlessEncryptionMode::Native;
         return VlessEncryptionParseError::None;
     }
-    if (value == "xorpub") {
+    if (transport::internet::EqualsAsciiCI(value, "xorpub")) {
         out = VlessEncryptionMode::XorPub;
         return VlessEncryptionParseError::None;
     }
-    if (value == "random") {
+    if (transport::internet::EqualsAsciiCI(value, "random")) {
         out = VlessEncryptionMode::Random;
         return VlessEncryptionParseError::None;
     }
     return VlessEncryptionParseError::InvalidMode;
 }
 
-[[nodiscard]] std::vector<std::string_view> SplitDot(std::string_view value) {
+[[nodiscard]] std::vector<std::string_view> Split(std::string_view value,
+                                                  char separator) {
     std::vector<std::string_view> parts;
     size_t start = 0;
     while (start <= value.size()) {
-        const size_t dot = value.find('.', start);
-        if (dot == std::string_view::npos) {
+        const size_t pos = value.find(separator, start);
+        if (pos == std::string_view::npos) {
             parts.push_back(value.substr(start));
             break;
         }
-        parts.push_back(value.substr(start, dot - start));
-        start = dot + 1;
-    }
-    return parts;
-}
-
-[[nodiscard]] std::vector<std::string_view> SplitHyphen(std::string_view value) {
-    std::vector<std::string_view> parts;
-    size_t start = 0;
-    while (start <= value.size()) {
-        const size_t hyphen = value.find('-', start);
-        if (hyphen == std::string_view::npos) {
-            parts.push_back(value.substr(start));
-            break;
-        }
-        parts.push_back(value.substr(start, hyphen - start));
-        start = hyphen + 1;
+        parts.push_back(value.substr(start, pos - start));
+        start = pos + 1;
     }
     return parts;
 }
@@ -137,10 +80,10 @@ constexpr int kMaxPaddingLength = 18 + 65535;
 [[nodiscard]] VlessEncryptionParseError ParsePadding(
     const std::vector<std::string_view>& parts,
     VlessEncryptionConfig& out) {
-    int max_len = 0;
+    int64_t max_len = 0;
     for (size_t i = 0; i < parts.size(); ++i) {
-        const auto fields = SplitHyphen(parts[i]);
-        if (fields.size() < 3 || fields[0].empty() ||
+        const auto fields = Split(parts[i], '-');
+        if (fields.size() != 3 || fields[0].empty() ||
             fields[1].empty() || fields[2].empty()) {
             return VlessEncryptionParseError::InvalidPadding;
         }
@@ -148,7 +91,8 @@ constexpr int kMaxPaddingLength = 18 + 65535;
         VlessEncryptionPadding padding;
         if (!ParseInt(fields[0], padding.probability) ||
             !ParseInt(fields[1], padding.from) ||
-            !ParseInt(fields[2], padding.to)) {
+            !ParseInt(fields[2], padding.to) ||
+            padding.probability > 100) {
             return VlessEncryptionParseError::InvalidPadding;
         }
 
@@ -159,14 +103,14 @@ constexpr int kMaxPaddingLength = 18 + 65535;
             return VlessEncryptionParseError::InvalidPadding;
         }
 
+        // Odd parts are inter-fragment gaps; the handshake writes padding as
+        // one block, so they are validated but not retained.
         if (i % 2 == 0) {
             out.padding_lens.push_back(padding);
             max_len += std::max(padding.from, padding.to);
             if (max_len > kMaxPaddingLength) {
                 return VlessEncryptionParseError::PaddingTooLarge;
             }
-        } else {
-            out.padding_gaps.push_back(padding);
         }
     }
     return VlessEncryptionParseError::None;
@@ -182,11 +126,11 @@ VlessEncryptionParseResult ParseErrorResult(VlessEncryptionParseError error) {
 [[nodiscard]] VlessEncryptionParseResult ParseVlessEncryption(
     std::string_view value,
     VlessEncryptionRole role) {
-    auto parts = SplitDot(value);
+    auto parts = Split(value, '.');
     if (parts.size() < 4) {
         return ParseErrorResult(VlessEncryptionParseError::TooFewParts);
     }
-    if (parts[0] != kEncryptionName) {
+    if (!transport::internet::EqualsAsciiCI(parts[0], kEncryptionName)) {
         return ParseErrorResult(VlessEncryptionParseError::UnsupportedName);
     }
 
@@ -198,16 +142,16 @@ VlessEncryptionParseResult ParseErrorResult(VlessEncryptionParseError error) {
     }
 
     if (role == VlessEncryptionRole::Client) {
-        if (parts[2] == "1rtt") {
+        if (transport::internet::EqualsAsciiCI(parts[2], "1rtt")) {
             config.zero_rtt = false;
-        } else if (parts[2] == "0rtt") {
+        } else if (transport::internet::EqualsAsciiCI(parts[2], "0rtt")) {
             config.zero_rtt = true;
         } else {
             return ParseErrorResult(VlessEncryptionParseError::InvalidRtt);
         }
     } else {
         std::string_view seconds = parts[2];
-        if (seconds.ends_with('s')) {
+        if (seconds.ends_with('s') || seconds.ends_with('S')) {
             seconds.remove_suffix(1);
         }
         const size_t hyphen = seconds.find('-');
@@ -221,6 +165,9 @@ VlessEncryptionParseResult ParseErrorResult(VlessEncryptionParseError error) {
                 return ParseErrorResult(VlessEncryptionParseError::InvalidSeconds);
             }
         }
+        if (config.seconds_from > 65535 || config.seconds_to > 65535) {
+            return ParseErrorResult(VlessEncryptionParseError::InvalidSeconds);
+        }
     }
 
     std::vector<std::string_view> padding_parts;
@@ -231,33 +178,70 @@ VlessEncryptionParseResult ParseErrorResult(VlessEncryptionParseError error) {
             continue;
         }
 
-        auto key = DecodeRawUrlBase64(part);
-        if (!key) {
+        std::vector<uint8_t> key(Base64UrlDecodedSize(part.size()));
+        struct KeyCleanseGuard {
+            std::vector<uint8_t>& buf;
+            ~KeyCleanseGuard() noexcept {
+                if (!buf.empty()) OPENSSL_cleanse(buf.data(), buf.size());
+            }
+        } cleanse_key{key};
+        if (!DecodeBase64Url(part, key)) {
             return ParseErrorResult(VlessEncryptionParseError::InvalidBase64);
         }
-        const size_t len = key->size();
-        const bool key_ok = role == VlessEncryptionRole::Client
-            ? (len == kVlessX25519KeySize ||
-               len == kVlessMlKem768PublicKeySize)
-            : (len == kVlessX25519KeySize ||
-               len == kVlessMlKem768SeedSize);
-        if (!key_ok) {
-            return ParseErrorResult(VlessEncryptionParseError::InvalidKeyLength);
+        const size_t len = key.size();
+        if (role == VlessEncryptionRole::Client) {
+            if (len == kVlessX25519KeySize) {
+                config.client_keys.push_back(VlessClientPfsKey{
+                    .public_key = std::move(key),
+                    .mlkem_key = nullptr,
+                });
+            } else if (len == kVlessMlKem768PublicKeySize) {
+                auto mlkem_key = CreateVlessMlKem768PublicKey(key);
+                if (!mlkem_key) {
+                    return ParseErrorResult(
+                        VlessEncryptionParseError::InvalidKeyMaterial);
+                }
+                config.client_keys.push_back(VlessClientPfsKey{
+                    .public_key = std::move(key),
+                    .mlkem_key = std::move(mlkem_key),
+                });
+            } else {
+                return ParseErrorResult(
+                    VlessEncryptionParseError::InvalidKeyLength);
+            }
+        } else {
+            if (len == kVlessX25519KeySize) {
+                std::array<uint8_t, kVlessX25519KeySize> public_key{};
+                if (!DeriveVlessX25519PublicKey(key, public_key)) {
+                    return ParseErrorResult(
+                        VlessEncryptionParseError::InvalidKeyMaterial);
+                }
+                config.server_keys.emplace_back(
+                    std::move(key),
+                    std::vector<uint8_t>(public_key.begin(), public_key.end()),
+                    nullptr);
+            } else if (len == kVlessMlKem768SeedSize) {
+                auto mlkem_key = CreateVlessMlKem768PrivateKeyFromSeed(key);
+                auto public_key = DeriveVlessMlKem768PublicKey(mlkem_key.get());
+                if (!mlkem_key || !public_key) {
+                    return ParseErrorResult(
+                        VlessEncryptionParseError::InvalidKeyMaterial);
+                }
+                config.server_keys.emplace_back(
+                    std::move(key),
+                    std::vector<uint8_t>(public_key->begin(), public_key->end()),
+                    std::move(mlkem_key));
+            } else {
+                return ParseErrorResult(
+                    VlessEncryptionParseError::InvalidKeyLength);
+            }
         }
-        if (role == VlessEncryptionRole::Client &&
-            len == kVlessMlKem768PublicKeySize &&
-            !ValidateVlessMlKem768PublicKey(*key)) {
-            return ParseErrorResult(VlessEncryptionParseError::InvalidKeyMaterial);
-        }
-        if (role == VlessEncryptionRole::Server &&
-            len == kVlessMlKem768SeedSize &&
-            !DeriveVlessMlKem768PublicKeyFromSeed(*key)) {
-            return ParseErrorResult(VlessEncryptionParseError::InvalidKeyMaterial);
-        }
-        config.keys.push_back(std::move(*key));
     }
 
-    if (config.keys.empty()) {
+    const bool has_keys = role == VlessEncryptionRole::Client
+        ? !config.client_keys.empty()
+        : !config.server_keys.empty();
+    if (!has_keys) {
         return ParseErrorResult(VlessEncryptionParseError::EmptyKeys);
     }
 
@@ -275,19 +259,7 @@ VlessEncryptionParseResult ParseErrorResult(VlessEncryptionParseError error) {
 }  // namespace
 
 bool IsNoVlessEncryption(std::string_view value) noexcept {
-    return value.empty() || value == "none";
-}
-
-uint32_t VlessEncryptionXorModeValue(VlessEncryptionMode mode) noexcept {
-    switch (mode) {
-    case VlessEncryptionMode::Native:
-        return 0;
-    case VlessEncryptionMode::XorPub:
-        return 1;
-    case VlessEncryptionMode::Random:
-        return 2;
-    }
-    return 0;
+    return value.empty() || transport::internet::EqualsAsciiCI(value, "none");
 }
 
 VlessEncryptionParseResult ParseVlessClientEncryption(
@@ -337,4 +309,4 @@ std::string_view VlessEncryptionParseErrorMessage(
     return "unknown error";
 }
 
-}  // namespace acpp::vless
+}  // namespace vless

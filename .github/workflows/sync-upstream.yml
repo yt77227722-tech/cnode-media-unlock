@@ -23,6 +23,6 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git remote add upstream https://github.com/grrhuipp/cnode.git || true
           git fetch upstream main
-          git merge upstream/main -m "chore: auto sync from upstream grrhuipp/cnode" --no-edit || git merge --abort
+          git merge upstream/main --allow-unrelated-histories -X ours -m "chore: auto sync from upstream grrhuipp/cnode" --no-edit || git merge --abort
           git push origin main || true
           git push origin main:master || true

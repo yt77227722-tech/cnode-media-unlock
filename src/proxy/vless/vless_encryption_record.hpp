@@ -5,8 +5,9 @@
 #include <cstdint>
 #include <optional>
 #include <span>
+#include <openssl/aead.h>
 
-namespace acpp::vless {
+namespace vless {
 
 inline constexpr size_t kVlessEncryptionLengthSize = 2;
 inline constexpr size_t kVlessEncryptionRecordHeaderSize = 5;
@@ -29,7 +30,7 @@ enum class VlessEncryptionAeadCipher : uint8_t {
 [[nodiscard]] std::array<uint8_t, kVlessEncryptionLengthSize>
 EncodeVlessEncryptionLength(size_t length) noexcept;
 
-[[nodiscard]] std::optional<uint16_t> DecodeVlessEncryptionLength(
+[[nodiscard]] uint16_t DecodeVlessEncryptionLength(
     std::span<const uint8_t, kVlessEncryptionLengthSize> encoded) noexcept;
 
 [[nodiscard]] bool EncodeVlessEncryptionRecordHeader(
@@ -48,13 +49,13 @@ void IncreaseVlessEncryptionNonce(
 class VlessEncryptionAead {
 public:
     VlessEncryptionAead() noexcept = default;
-    ~VlessEncryptionAead() noexcept;
+    ~VlessEncryptionAead() noexcept = default;
 
     VlessEncryptionAead(const VlessEncryptionAead&) = delete;
     VlessEncryptionAead& operator=(const VlessEncryptionAead&) = delete;
 
-    VlessEncryptionAead(VlessEncryptionAead&& other) noexcept;
-    VlessEncryptionAead& operator=(VlessEncryptionAead&& other) noexcept;
+    VlessEncryptionAead(VlessEncryptionAead&&) noexcept = default;
+    VlessEncryptionAead& operator=(VlessEncryptionAead&&) noexcept = default;
 
     [[nodiscard]] static std::optional<VlessEncryptionAead> Create(
         std::span<const uint8_t> context,
@@ -92,13 +93,10 @@ public:
     }
 
 private:
-    void Close() noexcept;
-
-    std::array<uint8_t, kVlessEncryptionAeadKeySize> key_{};
     VlessEncryptionNonce nonce_{};
     VlessEncryptionAeadCipher cipher_ = VlessEncryptionAeadCipher::Aes256Gcm;
-    void* enc_ctx_ = nullptr;
-    void* dec_ctx_ = nullptr;
+    // Allocated once on creation; moves transfer ownership without copying keys.
+    bssl::UniquePtr<EVP_AEAD_CTX> aead_ctx_;
 };
 
 [[nodiscard]] std::optional<size_t> SealVlessEncryptionRecord(
@@ -112,4 +110,4 @@ private:
     std::span<const uint8_t> ciphertext,
     std::span<uint8_t> output) noexcept;
 
-}  // namespace acpp::vless
+}  // namespace vless

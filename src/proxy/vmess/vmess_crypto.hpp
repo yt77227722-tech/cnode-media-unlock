@@ -5,25 +5,19 @@
 //
 // 职责：底层加密函数、密钥派生（KDF）、哈希、随机数生成。
 // 不包含任何协议结构体或用户管理逻辑。
+// 底层 OpenSSL 失败属于系统故障，统一以异常上报，不返回未初始化输出。
 // ============================================================================
 
-#include "acppnode/common.hpp"
-#include "acppnode/common/allocator.hpp"
+#include "common.hpp"
+#include "common/allocator.hpp"
+#include <openssl/aes.h>
+#include "common/unsafe.hpp"
 #include <array>
-#include <string>
+#include <span>
 #include <string_view>
-#include <optional>
 #include <cstdint>
 
-namespace acpp {
 namespace vmess {
-
-// ============================================================================
-// UUID 解析
-// ============================================================================
-
-// 解析 UUID 字符串（带连字符）为字节数组
-std::optional<std::array<uint8_t, 16>> ParseUUID(const std::string& uuid_str);
 
 // ============================================================================
 // 哈希函数
@@ -31,14 +25,6 @@ std::optional<std::array<uint8_t, 16>> ParseUUID(const std::string& uuid_str);
 
 std::array<uint8_t, 16> MD5Hash(const uint8_t* data, size_t len);
 std::array<uint8_t, 32> SHA256Hash(const uint8_t* data, size_t len);
-
-// SHA256Sum (SHA256Hash 的别名)
-inline std::array<uint8_t, 32> SHA256Sum(const uint8_t* data, size_t len) {
-    return SHA256Hash(data, len);
-}
-
-std::array<uint8_t, 16> HMAC_MD5(const uint8_t* key, size_t key_len,
-                                  const uint8_t* data, size_t data_len);
 
 // ============================================================================
 // VMess AEAD KDF（嵌套 HMAC-SHA256）
@@ -51,6 +37,30 @@ void KDF(const uint8_t* key, size_t key_len,
 // KDF16 — 返回 16 字节派生密钥
 std::array<uint8_t, 16> KDF16(const uint8_t* key, size_t key_len,
                                std::span<const std::string_view> path);
+
+// AES-128-GCM 头部密钥与 nonce
+struct HeaderAeadKey {
+    std::array<uint8_t, 16> key{};
+    std::array<uint8_t, 12> nonce{};
+    ~HeaderAeadKey() noexcept {
+        ::SecureZeroMemory(key.data(), key.size());
+        ::SecureZeroMemory(nonce.data(), nonce.size());
+    }
+};
+
+// 请求头：由 cmd_key、AuthID 与 8 字节连接 nonce 派生
+HeaderAeadKey RequestHeaderLengthKey(std::span<const uint8_t, 16> cmd_key,
+                                     std::span<const uint8_t, 16> auth_id,
+                                     std::span<const uint8_t, 8> connection_nonce);
+HeaderAeadKey RequestHeaderPayloadKey(std::span<const uint8_t, 16> cmd_key,
+                                      std::span<const uint8_t, 16> auth_id,
+                                      std::span<const uint8_t, 8> connection_nonce);
+
+// 响应头：由响应 body key/IV 派生
+HeaderAeadKey ResponseHeaderLengthKey(std::span<const uint8_t, 16> response_key,
+                                      std::span<const uint8_t, 16> response_iv);
+HeaderAeadKey ResponseHeaderPayloadKey(std::span<const uint8_t, 16> response_key,
+                                       std::span<const uint8_t, 16> response_iv);
 
 // ============================================================================
 // AES-128-GCM
@@ -70,13 +80,6 @@ bool AES128GCMEncrypt(
     uint8_t* ciphertext, uint8_t* tag);
 
 // ============================================================================
-// AES-128-ECB（用于 AuthID 生成与验证）
-// ============================================================================
-
-void AES128ECBEncrypt(const uint8_t* key, const uint8_t* plaintext, uint8_t* ciphertext);
-void AES128ECBDecrypt(const uint8_t* key, const uint8_t* ciphertext, uint8_t* plaintext);
-
-// ============================================================================
 // 校验和
 // ============================================================================
 
@@ -87,20 +90,9 @@ uint32_t FNV1a32(const uint8_t* data, size_t len);
 // AuthID 生成（客户端使用）
 // ============================================================================
 
-void GenerateAuthID(const uint8_t* auth_key, int64_t timestamp, uint8_t* out_auth_id);
-
-// ============================================================================
-// 随机数
-// ============================================================================
-
-void RandomBytes(uint8_t* buf, size_t len);
-
-// ============================================================================
-// SHAKE128（用于 chunk masking）
-// ============================================================================
-
-void SHAKE128(const uint8_t* input, size_t input_len,
-              uint8_t* output, size_t output_len);
+// AES-128 encrypt schedule of an account's AuthID key, expanded once when the
+// outbound account is prepared; requests only borrow it.
+[[nodiscard]] AES_KEY ExpandAuthIDEncryptKey(const std::array<uint8_t, 16>& auth_key);
+void GenerateAuthID(const AES_KEY& auth_id_key, int64_t timestamp, uint8_t* out_auth_id);
 
 }  // namespace vmess
-}  // namespace acpp

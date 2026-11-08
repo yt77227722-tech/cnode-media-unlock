@@ -1,19 +1,15 @@
 #include "udp_framing.hpp"
 
-#include "vless_codec.hpp"
-#include "acppnode/common/buffer_util.hpp"
-#include "acppnode/common/container_util.hpp"
+#include "common/buffer_util.hpp"
 
 #include <array>
 #include <cstring>
 #include <limits>
 #include <new>
 
-namespace acpp::vless {
+namespace vless {
 
 namespace {
-
-constexpr size_t kUdpFrameQueueShrinkItems = 64;
 
 struct PacketAddrHeader {
     TargetAddress target;
@@ -86,12 +82,12 @@ std::optional<PacketAddrHeader> DecodePacketAddrHeader(
     return std::nullopt;
 }
 
-bool EncodeUdpHeaderTo(const TargetAddress& target,
-                       bool packet_addr,
-                       size_t payload_size,
-                       buf::Buffer& out) noexcept {
-    if (payload_size == 0 || payload_size > std::numeric_limits<uint16_t>::max()) {
-        return false;
+size_t EncodeUdpHeaderTo(const TargetAddress& target,
+                         bool packet_addr,
+                         size_t payload_size,
+                         std::span<uint8_t> out) noexcept {
+    if (payload_size > std::numeric_limits<uint16_t>::max()) {
+        return 0;
     }
 
     std::array<uint8_t, 19> address{};
@@ -99,22 +95,20 @@ bool EncodeUdpHeaderTo(const TargetAddress& target,
         ? EncodePacketAddrHeaderTo(target, address.data(), address.size())
         : 0;
     if (packet_addr && address_size == 0) {
-        return false;
+        return 0;
     }
     if (address_size > std::numeric_limits<uint16_t>::max() - payload_size ||
-        out.Available() < address_size + 2) {
-        return false;
+        out.size() < address_size + 2) {
+        return 0;
     }
 
     const size_t frame_payload_size = address_size + payload_size;
-    auto tail = out.Tail();
-    tail[0] = static_cast<uint8_t>(frame_payload_size >> 8);
-    tail[1] = static_cast<uint8_t>(frame_payload_size);
+    out[0] = static_cast<uint8_t>(frame_payload_size >> 8);
+    out[1] = static_cast<uint8_t>(frame_payload_size);
     if (address_size > 0) {
-        std::memcpy(tail.data() + 2, address.data(), address_size);
+        std::memcpy(out.data() + 2, address.data(), address_size);
     }
-    out.Produce(static_cast<uint32_t>(address_size + 2));
-    return true;
+    return address_size + 2;
 }
 
 }  // namespace
@@ -123,86 +117,77 @@ bool IsPacketAddrMagic(const TargetAddress& target) noexcept {
     return target.IsDomain() && target.host == kPacketAddrMagicAddress;
 }
 
-void UdpFramer::Feed(const uint8_t* data, size_t len) {
-    if (len == 0) {
-        return;
+void UdpFramer::Feed(buf::MultiBuffer input) {
+    if (failed_) {
+        throw IoSystemError(io_error::invalid_argument, "failed VLESS UDP stream");
     }
-    if (!data) {
-        throw IoSystemError(io_error::invalid_argument, "null VLESS UDP input");
-    }
-
-    CompactPending();
-    pending_.insert(pending_.end(), data, data + len);
-    Parse();
+    pending_.Append(std::move(input));
 }
 
 bool UdpFramer::Next(FramedUdpPacket& out) {
-    if (queue_.empty()) {
-        return false;
+    if (failed_) {
+        throw IoSystemError(io_error::invalid_argument, "failed VLESS UDP stream");
     }
-    out = std::move(queue_.front());
-    queue_.pop_front();
-    if (queue_.empty() && shrink_queue_on_drain_) {
-        TryShrinkSequence(queue_);
-        shrink_queue_on_drain_ = false;
-    }
-    return true;
-}
-
-void UdpFramer::Parse() {
-    while (pending_offset_ < pending_.size()) {
-        const uint8_t* data = pending_.data() + pending_offset_;
-        const size_t size = pending_.size() - pending_offset_;
-        auto parsed = Codec::ParseUdpPacket(data, size);
-        if (parsed.result == Codec::UdpParseResult::INCOMPLETE) {
-            break;
+    out = {};
+    for (;;) {
+        buf::MultiBuffer payload;
+        const auto result = pending_.Pop(payload);
+        if (result == buf::LengthPrefixedPacketBuffer::PopResult::NeedMore) {
+            return false;
         }
-        if (parsed.result == Codec::UdpParseResult::INVALID ||
-            !parsed.packet || parsed.consumed == 0) {
-            ++pending_offset_;
-            continue;
+        if (result == buf::LengthPrefixedPacketBuffer::PopResult::Invalid) {
+            failed_ = true;
+            pending_.Clear();
+            throw IoSystemError(io_error::invalid_argument, "invalid VLESS UDP frame");
         }
-
-        FramedUdpPacket packet;
-        std::span<const uint8_t> payload = parsed.packet->payload;
         if (packet_addr_) {
-            auto header = DecodePacketAddrHeader(payload);
-            if (!header || header->consumed >= payload.size()) {
-                pending_offset_ += parsed.consumed;
-                continue;
+            std::array<uint8_t, 19> address{};
+            const size_t copied = payload.CopyPrefixTo(address);
+            auto header = DecodePacketAddrHeader(
+                std::span<const uint8_t>(address.data(), copied));
+            if (!header || !header->target.IsValid()) {
+                failed_ = true;
+                pending_.Clear();
+                throw IoSystemError(
+                    io_error::invalid_argument, "invalid VLESS packet address");
             }
-            packet.target = std::move(header->target);
-            payload = payload.subspan(header->consumed);
+            out.target = std::move(header->target);
+            (void)payload.DropPrefixBytes(header->consumed);
         }
-        if (!buf::AppendSpanToMultiBuffer(payload, packet.payload)) {
-            throw std::bad_alloc();
-        }
-        pending_offset_ += parsed.consumed;
-        queue_.push_back(std::move(packet));
-        if (queue_.size() >= kUdpFrameQueueShrinkItems) {
-            shrink_queue_on_drain_ = true;
-        }
+        out.payload = std::move(payload);
+        return true;
     }
-    CompactPending();
 }
 
-void UdpFramer::CompactPending() {
-    if (pending_offset_ == 0) {
-        return;
+void UdpFramer::Finish() const {
+    if (failed_) {
+        throw IoSystemError(io_error::invalid_argument, "failed VLESS UDP stream");
     }
-    if (pending_offset_ >= pending_.size()) {
-        pending_.clear();
-        pending_offset_ = 0;
-        return;
+    pending_.Finish();
+}
+
+net::awaitable<buf::MultiBuffer> UdpFramer::ReadDatagram(
+    transport::MultiBufferReader& src,
+    const TargetAddress& session_target) {
+    for (;;) {
+        FramedUdpPacket packet;
+        if (Next(packet)) {
+            const TargetAddress& target = packet.target
+                ? *packet.target
+                : session_target;
+            if (!buf::SetUdpTarget(packet.payload, target)) {
+                throw std::bad_alloc();
+            }
+            co_return std::move(packet.payload);
+        }
+
+        buf::MultiBuffer raw = co_await ReadMultiBufferOrThrowOnCancel(src);
+        if (raw.byte_size() == 0) {
+            Finish();
+            co_return buf::MultiBuffer{};
+        }
+        Feed(std::move(raw));
     }
-    if (pending_offset_ < buf::Buffer::kSize &&
-        pending_offset_ * 2 < pending_.size()) {
-        return;
-    }
-    pending_.erase(
-        pending_.begin(),
-        pending_.begin() + static_cast<std::ptrdiff_t>(pending_offset_));
-    pending_offset_ = 0;
 }
 
 net::awaitable<void> WriteUdpDatagram(
@@ -226,30 +211,18 @@ net::awaitable<void> WriteUdpDatagram(
             "VLESS UDP datagram target differs from the fixed session target");
     }
 
-    buf::BufferGuard header{buf::Buffer::New()};
-    if (!header) {
-        throw std::bad_alloc();
-    }
-    if (!EncodeUdpHeaderTo(
-            *datagram.target, packet_addr, datagram.payload_size, *header)) {
+    std::array<uint8_t, 32> header{};
+    const size_t header_size = EncodeUdpHeaderTo(
+        *datagram.target, packet_addr, datagram.payload_size, header);
+    if (header_size == 0) {
         throw IoSystemError(
             io_error::message_size, "invalid VLESS UDP datagram size or target");
     }
 
-    for (buf::Buffer* buffer : payload) {
-        if (buffer) {
-            buffer->ClearUDP();
-        }
-    }
-    buf::MultiBuffer framed{std::move(header)};
-    payload.MoveTo(framed, true);
-    co_await writer.WriteMultiBuffer(std::move(framed));
-}
-
-net::awaitable<void> WriteUdpDatagram(
-    transport::MultiBufferWriter& writer,
-    std::span<const net::const_buffer> payload) {
-    co_await WriteUdpDatagram(writer, TargetAddress{}, false, payload);
+    ConstBufferSpanBuilder<1 + buf::MultiBuffer::kInlineCapacity> framed;
+    framed.Append(net::buffer(header.data(), header_size));
+    framed.AppendMultiBuffer(payload);
+    co_await writer.WriteBuffers(framed.Span());
 }
 
 net::awaitable<void> WriteUdpDatagram(
@@ -257,32 +230,25 @@ net::awaitable<void> WriteUdpDatagram(
     const TargetAddress& target,
     bool packet_addr,
     std::span<const net::const_buffer> payload) {
-    size_t payload_size = 0;
-    for (const auto& buffer : payload) {
-        if (buffer.size() >
-            std::numeric_limits<uint16_t>::max() - payload_size) {
-            throw IoSystemError(
-                io_error::message_size, "VLESS UDP datagram is too large");
-        }
-        payload_size += buffer.size();
-    }
-    if (payload_size == 0) {
-        co_return;
+    const auto payload_size = buf::TrySumBufferSizes(
+        payload, std::numeric_limits<uint16_t>::max());
+    if (!payload_size) {
+        throw IoSystemError(
+            io_error::message_size, "VLESS UDP datagram is too large");
     }
 
-    buf::BufferGuard header{buf::Buffer::New()};
-    if (!header) {
-        throw std::bad_alloc();
-    }
-    if (!EncodeUdpHeaderTo(target, packet_addr, payload_size, *header)) {
+    std::array<uint8_t, 32> header{};
+    const size_t header_size = EncodeUdpHeaderTo(
+        target, packet_addr, *payload_size, header);
+    if (header_size == 0) {
         throw IoSystemError(
             io_error::message_size, "invalid VLESS UDP datagram size or target");
     }
 
     ConstBufferSpanBuilder<8> framed;
-    framed.Append(net::buffer(header->Bytes()));
+    framed.Append(net::buffer(header.data(), header_size));
     framed.AppendBuffers(payload);
     co_await writer.WriteBuffers(framed.Span());
 }
 
-}  // namespace acpp::vless
+}  // namespace vless

@@ -1,8 +1,8 @@
 #pragma once
 
-#include "acppnode/common/error.hpp"
-#include "acppnode/transport/phase_deadline.hpp"
-#include "acppnode/transport/internet/timeout_scheduler.hpp"
+#include "common/error.hpp"
+#include "transport/phase_deadline.hpp"
+#include "transport/internet/timeout_scheduler.hpp"
 
 #include <chrono>
 #include <cstdint>
@@ -10,18 +10,18 @@
 #include <optional>
 #include <stdexcept>
 
-namespace acpp::transport::internet::detail {
+namespace transport::internet::detail {
 
-// Worker-thread-only aggregate deadlines for one connection. The scheduler
-// callback borrows this object; destruction cancels its sole event token.
+// Domain-owned aggregate deadlines. The sole embedded event follows the domain's
+// current Worker scheduler without retaining a pre-handoff scheduler reference.
 template<class Owner>
-class ConnectionTimeouts {
+class ConnectionTimeouts final : private TimeoutEvent {
 public:
     using Clock = std::chrono::steady_clock;
     using TimePoint = Clock::time_point;
 
     ConnectionTimeouts(net::io_context& io_context, Owner& owner)
-        : scheduler_(TimeoutScheduler::ForIoContext(io_context)), owner_(owner) {}
+        : TimeoutEvent(io_context), owner_(owner) {}
     ConnectionTimeouts(const ConnectionTimeouts&) = delete;
     ConnectionTimeouts& operator=(const ConnectionTimeouts&) = delete;
     ~ConnectionTimeouts() noexcept { Stop(); }
@@ -53,11 +53,23 @@ public:
     }
 
     [[nodiscard]] PhaseDeadlineHandle StartPhaseDeadline(std::chrono::seconds timeout) {
-        ClearPhaseDeadline();
-        if (stopped_ || timeout <= std::chrono::seconds::zero()) return {};
-        phase_deadline_ = Deadline(timeout);
+        ++phase_generation_;
         phase_expired_ = false;
-        Reconcile();
+        UpdateFlags();
+        if (stopped_ || timeout <= std::chrono::seconds::zero()) {
+            phase_deadline_.reset();
+            ReconcileNoThrow();
+            return {};
+        }
+        phase_deadline_ = Deadline(timeout);
+        armed_deadline_.reset();
+        try {
+            Reconcile();
+        } catch (...) {
+            phase_deadline_.reset();
+            ReconcileNoThrow();
+            throw;
+        }
         return {&flags_, kPhaseMask, &phase_generation_, phase_generation_};
     }
 
@@ -74,6 +86,9 @@ public:
     [[nodiscard]] bool ConsumeWriteTimeout() noexcept { return Consume(write_expired_); }
     [[nodiscard]] bool ConsumePhaseDeadline() noexcept { return Consume(phase_expired_); }
 
+    [[nodiscard]] bool IsPending(bool is_read) const noexcept {
+        return is_read ? read_pending_ : write_pending_;
+    }
     void BeginRead() {
         CheckCanBegin(read_pending_);
         read_pending_ = true;
@@ -110,7 +125,7 @@ public:
         read_deadline_.reset();
         write_deadline_.reset();
         phase_deadline_.reset();
-        scheduler_.Cancel(token_);
+        Cancel();
         armed_deadline_.reset();
     }
 
@@ -161,16 +176,18 @@ private:
         if (stopped_) return;
         const auto first = Earliest();
         if (first == TimePoint::max()) {
-            scheduler_.Cancel(token_);
+            Cancel();
             armed_deadline_.reset();
             return;
         }
         // Earlier waits can safely wake later deadlines; avoid churn when idle
         // activity moves its deadline forward.
-        if (token_.Valid() && armed_deadline_ && *armed_deadline_ <= first) return;
-        scheduler_.Cancel(token_);
+        if (Valid() && armed_deadline_ && *armed_deadline_ <= first) return;
         armed_deadline_.reset();
-        token_ = scheduler_.ScheduleAfter(DelayUntil(first), [this]() noexcept { OnWake(); });
+        if (!ScheduleAfter(DelayUntil(first))) {
+            Cancel();
+            return;
+        }
         armed_deadline_ = first;
     }
     void ReconcileNoThrow() noexcept {
@@ -178,8 +195,7 @@ private:
         catch (const std::bad_alloc&) { Fail(ErrorCode::RESOURCE_EXHAUSTED); }
         catch (...) { Fail(ErrorCode::INTERNAL); }
     }
-    void OnWake() noexcept {
-        token_.Reset();
+    void OnTimeout() noexcept override {
         armed_deadline_.reset();
         if (stopped_) return;
         const auto now = Clock::now();
@@ -200,9 +216,7 @@ private:
         owner_.OnTimeout(reason);
     }
 
-    TimeoutScheduler& scheduler_;
     Owner& owner_;
-    TimeoutToken token_;
     std::optional<TimePoint> idle_deadline_, read_deadline_, write_deadline_, phase_deadline_;
     std::optional<TimePoint> armed_deadline_;
     std::chrono::seconds idle_timeout_{0}, read_timeout_{0}, write_timeout_{0};
@@ -212,4 +226,4 @@ private:
     bool idle_expired_ = false, read_expired_ = false, write_expired_ = false, phase_expired_ = false;
 };
 
-}  // namespace acpp::transport::internet::detail
+}  // namespace transport::internet::detail

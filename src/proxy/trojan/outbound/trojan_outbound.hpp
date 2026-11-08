@@ -2,39 +2,29 @@
 
 #include "../credentials.hpp"
 
-#include "acppnode/proxy/outbound.hpp"
-#include "acppnode/transport/internet/stream_settings.hpp"
-#include "acppnode/transport/internet/outbound_bind.hpp"
+#include "proxy/outbound.hpp"
+#include "transport/internet/outbound_sender.hpp"
 
 #include <chrono>
-#include <cstdint>
-#include <optional>
-#include <span>
-#include <string>
-#include <string_view>
+#include "common/unsafe.hpp"
+#include <memory>
 
-namespace acpp {
-
-namespace app::dns {
-class DNS;
-}  // namespace app::dns
 
 // ============================================================================
-// Trojan Outbound 配置
+// Trojan Outbound 配置（传输层与 sendThrough 属于 Handler 的 sender settings）
 // ============================================================================
 struct TrojanOutboundConfig {
-    std::string address;            // 服务器地址
-    std::optional<net::ip::address> literal_address; // 冷路径解析的 IP 字面量
-    uint16_t port = 443;            // 服务器端口
+    OutboundServer server;
     trojan::PasswordHash password_hash{};
 
-    // 传输层配置（保持现有 streamSettings JSON）
-    StreamSettings stream_settings;
-    OutboundBind send_through;
-
-    // 连接配置
-    std::chrono::seconds timeout{10};
-
+    TrojanOutboundConfig() = default;
+    TrojanOutboundConfig(const TrojanOutboundConfig&) = default;
+    TrojanOutboundConfig& operator=(const TrojanOutboundConfig&) = default;
+    TrojanOutboundConfig(TrojanOutboundConfig&&) noexcept = default;
+    TrojanOutboundConfig& operator=(TrojanOutboundConfig&&) noexcept = default;
+    ~TrojanOutboundConfig() noexcept {
+        ::SecureZeroMemory(password_hash.data(), password_hash.size());
+    }
 };
 
 // ============================================================================
@@ -42,34 +32,26 @@ struct TrojanOutboundConfig {
 // ============================================================================
 namespace proxy::trojan::outbound {
 
-class Handler final : public ::acpp::Outbound {
+class Handler final : public ::Outbound {
 public:
-    Handler(std::string tag,
-            const ::acpp::TrojanOutboundConfig& config,
-            ::acpp::app::dns::DNS& dns_service);
+    explicit Handler(std::shared_ptr<const ::TrojanOutboundConfig> config);
 
     ~Handler() override;
 
-    ::acpp::net::awaitable<::acpp::OutboundProcessResult> Process(
-        ::acpp::net::io_context& io_context,
-        const ::acpp::tcp::endpoint* inbound_local_addr,
-        ::acpp::session::Context& ctx,
-        const ::acpp::TimeoutsConfig& timeouts,
-        ::acpp::transport::Link inbound,
-        ::acpp::StatsShard& stats,
-        const ::acpp::RelayConfig& relay_config,
-        ::acpp::buf::MultiBuffer first_payload,
+    ::net::awaitable<::OutboundProcessResult> Process(
+        ::session::Context& ctx,
+        ::transport::Link inbound,
+        ::OutboundDialer& dialer,
+        const ::TimeoutsConfig& timeouts,
+        ::StatsShard& stats,
+        const ::RelayConfig& relay_config,
+        ::buf::MultiBufferBatch first_payload,
         std::chrono::seconds relay_idle_timeout,
         std::chrono::seconds relay_write_timeout) override;
 
-    std::string_view Tag() const noexcept override { return tag_; }
-
 private:
-    std::string tag_;
-    const ::acpp::TrojanOutboundConfig config_;
-    ::acpp::app::dns::DNS& dns_service_;
+    std::shared_ptr<const ::TrojanOutboundConfig> config_;
 };
 
 }  // namespace proxy::trojan::outbound
 
-}  // namespace acpp

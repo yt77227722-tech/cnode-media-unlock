@@ -1,14 +1,14 @@
 #pragma once
 
-#include "acppnode/features/routing/dispatch_policy.hpp"
-#include "acppnode/features/routing/router.hpp"
+#include "features/routing/dispatch_policy.hpp"
+#include "features/routing/router.hpp"
 
 #include <cassert>
 #include <cstdint>
 #include <string_view>
 #include <variant>
 
-namespace acpp::app::dispatcher::detail {
+namespace app::dispatcher::detail {
 
 enum class SelectionSource : uint8_t {
     Forced,
@@ -19,7 +19,6 @@ enum class SelectionSource : uint8_t {
 struct OutboundSelection {
     std::string_view outbound_tag;
     SelectionSource source = SelectionSource::Fallback;
-    uint32_t rule_index = 0;
 };
 
 [[nodiscard]] inline bool RequiresRouting(
@@ -43,7 +42,6 @@ struct OutboundSelection {
         return OutboundSelection{
             .outbound_tag = rule.outbound_tag,
             .source = SelectionSource::Rule,
-            .rule_index = rule.rule_index,
         };
     }
     return OutboundSelection{
@@ -52,4 +50,4 @@ struct OutboundSelection {
     };
 }
 
-}  // namespace acpp::app::dispatcher::detail
+}  // namespace app::dispatcher::detail

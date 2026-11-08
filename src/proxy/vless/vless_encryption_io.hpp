@@ -1,95 +1,94 @@
 #pragma once
 
-#include "acppnode/common/allocator.hpp"
-#include "acppnode/common/asio_types.hpp"
-#include "acppnode/common/buf/multi_buffer.hpp"
-#include "acppnode/transport/link.hpp"
+#include "common/allocator.hpp"
+#include "common/asio_types.hpp"
+#include "common/buf/multi_buffer.hpp"
+#include "transport/link.hpp"
 
+#include "vless_encryption_crypto.hpp"
 #include "vless_encryption_record.hpp"
 #include "vless_encryption_xor.hpp"
-#include "vless_io_util.hpp"
+#include "vless_buffered_reader.hpp"
 
+#include <array>
 #include <cstdint>
 #include <optional>
 #include <span>
+#include <variant>
 
-namespace acpp::vless {
+namespace vless {
+
+struct VlessEncryptionClientTicketCache;
+
+// 0-RTT client read side: it is keyed by the server random that prefixes the
+// first response bytes, which also seeds the header XOR when enabled.
+struct VlessEncryptionDeferredRead {
+    VlessEncryptionAeadCipher cipher = VlessEncryptionAeadCipher::Aes256Gcm;
+    bool header_xor = false;
+    VlessEncryptionClientTicketCache* ticket_cache = nullptr;
+};
+using VlessEncryptionReadKeys =
+    std::variant<VlessEncryptionAead, VlessEncryptionDeferredRead>;
 
 class VlessEncryptionReader final : public transport::MultiBufferReader {
 public:
     transport::CancellationSource& Cancellation() noexcept override { return src_.Cancellation(); }
     transport::EofAction ReadEofAction() const noexcept override { return src_.ReadEofAction(); }
 
-    [[nodiscard]] static std::optional<VlessEncryptionReader> Create(
-        transport::MultiBufferReader& src,
-        std::span<const uint8_t> read_context,
-        std::span<const uint8_t> united_key,
-        VlessEncryptionAeadCipher cipher,
-        std::optional<VlessEncryptionHeaderXor> header_xor =
-            std::nullopt) noexcept;
-
-    [[nodiscard]] static VlessEncryptionReader CreateLazyReadContext(
-        transport::MultiBufferReader& src,
-        size_t read_context_size,
-        std::span<const uint8_t> united_key,
-        VlessEncryptionAeadCipher cipher,
-        bool header_xor_from_context) noexcept;
-
+    // A deferred read side must not come with a header XOR; it derives its own.
     VlessEncryptionReader(transport::MultiBufferReader& src,
-                          VlessEncryptionAead aead,
-                          memory::ByteVector united_key,
+                          VlessEncryptionReadKeys keys,
+                          const VlessEncryptionUnitedKey& united_key,
                           std::optional<VlessEncryptionHeaderXor>
                               header_xor) noexcept;
 
-    VlessEncryptionReader(transport::MultiBufferReader& src,
-                          size_t read_context_size,
-                          VlessEncryptionAeadCipher cipher,
-                          memory::ByteVector united_key,
-                          bool header_xor_from_context) noexcept;
-
     net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override;
+    [[nodiscard]] bool EnableRawRead() noexcept override;
+    void ClearDeferredTicket() noexcept;
 
 private:
-    [[nodiscard]] bool Rekey(std::span<const uint8_t> context) noexcept;
+    [[nodiscard]] VlessEncryptionAead& KeyDeferredRead(
+        const VlessEncryptionDeferredRead& deferred);
 
     VlessBufferedReader src_;
-    VlessEncryptionAead aead_;
-    memory::ByteVector united_key_;
+    VlessEncryptionReadKeys keys_;
+    VlessEncryptionUnitedKey united_key_;
     std::optional<VlessEncryptionHeaderXor> header_xor_;
-    bool aead_ready_ = true;
-    VlessEncryptionAeadCipher cipher_ = VlessEncryptionAeadCipher::Aes256Gcm;
-    size_t pending_read_context_size_ = 0;
-    bool header_xor_from_context_ = false;
+    // Read progress survives a cancelled sniff continuation. Header XOR is
+    // applied once, before waiting for the rest of the encrypted record.
+    // `bytes_read_` tracks the server random until the read side is keyed.
+    std::array<uint8_t, kVlessEncryptionCtrIvSize> server_random_{};
+    std::array<uint8_t, kVlessEncryptionRecordHeaderSize> read_header_{};
+    buf::ContiguousWriteBuffer read_record_;
+    size_t header_read_ = 0;
+    size_t bytes_read_ = 0;
+    size_t encrypted_size_ = 0;
+    bool raw_read_ = false;
+    VlessEncryptionClientTicketCache* unverified_ticket_cache_ = nullptr;
 };
 
 class VlessEncryptionWriter final : public transport::MultiBufferWriter {
 public:
-    [[nodiscard]] static std::optional<VlessEncryptionWriter> Create(
-        transport::MultiBufferWriter& dst,
-        std::span<const uint8_t> write_context,
-        std::span<const uint8_t> united_key,
-        VlessEncryptionAeadCipher cipher,
-        std::optional<VlessEncryptionHeaderXor> header_xor =
-            std::nullopt) noexcept;
-
     VlessEncryptionWriter(transport::MultiBufferWriter& dst,
                           VlessEncryptionAead aead,
-                          memory::ByteVector united_key,
+                          const VlessEncryptionUnitedKey& united_key,
                           std::optional<VlessEncryptionHeaderXor>
                               header_xor) noexcept;
 
     net::awaitable<void> WriteMultiBuffer(buf::MultiBuffer mb) override;
     net::awaitable<void> WriteBuffers(std::span<const net::const_buffer> buffers) override;
     net::awaitable<void> AsyncShutdownWrite() override;
+    bool WriteShutdownClosesLink() const noexcept override {
+        return dst_.WriteShutdownClosesLink();
+    }
 
 private:
     net::awaitable<void> WritePlaintext(std::span<const uint8_t> data);
-    [[nodiscard]] bool Rekey(std::span<const uint8_t> context) noexcept;
 
     transport::MultiBufferWriter& dst_;
     VlessEncryptionAead aead_;
-    memory::ByteVector united_key_;
+    VlessEncryptionUnitedKey united_key_;
     std::optional<VlessEncryptionHeaderXor> header_xor_;
 };
 
-}  // namespace acpp::vless
+}  // namespace vless

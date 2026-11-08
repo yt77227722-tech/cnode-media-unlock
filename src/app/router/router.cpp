@@ -1,61 +1,25 @@
-#include "acppnode/app/router/router.hpp"
+#include "app/router/router.hpp"
 
-#include "acppnode/common/allocator.hpp"
-#include "acppnode/common/asio_types.hpp"
-#include "acppnode/common/domain_name.hpp"
-#include "acppnode/common/session.hpp"
-#include "acppnode/common/string_hash.hpp"
-#include "acppnode/core/constants.hpp"
-#include "acppnode/geo/geodata.hpp"
-#include "acppnode/infra/config_types.hpp"
-#include "acppnode/infra/log.hpp"
+#include "common/allocator.hpp"
+#include "common/asio_types.hpp"
+#include "common/session.hpp"
+#include "core/constants.hpp"
+#include "geo/geodata.hpp"
+#include "infra/config_types.hpp"
+#include "infra/log.hpp"
 
 #include <algorithm>
-#include <cstring>
-#include <regex>
+#include <optional>
 #include <stdexcept>
+#include <span>
 #include <string>
 #include <utility>
-#include <variant>
 #include <vector>
 
-namespace acpp::app::router {
+namespace app::router {
 
 namespace {
-inline char ToLowerAscii(unsigned char c) {
-    return static_cast<char>((c >= 'A' && c <= 'Z') ? (c + ('a' - 'A')) : c);
-}
-
-void ToLowerInPlace(std::string& s) {
-    std::ranges::transform(s, s.begin(), ToLowerAscii);
-}
-
-auto LowerBoundTrieChild(auto& children, char ch) {
-    return std::lower_bound(
-        children.begin(), children.end(), ch,
-        [](const auto& child, char value) {
-            return child.ch < value;
-        });
-}
-
-bool MatchIPv6Prefix(const net::ip::address_v6::bytes_type& ip,
-                     const net::ip::address_v6::bytes_type& network,
-                     uint8_t prefix) {
-    const size_t full_bytes = prefix / 8;
-    const uint8_t remaining_bits = prefix % 8;
-
-    if (full_bytes > 0 && std::memcmp(ip.data(), network.data(), full_bytes) != 0) {
-        return false;
-    }
-    if (remaining_bits == 0) {
-        return true;
-    }
-
-    const uint8_t mask = static_cast<uint8_t>(0xFFu << (8 - remaining_bits));
-    return (ip[full_bytes] & mask) == (network[full_bytes] & mask);
-}
-
-using StringVector = memory::ThreadLocalVector<std::string>;
+using StringVector = std::vector<std::string>;
 
 void SortUniqueStrings(StringVector& values) {
     std::sort(values.begin(), values.end());
@@ -73,100 +37,6 @@ void SortUniqueStrings(StringVector& values) {
     return it != values.end() && std::string_view(*it) == value;
 }
 
-class DomainTrie {
-public:
-    DomainTrie();
-    ~DomainTrie() noexcept;
-
-    DomainTrie(DomainTrie&&) noexcept = default;
-    DomainTrie& operator=(DomainTrie&&) noexcept = default;
-    DomainTrie(const DomainTrie&) = delete;
-    DomainTrie& operator=(const DomainTrie&) = delete;
-
-    void AddSuffix(const std::string& suffix);
-    bool MatchSuffix(std::string_view lower_domain) const;
-    [[nodiscard]] size_t Size() const { return rule_count_; }
-
-private:
-    struct TrieChild {
-        char ch;
-        size_t node_index;
-    };
-
-    struct TrieNode {
-        memory::ThreadLocalVector<TrieChild> children;
-        bool terminal = false;
-    };
-
-    memory::ThreadLocalVector<TrieNode> nodes_;
-    size_t rule_count_ = 0;
-};
-
-class DomainMatcher {
-public:
-    DomainMatcher();
-    ~DomainMatcher() noexcept;
-
-    DomainMatcher(DomainMatcher&&) noexcept = default;
-    DomainMatcher& operator=(DomainMatcher&&) noexcept = default;
-    DomainMatcher(const DomainMatcher&) = delete;
-    DomainMatcher& operator=(const DomainMatcher&) = delete;
-
-    void AddDomain(const std::string& domain);
-    void AddSuffix(const std::string& suffix);
-    void AddKeyword(const std::string& keyword);
-    void AddRegex(const std::string& pattern);
-
-    [[nodiscard]] bool Match(std::string_view domain) const;
-
-    [[nodiscard]] bool Empty() const {
-        return domains_.empty() && suffix_trie_.Size() == 0
-            && keywords_.empty() && regexes_.empty();
-    }
-
-private:
-    memory::ThreadLocalUnorderedSet<std::string, TransparentStringHash, TransparentStringEq> domains_;
-    DomainTrie suffix_trie_;
-    StringVector keywords_;
-    memory::ThreadLocalVector<std::regex> regexes_;
-};
-
-class IPMatcher {
-public:
-    IPMatcher();
-    ~IPMatcher() noexcept;
-
-    void AddNetwork(const RoutingIpNetwork& network);
-    void BuildIndex();
-
-    [[nodiscard]] bool Match(const net::ip::address& ip) const;
-    [[nodiscard]] bool MatchIPv4(uint32_t ip) const;
-    [[nodiscard]] bool MatchIPv6(const net::ip::address_v6::bytes_type& ip) const;
-
-    [[nodiscard]] bool Empty() const { return rules_.empty() && rules_v6_.empty(); }
-
-private:
-    struct CIDRRule {
-        uint32_t network;
-        uint32_t mask;
-    };
-    memory::ThreadLocalVector<CIDRRule> rules_;
-
-    struct CIDRRuleV6 {
-        net::ip::address_v6::bytes_type network{};
-        uint8_t prefix = 0;
-    };
-    memory::ThreadLocalVector<CIDRRuleV6> rules_v6_;
-
-    struct TrieNode {
-        int children[2]{-1, -1};
-        int rule_index = -1;
-    };
-    memory::ThreadLocalVector<TrieNode> trie_nodes_;
-    memory::ThreadLocalVector<TrieNode> trie_nodes_v6_;
-    bool index_built_ = false;
-};
-
 [[nodiscard]] std::string_view RoutingDomain(const session::Context& ctx) noexcept {
     if (ctx.outbound.route_target.IsValid() && ctx.outbound.route_target.IsDomain()) {
         return ctx.outbound.route_target.host;
@@ -177,32 +47,44 @@ private:
     return {};
 }
 
+[[nodiscard]] const net::ip::address* RoutingAddress(const session::Context& ctx) noexcept {
+    if (ctx.outbound.route_target.IsValid() && ctx.outbound.route_target.resolved_addr) {
+        return &*ctx.outbound.route_target.resolved_addr;
+    }
+    if (ctx.outbound.target.resolved_addr) {
+        return &*ctx.outbound.target.resolved_addr;
+    }
+    return nullptr;
+}
+
+[[nodiscard]] std::span<const uint8_t> NetworkBytes(const RoutingIpNetwork& network) noexcept {
+    return std::span<const uint8_t>(network.Network()).first(network.IsV6() ? 16 : 4);
+}
+
+// geosite / geoip 条件在构建期解析为 GeoDatabase 内只读集合的指针；
+// GeoDatabase 生命周期覆盖所有 Worker 的 Router。
 class GeoSiteCondition {
 public:
     GeoSiteCondition(
-        std::vector<std::string> tags,
-        const ::acpp::geo::GeoManager* geo);
+        const std::vector<std::string>& tags,
+        const ::geo::GeoDatabase* geo);
 
-    [[nodiscard]] bool Match(
-        const session::Context& ctx,
-        const ::acpp::geo::GeoManager* geo) const;
+    [[nodiscard]] bool Match(const session::Context& ctx) const;
 
 private:
-    memory::ThreadLocalVector<::acpp::geo::GeoManager::GeoSiteTagHandle> handles_;
+    std::vector<const ::geo::DomainRuleSet*> sets_;
 };
 
 class GeoIPCondition {
 public:
     GeoIPCondition(
-        std::vector<std::string> tags,
-        const ::acpp::geo::GeoManager* geo);
+        const std::vector<std::string>& tags,
+        const ::geo::GeoDatabase* geo);
 
-    [[nodiscard]] bool Match(
-        const session::Context& ctx,
-        const ::acpp::geo::GeoManager* geo) const;
+    [[nodiscard]] bool Match(const session::Context& ctx) const;
 
 private:
-    memory::ThreadLocalVector<::acpp::geo::GeoManager::GeoIPTagHandle> handles_;
+    std::vector<const ::geo::CidrSet*> sets_;
 };
 
 struct CompoundRoutingRule {
@@ -225,10 +107,12 @@ struct CompoundRoutingRule {
         has_protocol_condition = true;
         protocol_mask = 0;
         protocol_values.clear();
-        protocol_values.reserve(protocols.size());
         for (const auto& protocol : protocols) {
-            protocol_mask |= ProtocolBit(protocol);
-            protocol_values.emplace_back(protocol);
+            if (const uint8_t bit = ProtocolBit(protocol); bit != 0) {
+                protocol_mask |= bit;
+            } else {
+                protocol_values.emplace_back(protocol);
+            }
         }
         SortUniqueStrings(protocol_values);
     }
@@ -272,9 +156,9 @@ struct CompoundRoutingRule {
                geoip_condition.has_value();
     }
 
-    std::optional<IPMatcher> source_ip_matcher;
-    std::optional<IPMatcher> ip_matcher;
-    std::optional<DomainMatcher> domain_matcher;
+    std::optional<::geo::CidrSet> source_ip_matcher;
+    std::optional<::geo::CidrSet> ip_matcher;
+    std::optional<::geo::DomainRuleSet> domain_matcher;
     std::optional<GeoSiteCondition> geosite_condition;
     std::optional<GeoIPCondition> geoip_condition;
     std::string outbound_tag;
@@ -289,12 +173,10 @@ struct CompoundRoutingRule {
     StringVector protocol_values;
     StringVector inbound_tag_values;
     StringVector user_values;
-    memory::ThreadLocalVector<RoutingPortRange> port_ranges;
-    memory::ThreadLocalVector<RoutingPortRange> source_port_ranges;
+    std::vector<RoutingPortRange> port_ranges;
+    std::vector<RoutingPortRange> source_port_ranges;
 
-    [[nodiscard]] bool Match(
-        const session::Context& ctx,
-        const ::acpp::geo::GeoManager* geo = nullptr) const {
+    [[nodiscard]] bool Match(const session::Context& ctx) const {
         if (!HasAnyCondition()) return false;
         if (has_network_condition && !MatchNetwork(ctx)) return false;
         if (has_protocol_condition && !MatchProtocol(ctx)) return false;
@@ -303,7 +185,10 @@ struct CompoundRoutingRule {
         if (has_source_port_condition && !MatchPortRanges(source_port_ranges, ctx.inbound.source_port)) {
             return false;
         }
-        if (has_port_condition && !MatchPortRanges(port_ranges, ctx.outbound.target.port)) {
+        const uint16_t target_port = ctx.outbound.route_target.IsValid()
+            ? ctx.outbound.route_target.port
+            : ctx.outbound.target.port;
+        if (has_port_condition && !MatchPortRanges(port_ranges, target_port)) {
             return false;
         }
         if (source_ip_matcher) {
@@ -313,8 +198,8 @@ struct CompoundRoutingRule {
             }
         }
         if (ip_matcher) {
-            const auto& target = ctx.outbound.target;
-            if (!target.resolved_addr || !ip_matcher->Match(*target.resolved_addr)) {
+            const auto* addr = RoutingAddress(ctx);
+            if (!addr || !ip_matcher->Match(*addr)) {
                 return false;
             }
         }
@@ -324,10 +209,10 @@ struct CompoundRoutingRule {
                 return false;
             }
         }
-        if (geosite_condition && !geosite_condition->Match(ctx, geo)) {
+        if (geosite_condition && !geosite_condition->Match(ctx)) {
             return false;
         }
-        if (geoip_condition && !geoip_condition->Match(ctx, geo)) {
+        if (geoip_condition && !geoip_condition->Match(ctx)) {
             return false;
         }
         return true;
@@ -375,7 +260,7 @@ private:
     }
 
     [[nodiscard]] static bool MatchPortRanges(
-        const memory::ThreadLocalVector<RoutingPortRange>& ranges,
+        const std::vector<RoutingPortRange>& ranges,
         uint16_t port) noexcept {
         for (const auto& range : ranges) {
             if (port >= range.start && port <= range.end) return true;
@@ -402,329 +287,48 @@ private:
 }  // namespace
 
 // ============================================================================
-// DomainTrie 实现 - 反向 Trie 树用于高效后缀匹配
-// ============================================================================
-
-DomainTrie::DomainTrie() {
-    nodes_.push_back({});
-}
-
-DomainTrie::~DomainTrie() noexcept = default;
-
-void DomainTrie::AddSuffix(const std::string& suffix) {
-    std::string lower = suffix;
-    ::acpp::domain::NormalizeDnsHostnameInPlace(lower);
-
-    size_t node_index = 0;
-    for (auto it = lower.rbegin(); it != lower.rend(); ++it) {
-        auto& children = nodes_[node_index].children;
-        auto child_it = LowerBoundTrieChild(children, *it);
-        if (child_it == children.end() || child_it->ch != *it) {
-            const size_t child_index = nodes_.size();
-            nodes_.push_back({});
-            auto& refreshed_children = nodes_[node_index].children;
-            auto insert_it = LowerBoundTrieChild(refreshed_children, *it);
-            refreshed_children.insert(insert_it, TrieChild{*it, child_index});
-            node_index = child_index;
-        } else {
-            node_index = child_it->node_index;
-        }
-    }
-    nodes_[node_index].terminal = true;
-    rule_count_++;
-}
-
-bool DomainTrie::MatchSuffix(std::string_view lower_domain) const {
-    if (nodes_.empty()) return false;
-
-    size_t node_index = 0;
-    for (auto it = lower_domain.rbegin(); it != lower_domain.rend(); ++it) {
-        const auto& node = nodes_[node_index];
-        auto child_it = LowerBoundTrieChild(node.children, *it);
-        if (child_it == node.children.end() || child_it->ch != *it) {
-            return false;
-        }
-        node_index = child_it->node_index;
-        const auto& child_node = nodes_[node_index];
-
-        if (child_node.terminal) {
-            auto next_it = std::next(it);
-            if (next_it == lower_domain.rend() || *next_it == '.') {
-                return true;
-            }
-        }
-    }
-
-    return nodes_[node_index].terminal;
-}
-
-// ============================================================================
-// DomainMatcher 实现
-// ============================================================================
-
-DomainMatcher::DomainMatcher() = default;
-DomainMatcher::~DomainMatcher() noexcept = default;
-
-void DomainMatcher::AddDomain(const std::string& domain) {
-    std::string lower = domain;
-    ::acpp::domain::NormalizeDnsHostnameInPlace(lower);
-    domains_.insert(std::move(lower));
-}
-
-void DomainMatcher::AddSuffix(const std::string& suffix) {
-    suffix_trie_.AddSuffix(suffix);
-}
-
-void DomainMatcher::AddKeyword(const std::string& keyword) {
-    std::string lower = keyword;
-    ToLowerInPlace(lower);
-    keywords_.push_back(std::move(lower));
-}
-
-void DomainMatcher::AddRegex(const std::string& pattern) {
-    regexes_.emplace_back(pattern, std::regex::ECMAScript | std::regex::icase);
-}
-
-bool DomainMatcher::Match(std::string_view domain) const {
-    domain = ::acpp::domain::WithoutTrailingRootDot(domain);
-    char stack_buf[256];
-    memory::ThreadLocalVector<char> heap_buf;
-    char* lower_ptr = stack_buf;
-
-    if (domain.size() >= sizeof(stack_buf)) {
-        heap_buf.resize(domain.size());
-        lower_ptr = heap_buf.data();
-    }
-
-    for (size_t i = 0; i < domain.size(); ++i) {
-        lower_ptr[i] = ToLowerAscii(static_cast<unsigned char>(domain[i]));
-    }
-    const std::string_view lower(lower_ptr, domain.size());
-
-    if (domains_.find(lower) != domains_.end()) {
-        return true;
-    }
-
-    if (suffix_trie_.MatchSuffix(lower)) {
-        return true;
-    }
-
-    for (const auto& keyword : keywords_) {
-        if (lower.find(keyword) != std::string::npos) {
-            return true;
-        }
-    }
-
-    for (const auto& regex : regexes_) {
-        if (std::regex_search(lower.begin(), lower.end(), regex)) {
-            return true;
-        }
-    }
-
-    return false;
-}
-
-// ============================================================================
-// IPMatcher 实现
-// ============================================================================
-
-IPMatcher::IPMatcher() = default;
-IPMatcher::~IPMatcher() noexcept = default;
-
-void IPMatcher::AddNetwork(const RoutingIpNetwork& network) {
-    const auto& bytes = network.Network();
-    if (!network.IsV6()) {
-        const uint32_t address =
-            (static_cast<uint32_t>(bytes[0]) << 24) |
-            (static_cast<uint32_t>(bytes[1]) << 16) |
-            (static_cast<uint32_t>(bytes[2]) << 8) |
-            static_cast<uint32_t>(bytes[3]);
-        const uint32_t mask = network.Prefix() == 0
-            ? 0U
-            : 0xFFFFFFFFU << (32 - network.Prefix());
-        rules_.push_back({address, mask});
-        return;
-    }
-
-    net::ip::address_v6::bytes_type ipv6_bytes{};
-    std::ranges::copy(bytes, ipv6_bytes.begin());
-    rules_v6_.push_back({ipv6_bytes, network.Prefix()});
-}
-
-void IPMatcher::BuildIndex() {
-    trie_nodes_.clear();
-    trie_nodes_v6_.clear();
-
-    if (!rules_.empty()) {
-        trie_nodes_.push_back({});  // 根节点
-
-        for (int i = 0; i < static_cast<int>(rules_.size()); ++i) {
-            const auto& rule = rules_[i];
-            // 从 mask 推算前缀长度
-            uint8_t prefix = 0;
-            uint32_t m = rule.mask;
-            while (m & 0x80000000U) { ++prefix; m <<= 1; }
-
-            int node = 0;
-            for (uint8_t bit_idx = 0; bit_idx < prefix; ++bit_idx) {
-                int bit = (rule.network >> (31 - bit_idx)) & 1;
-                if (trie_nodes_[node].children[bit] < 0) {
-                    trie_nodes_[node].children[bit] = static_cast<int>(trie_nodes_.size());
-                    trie_nodes_.push_back({});
-                }
-                node = trie_nodes_[node].children[bit];
-            }
-            // 第一个匹配的规则优先（保持顺序语义）
-            if (trie_nodes_[node].rule_index < 0) {
-                trie_nodes_[node].rule_index = i;
-            }
-        }
-    }
-
-    if (!rules_v6_.empty()) {
-        trie_nodes_v6_.push_back({});  // 根节点
-
-        for (int i = 0; i < static_cast<int>(rules_v6_.size()); ++i) {
-            const auto& rule = rules_v6_[i];
-            int node = 0;
-            for (uint8_t bit_idx = 0; bit_idx < rule.prefix; ++bit_idx) {
-                const uint8_t byte = rule.network[bit_idx / 8];
-                const int bit = (byte >> (7 - (bit_idx % 8))) & 1;
-                if (trie_nodes_v6_[node].children[bit] < 0) {
-                    trie_nodes_v6_[node].children[bit] =
-                        static_cast<int>(trie_nodes_v6_.size());
-                    trie_nodes_v6_.push_back({});
-                }
-                node = trie_nodes_v6_[node].children[bit];
-            }
-            if (trie_nodes_v6_[node].rule_index < 0) {
-                trie_nodes_v6_[node].rule_index = i;
-            }
-        }
-    }
-
-    index_built_ = true;
-}
-
-bool IPMatcher::Match(const net::ip::address& ip) const {
-    if (ip.is_v4()) {
-        auto bytes = ip.to_v4().to_bytes();
-        const uint32_t ip_val = (static_cast<uint32_t>(bytes[0]) << 24) |
-                                (static_cast<uint32_t>(bytes[1]) << 16) |
-                                (static_cast<uint32_t>(bytes[2]) << 8)  |
-                                static_cast<uint32_t>(bytes[3]);
-        return MatchIPv4(ip_val);
-    }
-
-    return MatchIPv6(ip.to_v6().to_bytes());
-}
-
-bool IPMatcher::MatchIPv4(uint32_t ip) const {
-    if (index_built_ && !trie_nodes_.empty()) {
-        int node = 0;
-        if (trie_nodes_[0].rule_index >= 0) {
-            return true;
-        }
-        for (uint8_t i = 0; i < 32; ++i) {
-            int bit = (ip >> (31 - i)) & 1;
-            int next = trie_nodes_[node].children[bit];
-            if (next < 0) {
-                return false;
-            }
-            node = next;
-            if (trie_nodes_[node].rule_index >= 0) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    for (const auto& rule : rules_) {
-        if ((ip & rule.mask) == rule.network) {
-            return true;
-        }
-    }
-    return false;
-}
-
-bool IPMatcher::MatchIPv6(const net::ip::address_v6::bytes_type& ip) const {
-    if (index_built_ && !trie_nodes_v6_.empty()) {
-        int node = 0;
-        if (trie_nodes_v6_[0].rule_index >= 0) {
-            return true;
-        }
-        for (uint8_t bit_idx = 0; bit_idx < 128; ++bit_idx) {
-            const uint8_t byte = ip[bit_idx / 8];
-            const int bit = (byte >> (7 - (bit_idx % 8))) & 1;
-            const int next = trie_nodes_v6_[node].children[bit];
-            if (next < 0) {
-                return false;
-            }
-            node = next;
-            if (trie_nodes_v6_[node].rule_index >= 0) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    for (const auto& rule : rules_v6_) {
-        if (MatchIPv6Prefix(ip, rule.network, rule.prefix)) {
-            return true;
-        }
-    }
-    return false;
-}
-
-// ============================================================================
 // Router 实现
 // ============================================================================
 
 struct Router::Impl {
-    Impl(const RoutingConfig& routing, const ::acpp::geo::GeoManager* geo);
+    Impl(const RoutingConfig& routing, const ::geo::GeoDatabase* geo);
 
-    memory::ThreadLocalVector<CompoundRoutingRule> compound_rules;
+    std::vector<CompoundRoutingRule> compound_rules;
     routing::DomainStrategy domain_strategy;
-    const ::acpp::geo::GeoManager* geo_manager;
 };
 
-Router::Router(const RoutingConfig& config, const ::acpp::geo::GeoManager* geo_manager)
-    : impl_(std::make_unique<const Impl>(config, geo_manager)) {}
+Router::Router(const RoutingConfig& config, const ::geo::GeoDatabase* geo_database)
+    : impl_(std::make_unique<const Impl>(config, geo_database)) {}
 Router::~Router() noexcept = default;
 
 routing::RouteDecision Router::Route(const session::Context& ctx) const {
     const auto& target = ctx.outbound.target;
 
     // 顺序检查复合规则（AND 语义）
-    for (uint32_t rule_index = 0;
-         rule_index < impl_->compound_rules.size();
-         ++rule_index) {
-        const auto& rule = impl_->compound_rules[rule_index];
-        if (rule.Match(ctx, impl_->geo_manager)) {
-            LOG_NET_DEBUG("Router: {} matched compound rule -> {}",
+    for (const auto& rule : impl_->compound_rules) {
+        if (rule.Match(ctx)) {
+            LOG_CONN_DEBUG(ctx, "matched compound routing rule target={} outbound={}",
                       target, rule.outbound_tag);
             return routing::RouteDecision{
                 .outbound_tag = rule.outbound_tag,
                 .matched = true,
-                .rule_index = rule_index,
             };
         }
     }
 
     // No match is an explicit empty decision. Dispatcher owns the receiver's
     // explicit fallback.
-    LOG_NET_DEBUG("Router: {} no matching rule", target);
+    LOG_CONN_DEBUG(ctx, "no matching routing rule target={}", target);
     return routing::RouteDecision{
         .outbound_tag = {},
         .matched = false,
-        .rule_index = 0,
     };
 }
 
 Router::Impl::Impl(
     const RoutingConfig& routing,
-    const ::acpp::geo::GeoManager* geo)
-    : domain_strategy(routing.domain_strategy), geo_manager(geo) {
+    const ::geo::GeoDatabase* geo)
+    : domain_strategy(routing.domain_strategy) {
     compound_rules.reserve(routing.rules.size());
     for (const auto& rc : routing.rules) {
         if (rc.outbound_tag.empty()) {
@@ -757,30 +361,23 @@ Router::Impl::Impl(
             compound.SetProtocolCondition(rc.protocol);
         }
 
-        {
-            IPMatcher source_ip_matcher;
-            for (const auto& value : rc.source) {
-                source_ip_matcher.AddNetwork(value);
-            }
-            if (!source_ip_matcher.Empty()) {
-                source_ip_matcher.BuildIndex();
-                compound.source_ip_matcher.emplace(std::move(source_ip_matcher));
-            }
+        ::geo::CidrSet source_ip_matcher(memory::process_resource());
+        for (const auto& value : rc.source) {
+            source_ip_matcher.Insert(NetworkBytes(value), value.Prefix());
+        }
+        if (!source_ip_matcher.Empty()) {
+            compound.source_ip_matcher.emplace(std::move(source_ip_matcher));
         }
 
-        IPMatcher ip_matcher;
+        ::geo::CidrSet ip_matcher(memory::process_resource());
         for (const auto& value : rc.ip) {
-            ip_matcher.AddNetwork(value);
+            ip_matcher.Insert(NetworkBytes(value), value.Prefix());
         }
         if (!ip_matcher.Empty()) {
-            ip_matcher.BuildIndex();
             compound.ip_matcher.emplace(std::move(ip_matcher));
         }
 
-        DomainMatcher domain_matcher;
-        for (const auto& value : rc.domain) {
-            domain_matcher.AddSuffix(value);
-        }
+        ::geo::DomainRuleSet domain_matcher(memory::process_resource());
         for (const auto& value : rc.domain_suffix) {
             domain_matcher.AddSuffix(value);
         }
@@ -788,7 +385,7 @@ Router::Impl::Impl(
             domain_matcher.AddKeyword(value);
         }
         for (const auto& value : rc.domain_full) {
-            domain_matcher.AddDomain(value);
+            domain_matcher.AddFull(value);
         }
         for (const auto& value : rc.domain_regex) {
             domain_matcher.AddRegex(value);
@@ -798,11 +395,11 @@ Router::Impl::Impl(
         }
 
         if (!rc.geosite.empty()) {
-            compound.geosite_condition.emplace(rc.geosite, geo_manager);
+            compound.geosite_condition.emplace(rc.geosite, geo);
         }
 
         if (!rc.geoip.empty()) {
-            compound.geoip_condition.emplace(rc.geoip, geo_manager);
+            compound.geoip_condition.emplace(rc.geoip, geo);
         }
 
         if (!compound.HasAnyCondition()) {
@@ -817,68 +414,58 @@ routing::DomainStrategy Router::DomainStrategy() const noexcept {
     return impl_->domain_strategy;
 }
 
-// ============================================================================
-// ICondition 具体实现（GeoSite / GeoIP 需要 GeoManager）
-// ============================================================================
-
-bool GeoSiteCondition::Match(
-    const session::Context& ctx,
-    const ::acpp::geo::GeoManager* geo) const {
+bool GeoSiteCondition::Match(const session::Context& ctx) const {
     const auto domain = RoutingDomain(ctx);
-    if (!geo || domain.empty()) return false;
-    for (const auto& handle : handles_) {
-        if (geo->MatchGeoSite(handle, domain)) return true;
+    if (domain.empty()) return false;
+    for (const auto* set : sets_) {
+        if (set->Match(domain)) return true;
     }
     return false;
 }
 
 GeoSiteCondition::GeoSiteCondition(
-    std::vector<std::string> tags,
-    const ::acpp::geo::GeoManager* geo) {
+    const std::vector<std::string>& tags,
+    const ::geo::GeoDatabase* geo) {
     if (!geo) {
         throw std::logic_error(
-            "geosite condition reached runtime without GeoManager");
+            "geosite condition reached runtime without GeoDatabase");
     }
-    handles_.reserve(tags.size());
-    for (auto& tag : tags) {
-        ToLowerInPlace(tag);
-        auto handle = geo->ResolveGeoSiteTag(tag);
-        if (!handle.Valid()) {
+    sets_.reserve(tags.size());
+    for (const auto& tag : tags) {
+        const auto* set = geo->FindGeoSite(tag);
+        if (!set) {
             throw std::logic_error(
                 "unresolved geosite tag reached routing runtime");
         }
-        handles_.push_back(handle);
+        sets_.push_back(set);
     }
 }
 
-bool GeoIPCondition::Match(
-    const session::Context& ctx,
-    const ::acpp::geo::GeoManager* geo) const {
-    const auto& target = ctx.outbound.target;
-    if (!geo || !target.resolved_addr) return false;
-    for (const auto& handle : handles_) {
-        if (geo->MatchGeoIP(handle, *target.resolved_addr)) return true;
+bool GeoIPCondition::Match(const session::Context& ctx) const {
+    const auto* addr = RoutingAddress(ctx);
+    if (!addr) return false;
+    for (const auto* set : sets_) {
+        if (set->Match(*addr)) return true;
     }
     return false;
 }
 
 GeoIPCondition::GeoIPCondition(
-    std::vector<std::string> tags,
-    const ::acpp::geo::GeoManager* geo) {
+    const std::vector<std::string>& tags,
+    const ::geo::GeoDatabase* geo) {
     if (!geo) {
         throw std::logic_error(
-            "geoip condition reached runtime without GeoManager");
+            "geoip condition reached runtime without GeoDatabase");
     }
-    handles_.reserve(tags.size());
-    for (auto& tag : tags) {
-        ToLowerInPlace(tag);
-        auto handle = geo->ResolveGeoIPTag(tag);
-        if (!handle.Valid()) {
+    sets_.reserve(tags.size());
+    for (const auto& tag : tags) {
+        const auto* set = geo->FindGeoIP(tag);
+        if (!set) {
             throw std::logic_error(
                 "unresolved geoip tag reached routing runtime");
         }
-        handles_.push_back(handle);
+        sets_.push_back(set);
     }
 }
 
-}  // namespace acpp::app::router
+}  // namespace app::router

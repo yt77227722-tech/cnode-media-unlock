@@ -13,30 +13,36 @@
 
 #include "vmess_crypto.hpp"
 #include "vmess_request.hpp"
+#include "../aead.hpp"
 
 #include <array>
 #include <memory>
-#include <optional>
 #include <cstdint>
+#include <variant>
+#include "common/unsafe.hpp"
+#include <openssl/ossl_typ.h>
 
-namespace acpp {
 namespace vmess {
 
 // ============================================================================
 // VMessCipher — 单方向 AEAD per-chunk 加密/解密器
 //
-// 支持：AES-128-GCM、ChaCha20-Poly1305
+// 支持：AES-128-GCM、ChaCha20-Poly1305；NONE/ZERO 原样复制。
 // 每次 Encrypt/Decrypt 递增内部计数器（16-bit，嵌入 nonce）。
+// 其他 Security 值构造即抛出，不进入数据路径。
 // ============================================================================
 class VMessCipher {
 public:
-    VMessCipher(Security security, const uint8_t* key, const uint8_t* iv);
-    ~VMessCipher();
+    VMessCipher(Security security, const uint8_t* key, const uint8_t* iv,
+                proxy::AeadDirection direction);
+    ~VMessCipher() noexcept {
+        ::SecureZeroMemory(iv_.data(), iv_.size());
+    }
 
     VMessCipher(const VMessCipher&)            = delete;
     VMessCipher& operator=(const VMessCipher&) = delete;
-    VMessCipher(VMessCipher&& other) noexcept;
-    VMessCipher& operator=(VMessCipher&& other) noexcept;
+    VMessCipher(VMessCipher&& other) noexcept = default;
+    VMessCipher& operator=(VMessCipher&& other) noexcept = default;
 
     // AEAD tag 大小（GCM_TAG_SIZE = 16）
     size_t Overhead() const;
@@ -52,19 +58,11 @@ public:
 private:
     void BuildNonce(uint16_t count, uint8_t* nonce);
 
-    // ChaCha20-Poly1305 需要 32 字节密钥，从 16 字节扩展：
-    //   key32[0:16] = MD5(key16), key32[16:32] = MD5(key32[0:16])
-    static void GenerateChaCha20Key(const uint8_t* key16, uint8_t* key32);
-
     Security security_;
-    std::array<uint8_t, 16> key_;
-    std::array<uint8_t, 32> key32_;   // ChaCha20 扩展密钥
     std::array<uint8_t, 16> iv_;
     uint16_t count_ = 0;
 
-    void* enc_ctx_          = nullptr;  // EVP_CIPHER_CTX*，加密上下文
-    void* dec_ctx_          = nullptr;  // EVP_CIPHER_CTX*，解密上下文
-    bool  ctx_initialized_  = false;
+    std::variant<std::monostate, proxy::AeadEncryptor, proxy::AeadDecryptor> cipher_;
 };
 
 // ============================================================================
@@ -89,12 +87,11 @@ public:
 private:
     static constexpr size_t kBufferSize = 512;  // 批量 squeeze 大小
 
-    void* ctx_ = nullptr;  // EVP_MD_CTX*
-    alignas(64) uint8_t            buffer_[kBufferSize];
+    EVP_MD_CTX* ctx_ = nullptr;
+    uint8_t buffer_[kBufferSize];
     size_t                         offset_      = kBufferSize;  // 初始为满，触发首次 Refill
 
     void Refill();
 };
 
 }  // namespace vmess
-}  // namespace acpp

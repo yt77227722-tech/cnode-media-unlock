@@ -1,10 +1,9 @@
-#include "acppnode/app/bootstrap_cli.hpp"
+#include "app/bootstrap_cli.hpp"
 
 #include <format>
 #include <iostream>
 #include <utility>
 
-namespace acpp {
 
 namespace {
 
@@ -35,12 +34,16 @@ CommandLineOptions ParseCommandLine(int argc, char* argv[]) {
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
-        if ((arg == "-h" || arg == "--help") && options.action == CommandLineAction::None) {
-            options.action = CommandLineAction::Help;
+        if (arg == "-h" || arg == "--help") {
+            if (options.action == CommandLineAction::None) {
+                options.action = CommandLineAction::Help;
+            }
             continue;
         }
-        if ((arg == "-v" || arg == "--version") && options.action == CommandLineAction::None) {
-            options.action = CommandLineAction::Version;
+        if (arg == "-v" || arg == "--version") {
+            if (options.action == CommandLineAction::None) {
+                options.action = CommandLineAction::Version;
+            }
             continue;
         }
         if (arg == "-t" || arg == "--test") {
@@ -100,4 +103,3 @@ void PrintVersion(std::ostream& out) {
     out << BUILD_CHANNEL << ":" << BUILD_ID << "\n";
 }
 
-}  // namespace acpp

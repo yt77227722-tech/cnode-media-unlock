@@ -1,96 +1,100 @@
 #include "udp_framing.hpp"
 
 #include "trojan_codec.hpp"
-#include "acppnode/common/buffer_util.hpp"
-#include "acppnode/common/container_util.hpp"
+#include "common/buffer_util.hpp"
+#include "common/address_codec.hpp"
+#include "common/buf/length_prefixed_packet_buffer.hpp"
 
-#include <cstring>
+#include <array>
 #include <limits>
 #include <new>
 
-namespace acpp::trojan {
+namespace trojan {
 
-namespace {
-
-constexpr size_t kUdpFrameQueueShrinkItems = 64;
-
-}  // namespace
-
-void UdpFramer::Feed(const uint8_t* data, size_t len) {
-    if (len == 0) {
-        return;
+void UdpFramer::Feed(buf::MultiBuffer input) {
+    if (failed_) {
+        throw IoSystemError(io_error::invalid_argument, "failed Trojan UDP stream");
     }
-    if (!data) {
-        throw IoSystemError(io_error::invalid_argument, "null Trojan UDP input");
+    try {
+        buf::AppendPacketStreamInput(pending_, std::move(input));
+    } catch (...) {
+        failed_ = true;
+        pending_.clear();
+        throw;
     }
-
-    CompactPending();
-    pending_.insert(pending_.end(), data, data + len);
-    Parse();
 }
 
 bool UdpFramer::Next(FramedUdpPacket& out) {
-    if (queue_.empty()) {
-        return false;
+    if (failed_) {
+        throw IoSystemError(io_error::invalid_argument, "failed Trojan UDP stream");
     }
-    out = std::move(queue_.front());
-    queue_.pop_front();
-    if (queue_.empty() && shrink_queue_on_drain_) {
-        TryShrinkSequence(queue_);
-        shrink_queue_on_drain_ = false;
-    }
-    return true;
-}
-
-void UdpFramer::Parse() {
-    while (pending_offset_ < pending_.size()) {
-        const uint8_t* data = pending_.data() + pending_offset_;
-        const size_t size = pending_.size() - pending_offset_;
-        auto parsed = TrojanCodec::ParseUdpPacket(data, size);
-        if (parsed.result == TrojanCodec::UdpParseResult::INCOMPLETE) {
-            break;
+    out = {};
+    for (;;) {
+        if (!target_) {
+            // SOCKS5 address, length and CRLF only.
+            std::array<uint8_t, kMaxEncodedAddressSize + 4> header{};
+            const size_t copied = pending_.CopyPrefixTo(header);
+            auto address = DecodeAddress(
+                std::span<const uint8_t>(header.data(), copied),
+                AddressWireFormat::Socks5,
+                {.require_non_empty_domain = true, .allow_metadata = false});
+            if (address.status == AddressDecodeStatus::Incomplete) return false;
+            if (address.status == AddressDecodeStatus::Invalid || !address.target.IsValid()) {
+                failed_ = true;
+                pending_.clear();
+                throw IoSystemError(io_error::invalid_argument, "invalid Trojan UDP address");
+            }
+            const size_t pos = address.consumed;
+            if (copied < pos + 4) return false;
+            if (header[pos + 2] != '\r' || header[pos + 3] != '\n') {
+                failed_ = true;
+                pending_.clear();
+                throw IoSystemError(io_error::invalid_argument, "invalid Trojan UDP delimiter");
+            }
+            payload_size_ = (static_cast<size_t>(header[pos]) << 8) | header[pos + 1];
+            target_.emplace(std::move(address.target));
+            (void)pending_.DropPrefixBytes(pos + 4);
         }
-        if (parsed.result == TrojanCodec::UdpParseResult::INVALID ||
-            !parsed.packet || parsed.consumed == 0) {
-            ++pending_offset_;
-            continue;
-        }
-
-        FramedUdpPacket packet;
-        packet.target = std::move(parsed.packet->target);
-        if (!parsed.packet->payload.empty() &&
-            !buf::AppendSpanToMultiBuffer(parsed.packet->payload, packet.payload)) {
+        const size_t bytes = payload_size_;
+        if (pending_.byte_size() < bytes) return false;
+        if (!pending_.MovePrefixTo(out.payload, bytes)) {
+            failed_ = true;
+            pending_.clear();
             throw std::bad_alloc();
         }
-        pending_offset_ += parsed.consumed;
-        if (!buf::HasData(packet.payload)) {
-            continue;
+        pending_.ReleaseIfIdle();
+        out.target = std::move(*target_);
+        target_.reset();
+        if (!buf::SetUdpTarget(out.payload, out.target)) {
+            failed_ = true;
+            pending_.clear();
+            throw std::bad_alloc();
         }
-        queue_.push_back(std::move(packet));
-        if (queue_.size() >= kUdpFrameQueueShrinkItems) {
-            shrink_queue_on_drain_ = true;
-        }
+        return true;
     }
-    CompactPending();
 }
 
-void UdpFramer::CompactPending() {
-    if (pending_offset_ == 0) {
-        return;
+void UdpFramer::Finish() const {
+    if (failed_ || target_ || pending_.byte_size() != 0) {
+        throw IoSystemError(io_error::invalid_argument, "truncated Trojan UDP stream");
     }
-    if (pending_offset_ >= pending_.size()) {
-        pending_.clear();
-        pending_offset_ = 0;
-        return;
+}
+
+net::awaitable<buf::MultiBuffer> ReadUdpDatagram(
+    AsyncStream& stream,
+    UdpFramer& framer) {
+    while (true) {
+        FramedUdpPacket packet;
+        if (framer.Next(packet)) {
+            co_return std::move(packet.payload);
+        }
+        buf::MultiBuffer raw = co_await ReadMultiBufferOrThrowOnCancel(stream);
+        if (raw.byte_size() == 0) {
+            framer.Finish();
+            co_return buf::MultiBuffer{};
+        }
+        framer.Feed(std::move(raw));
     }
-    if (pending_offset_ < buf::Buffer::kSize &&
-        pending_offset_ * 2 < pending_.size()) {
-        return;
-    }
-    pending_.erase(
-        pending_.begin(),
-        pending_.begin() + static_cast<std::ptrdiff_t>(pending_offset_));
-    pending_offset_ = 0;
 }
 
 net::awaitable<void> WriteUdpDatagram(
@@ -106,62 +110,49 @@ net::awaitable<void> WriteUdpDatagram(
             "Trojan UDP datagram contains missing or mixed endpoints");
     }
 
-    buf::BufferGuard header{buf::Buffer::New()};
-    if (!header) {
-        throw std::bad_alloc();
-    }
-    const size_t header_size = TrojanCodec::EncodeUdpPacketHeaderTo(
+    std::array<uint8_t, 272> header{};
+    const size_t header_size = EncodeUdpPacketHeaderTo(
         *datagram.target,
         datagram.payload_size,
-        header->Tail().data(),
-        header->Available());
+        header.data(),
+        header.size());
     if (header_size == 0) {
         throw IoSystemError(
             io_error::message_size, "invalid Trojan UDP datagram size or target");
     }
-    header->Produce(static_cast<uint32_t>(header_size));
 
-    buf::MultiBuffer framed{std::move(header)};
-    payload.MoveTo(framed, true);
-    co_await writer.WriteMultiBuffer(std::move(framed));
+    ConstBufferSpanBuilder<1 + buf::MultiBuffer::kInlineCapacity> framed;
+    framed.Append(net::buffer(header.data(), header_size));
+    framed.AppendMultiBuffer(payload);
+    co_await writer.WriteBuffers(framed.Span());
 }
 
 net::awaitable<void> WriteUdpDatagram(
     transport::MultiBufferWriter& writer,
     const TargetAddress& target,
     std::span<const net::const_buffer> payload) {
-    size_t payload_size = 0;
-    for (const auto& buffer : payload) {
-        if (buffer.size() >
-            std::numeric_limits<uint16_t>::max() - payload_size) {
-            throw IoSystemError(
-                io_error::message_size, "Trojan UDP datagram is too large");
-        }
-        payload_size += buffer.size();
-    }
-    if (payload_size == 0) {
-        co_return;
+    const auto payload_size = buf::TrySumBufferSizes(
+        payload, std::numeric_limits<uint16_t>::max());
+    if (!payload_size) {
+        throw IoSystemError(
+            io_error::message_size, "Trojan UDP datagram is too large");
     }
 
-    buf::BufferGuard header{buf::Buffer::New()};
-    if (!header) {
-        throw std::bad_alloc();
-    }
-    const size_t header_size = TrojanCodec::EncodeUdpPacketHeaderTo(
+    std::array<uint8_t, 272> header{};
+    const size_t header_size = EncodeUdpPacketHeaderTo(
         target,
-        payload_size,
-        header->Tail().data(),
-        header->Available());
+        *payload_size,
+        header.data(),
+        header.size());
     if (header_size == 0) {
         throw IoSystemError(
             io_error::invalid_argument, "invalid Trojan UDP target");
     }
-    header->Produce(static_cast<uint32_t>(header_size));
 
     ConstBufferSpanBuilder<8> framed;
-    framed.Append(net::buffer(header->Bytes()));
+    framed.Append(net::buffer(header.data(), header_size));
     framed.AppendBuffers(payload);
     co_await writer.WriteBuffers(framed.Span());
 }
 
-}  // namespace acpp::trojan
+}  // namespace trojan

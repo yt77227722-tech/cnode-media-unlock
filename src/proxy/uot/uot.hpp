@@ -1,26 +1,27 @@
 #pragma once
 
-#include "acppnode/common/asio_types.hpp"
-#include "acppnode/common/buf/multi_buffer.hpp"
-#include "acppnode/common/error.hpp"
-#include "acppnode/common/target_address.hpp"
-#include "acppnode/transport/async_stream.hpp"
-#include "acppnode/transport/link.hpp"
+#include "common/asio_types.hpp"
+#include "common/buf/multi_buffer.hpp"
+#include "common/error.hpp"
+#include "common/target_address.hpp"
+#include "common/address_codec.hpp"
+#include "transport/async_stream.hpp"
+#include "transport/link.hpp"
 
 #include <array>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
-#include <expected>
+#include <tl/expected.hpp>
 #include <optional>
 #include <span>
 #include <string_view>
 
-namespace acpp::proxy::uot {
+namespace proxy::uot {
 
 inline constexpr std::string_view kMagicAddress = "sp.v2.udp-over-tcp.arpa";
 inline constexpr std::string_view kV1MagicAddress = "sp.udp-over-tcp.arpa";
-inline constexpr size_t kMaxAddressSize = 1 + 1 + 255 + 2;
+inline constexpr size_t kMaxAddressSize = kMaxEncodedAddressSize;
 inline constexpr size_t kMaxRequestSize = 1 + kMaxAddressSize;
 
 enum class Version : uint8_t {
@@ -31,9 +32,8 @@ enum class Version : uint8_t {
 struct Request {
     bool is_connect = false;
     TargetAddress destination;
-    size_t consumed = 0;
+    std::optional<ForwardedMetadata> forwarded;
 };
-
 struct EncodedRequest {
     std::array<uint8_t, kMaxRequestSize> bytes{};
     size_t size = 0;
@@ -46,31 +46,53 @@ struct EncodedRequest {
 [[nodiscard]] std::optional<Version> VersionFromMagicAddress(
     const TargetAddress& target) noexcept;
 
-[[nodiscard]] std::expected<EncodedRequest, ErrorCode> EncodeRequest(
+[[nodiscard]] tl::expected<EncodedRequest, ErrorCode> EncodeRequest(
     bool is_connect,
-    const TargetAddress& destination);
+    const TargetAddress& destination,
+    ForwardedMetadataView forwarded = {});
 
-[[nodiscard]] net::awaitable<std::expected<Request, ErrorCode>> ReadRequest(
+[[nodiscard]] net::awaitable<tl::expected<Request, ErrorCode>> ReadRequest(
     transport::MultiBufferReader& reader,
     buf::MultiBuffer& pending);
 
+
+struct PreparedRequest {
+    bool is_connect = false;
+    TargetAddress destination;
+    std::optional<ForwardedMetadata> forwarded;
+    buf::MultiBuffer pending;
+    buf::MultiBuffer initial_decoded;
+};
+
+[[nodiscard]] net::awaitable<tl::expected<PreparedRequest, ErrorCode>>
+ReadUotRequestHeader(
+    Version version,
+    transport::MultiBufferReader& reader,
+    buf::MultiBuffer pending = {},
+    ErrorCode v1_eof_error = ErrorCode::PROTOCOL_DECODE_FAILED);
 class PacketReader final : public transport::MultiBufferReader {
 public:
     transport::CancellationSource& Cancellation() noexcept override { return reader_.Cancellation(); }
-    transport::EofAction ReadEofAction() const noexcept override { return reader_.ReadEofAction(); }
+    // A UDP association has no write-half-close to propagate to its peer.
+    transport::EofAction ReadEofAction() const noexcept override {
+        return transport::EofAction::CloseLink;
+    }
 
     PacketReader(transport::MultiBufferReader& reader,
                  bool is_connect,
                  TargetAddress destination,
                  buf::MultiBuffer pending = {});
 
+    PacketReader(transport::MultiBufferReader& reader,
+                 PreparedRequest prepared);
+
     net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override;
 
-    void SetInitialDecoded(buf::MultiBuffer packet) noexcept;
-
+    [[nodiscard]] buf::MultiBuffer TakePending() noexcept;
 private:
     transport::MultiBufferReader& reader_;
     bool is_connect_ = false;
+    // 非 connect 仅使用帧内地址，请求目标已由会话上下文拥有。
     TargetAddress destination_;
     buf::MultiBuffer pending_;
     buf::MultiBuffer initial_decoded_;
@@ -108,7 +130,7 @@ public:
                    TargetAddress destination,
                    buf::MultiBuffer pending = {})
         : underlying_(underlying)
-        , reader_(underlying, is_connect, destination, std::move(pending))
+        , reader_(underlying, is_connect, is_connect ? destination : TargetAddress{}, std::move(pending))
         , writer_(underlying, is_connect, std::move(destination)) {}
 
     net::awaitable<buf::MultiBuffer> ReadMultiBuffer() override {
@@ -125,7 +147,7 @@ public:
     }
 
     net::awaitable<void> AsyncShutdownWrite() override {
-        co_await writer_.AsyncShutdownWrite();
+        return writer_.AsyncShutdownWrite();
     }
 
     transport::CancellationSource& Cancellation() noexcept override { return underlying_.Cancellation(); }
@@ -135,6 +157,18 @@ public:
     void Cancel() noexcept {
         if constexpr (requires(Underlying& endpoint) { endpoint.Cancel(); }) {
             underlying_.Cancel();
+        }
+    }
+
+    void Close() {
+        if constexpr (requires(Underlying& endpoint) { endpoint.Close(); }) {
+            underlying_.Close();
+        }
+    }
+
+    void CloseAbortive() {
+        if constexpr (requires(Underlying& endpoint) { endpoint.CloseAbortive(); }) {
+            underlying_.CloseAbortive();
         }
     }
 
@@ -212,4 +246,4 @@ private:
     PacketWriter writer_;
 };
 
-}  // namespace acpp::proxy::uot
+}  // namespace proxy::uot

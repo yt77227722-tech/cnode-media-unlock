@@ -1,3 +1,6 @@
+#include <stdexcept>
+#include <gtest/gtest.h>
+
 #include "online_report.hpp"
 
 #include <cstdlib>
@@ -9,7 +12,7 @@ namespace {
 
 [[noreturn]] void Fail(std::string_view message) {
     std::cerr << message << '\n';
-    std::exit(1);
+    ADD_FAILURE() << "contract assertion failed; see diagnostic above"; throw std::runtime_error("contract assertion failed");
 }
 
 void Check(bool condition, std::string_view message) {
@@ -20,8 +23,8 @@ void Check(bool condition, std::string_view message) {
 
 }  // namespace
 
-int main() {
-    std::vector<acpp::api::OnlineUser> devices{
+TEST(V2BoardOnlineReport, Contract) {
+    std::vector<::api::OnlineUser> devices{
         {.UID = 7, .IP = "203.0.113.2"},
         {.UID = 7, .IP = "203.0.113.1"},
         {.UID = 7, .IP = "203.0.113.1"},
@@ -29,7 +32,7 @@ int main() {
         {.UID = 0, .IP = "203.0.113.9"},
     };
 
-    auto report = acpp::api::v2board::BuildOnlineReportPayload(devices, 42);
+    auto report = ::api::v2board::BuildOnlineReportPayload(devices, 42);
     Check(report.user_count == 2, "online report did not count unique UIDs");
     Check(report.device_count == 3, "online report did not deduplicate devices");
     Check(report.alive_body.size() == 2, "alive payload user count mismatch");
@@ -41,12 +44,11 @@ int main() {
     Check(uid7_alive[1].as_string() == "203.0.113.2_42",
           "alive payload node suffix mismatch");
 
-    auto empty = acpp::api::v2board::BuildOnlineReportPayload({}, 42);
+    auto empty = ::api::v2board::BuildOnlineReportPayload({}, 42);
     Check(empty.user_count == 0 && empty.device_count == 0,
           "empty online snapshot did not report zero");
     Check(empty.alive_body.empty(),
           "empty online snapshot did not build an empty device payload");
 
     std::cout << "v2board_online_report_test: ok\n";
-    return 0;
 }

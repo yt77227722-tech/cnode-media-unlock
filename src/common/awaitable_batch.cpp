@@ -1,4 +1,6 @@
 #include "awaitable_batch.hpp"
+#include "common/allocator.hpp"
+#include "common/error.hpp"
 
 #include <asio/async_result.hpp>
 #include <asio/bind_cancellation_slot.hpp>
@@ -11,23 +13,33 @@
 #include <type_traits>
 #include <utility>
 
-namespace acpp {
 
 namespace {
+
 
 template <typename Handler>
 struct BatchState {
     BatchState(Handler handler, size_t task_count)
         : completion(std::move(handler)), remaining(task_count + 1) {}
 
+    void RecordFailure(std::exception_ptr error) {
+        if (!error) return;
+        const bool cancelled = IsOperationCancelled(error);
+        if (!failure || (failure_is_cancellation && !cancelled)) {
+            failure = std::move(error);
+            failure_is_cancellation = cancelled;
+        }
+    }
+
     void Finish(std::exception_ptr error = {}) {
-        if (error && !failure) failure = std::move(error);
+        RecordFailure(std::move(error));
         if (--remaining == 0) std::move(completion)(failure);
     }
 
     Handler completion;
     size_t remaining;
     std::exception_ptr failure;
+    bool failure_is_cancellation = false;
 };
 
 // This coroutine and every completion callback run on the supplied executor.
@@ -41,7 +53,7 @@ net::awaitable<void> RunBatchOnExecutor(std::vector<net::awaitable<void>> tasks)
             static_assert(std::is_nothrow_move_constructible_v<decltype(handler)>);
             std::shared_ptr<BatchState<decltype(handler)>> state;
             try {
-                state = std::make_shared<BatchState<decltype(handler)>>(
+                state = memory::AllocateShared<BatchState<decltype(handler)>>(
                     std::move(handler), tasks.size());
             } catch (...) {
                 tasks.clear();
@@ -56,7 +68,7 @@ net::awaitable<void> RunBatchOnExecutor(std::vector<net::awaitable<void>> tasks)
                     ++launched;
                 }
             } catch (...) {
-                if (!state->failure) state->failure = std::current_exception();
+                state->RecordFailure(std::current_exception());
                 state->remaining -= tasks.size() - launched;
             }
             // Destroy unstarted frames before releasing the launch sentinel.
@@ -83,4 +95,3 @@ net::awaitable<void> RunAwaitableBatch(
     }
 }
 
-}  // namespace acpp

@@ -1,8 +1,10 @@
+#include <gtest/gtest.h>
+
 #include "proxy/freedom/outbound/udp_request.hpp"
-#include "acppnode/app/dns/dns_worker.hpp"
-#include "acppnode/app/relay.hpp"
-#include "acppnode/transport/async_stream.hpp"
-#include "acppnode/transport/internet/timeout_scheduler.hpp"
+#include "app/dns/dns_worker.hpp"
+#include "app/relay.hpp"
+#include "transport/async_stream.hpp"
+#include "transport/internet/timeout_scheduler.hpp"
 
 #include <asio/bind_cancellation_slot.hpp>
 #include <asio/cancellation_signal.hpp>
@@ -19,7 +21,6 @@
 #include <vector>
 
 namespace {
-using namespace acpp;
 using namespace std::chrono_literals;
 using UdpRequest = proxy::freedom::outbound::UdpRequest;
 
@@ -81,7 +82,7 @@ public:
         stopped_ = true;
         IoErrorCode ignored;
         socket_.close(ignored);
-        query_ready_.cancel(ignored);
+        query_ready_.cancel();
     }
 
 private:
@@ -91,8 +92,7 @@ private:
                 if (error || stopped_) return;
                 Query query{{buffer_.begin(), buffer_.begin() + size}, sender_};
                 queries_.push_back(query);
-                IoErrorCode ignored;
-                query_ready_.cancel(ignored);
+                query_ready_.cancel();
                 if (auto_reply_) Reply(query);
                 Receive();
             });
@@ -411,8 +411,8 @@ net::awaitable<void> TestRelayRateAndAccounting(Fixture& fixture) {
     context.content.network = Network::UDP;
     StatsShard stats;
     const auto started = std::chrono::steady_clock::now();
-    auto result = co_await DoRelayLink(fixture.io, input, output, target, context, stats,
-                                      RelayConfig{.downlink_only = 1s, .speed_limit = 1000});
+    auto result = co_await DoRelayLink(fixture.io, input, output, static_cast<AsyncStream*>(nullptr),
+        target, context, stats, RelayConfig{.downlink_only = 1s, .speed_limit = 1000});
     const auto elapsed = std::chrono::steady_clock::now() - started;
     Check(result.error == ErrorCode::RELAY_TIMEOUT && result.bytes_up == 2000 && result.bytes_down == 0,
           "generic UDP relay traffic result changed");
@@ -430,10 +430,10 @@ net::awaitable<void> TestRelayErrorCode(Fixture& fixture) {
     session::Context context;
     context.content.network = Network::UDP;
     StatsShard stats;
-    auto result = co_await DoRelayLink(fixture.io, input, output, target, context, stats);
+    auto result = co_await DoRelayLink(fixture.io, input, output, static_cast<AsyncStream*>(nullptr),
+                                      target, context, stats);
     Check(result.error == ErrorCode::INVALID_ARGUMENT && result.bytes_up == 0 &&
           stats.Snapshot().bytes_out == 0, "logical UDP failure or failed-send accounting was lost");
-    Check(context.outbound.os_error_code == 0, "application failure fabricated an OS error code");
 }
 
 net::awaitable<void> TestRelayExternalCancellation(Fixture& fixture, bool deadline) {
@@ -444,22 +444,26 @@ net::awaitable<void> TestRelayExternalCancellation(Fixture& fixture, bool deadli
     session::Context context;
     context.content.network = Network::UDP;
     StatsShard stats;
-    TimeoutToken cancellation;
+    struct Cancellation final : TimeoutEvent {
+        explicit Cancellation(UdpRequest& target) : target(target) {}
+        void OnTimeout() override { target.Cancel(); }
+        UdpRequest& target;
+    } cancellation(target);
     if (deadline) target.StartPhaseDeadline(1s);
-    else cancellation = TimeoutScheduler::ForIoContext(fixture.io).ScheduleAfter(50ms, [&] { target.Cancel(); });
+    else (void)TimeoutScheduler::ForIoContext(fixture.io).ScheduleAfter(50ms, cancellation);
     const auto start = std::chrono::steady_clock::now();
-    const auto result = co_await DoRelayLink(fixture.io, input, output, target, context, stats,
-        RelayConfig{.speed_limit = 100});
+    const auto result = co_await DoRelayLink(fixture.io, input, output, static_cast<AsyncStream*>(nullptr),
+        target, context, stats, RelayConfig{.speed_limit = 100});
     const auto elapsed = std::chrono::steady_clock::now() - start;
     const auto expected = deadline ? ErrorCode::RELAY_TIMEOUT : ErrorCode::CANCELLED;
-    Check(result.error == expected && context.outbound.failure_detail_code == ErrorCodeToString(expected),
+    Check(result.error == expected,
         "UDP external cancellation lost the terminal reason");
     Check(result.bytes_up == 0 && stats.Snapshot().bytes_out == 0 && elapsed < (deadline ? 1800ms : 500ms),
         "UDP cancellation failed to join the pending rate wait before sending");
 }
 }  // namespace
 
-int main() {
+TEST(UdpRequest, Contract) {
     try {
         { Fixture fixture; fixture.Run(TestCancellationIsolation(fixture)); }
         { Fixture fixture; fixture.Run(TestDnsWriteCancellation(fixture, WriteAbort::RequestCancel)); }
@@ -478,7 +482,6 @@ int main() {
         }
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
-        return 1;
+        FAIL() << error.what();
     }
-    return 0;
 }

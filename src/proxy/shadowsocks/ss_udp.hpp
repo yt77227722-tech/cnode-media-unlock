@@ -1,11 +1,14 @@
 #pragma once
 
-#include "acppnode/common/allocator.hpp"
-#include "acppnode/common/buf/multi_buffer.hpp"
+#include "common/allocator.hpp"
+#include "common/buf/multi_buffer.hpp"
 #include "shadowsocks_protocol.hpp"
-#include "validator.hpp"
-#include "acppnode/common/target_address.hpp"
+#include "app/proxyman/inbound/user_store.hpp"
+#include "common/target_address.hpp"
+#include "proxy/inbound_datagram.hpp"
 
+#include "common/unsafe.hpp"
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <memory>
@@ -13,7 +16,7 @@
 #include <span>
 #include <vector>
 
-namespace acpp::ss {
+namespace ss {
 
 class Ss2022UdpReplayWindow {
 public:
@@ -32,8 +35,8 @@ private:
     bool initialized_ = false;
 };
 
-// Worker-local cache. It deliberately rejects new sessions when full instead of
-// evicting a still-protected session and reopening a replay window.
+// Worker-local cache, scoped by authenticated credential and protocol session ID.
+// Rejects new sessions when full instead of reopening a protected replay window.
 class Ss2022UdpReplayCache {
 public:
     static constexpr size_t kMaxSessions = 16384;
@@ -46,6 +49,7 @@ public:
     Ss2022UdpReplayCache& operator=(Ss2022UdpReplayCache&&) = default;
 
     [[nodiscard]] bool Accept(
+        std::span<const uint8_t> authenticated_key,
         std::span<const uint8_t, 8> session_id,
         uint64_t packet_id,
         std::chrono::steady_clock::time_point now =
@@ -54,6 +58,22 @@ public:
     [[nodiscard]] size_t Size() const noexcept { return sessions_.size(); }
 
 private:
+    struct SessionKey {
+        KeyBytes credential;
+        uint64_t session_id = 0;
+
+        [[nodiscard]] bool operator==(const SessionKey& other) const noexcept {
+            return session_id == other.session_id &&
+                credential.size == other.credential.size &&
+                ::ConstantTimeEqual(credential.bytes.data(),
+                                          other.credential.bytes.data(),
+                                          credential.size);
+        }
+    };
+    struct SessionKeyHash {
+        [[nodiscard]] size_t operator()(const SessionKey& key) const noexcept;
+    };
+
     struct Session {
         Ss2022UdpReplayWindow window;
         std::chrono::steady_clock::time_point last_seen;
@@ -61,7 +81,24 @@ private:
 
     void PruneExpired(std::chrono::steady_clock::time_point now);
 
-    memory::ThreadLocalUnorderedMap<uint64_t, Session> sessions_;
+    memory::ThreadLocalUnorderedMap<SessionKey, Session, SessionKeyHash> sessions_;
+};
+
+// The sole SS2022 path/replay authority, retained by the ingress directory
+// even after the live relay ends. The local index only borrows this object.
+class Ss2022UdpAssociation final : public InboundDatagramAssociation {
+public:
+    Ss2022UdpAssociation() noexcept : InboundDatagramAssociation(Policy()) {}
+    [[nodiscard]] static const InboundDatagramAssociationPolicy& Policy() noexcept;
+    [[nodiscard]] bool Check(
+        uint64_t packet_id, uint32_t worker, const udp::endpoint& endpoint,
+        InboundDatagramCheck check, Clock::time_point now = Clock::now()) noexcept override;
+
+private:
+    Ss2022UdpReplayWindow replay_;
+    std::optional<uint64_t> path_packet_id_;
+    uint32_t path_worker_ = 0;
+    udp::endpoint path_endpoint_;
 };
 
 // ============================================================================
@@ -92,15 +129,12 @@ struct Ss2022UdpSessionState {
 struct SsUdpDecodeResult {
     TargetAddress        target;       // 解析出的 SOCKS5 目标地址
     buf::MultiBuffer     payload;      // 解密后的 payload Buffer 所有权
-    memory::ThreadLocalString session_key;
+    std::optional<ForwardedMetadata> forwarded;
+    std::optional<uint64_t> session_id;
+    // SS2022 authenticated metadata, available before replay acceptance.
+    std::optional<uint64_t> packet_id;
+    KeyBytes             session_owner;
     size_t               user_index = 0;   // 匹配用户在 users 列表中的下标
-    // reply_* 由 UDP 接收侧直接拿来编码回包，不再经过额外回调包装
-    int64_t              user_id = 0;
-    memory::ThreadLocalString user_email;
-    uint64_t             speed_limit = 0;
-    KeyBytes             reply_key;
-    SsCipherInfo         cipher_info{};
-    std::shared_ptr<Ss2022UdpSessionState> ss2022_session;
 };
 
 // ============================================================================
@@ -111,6 +145,9 @@ struct SsUdpDecodeResult {
 //
 // 最小包长: salt_size + 1(ATYP) + 1(域名长度或4字节IP) + 2(port) + kTagSize
 // 返回 nullopt: 包过短 / 所有用户均不匹配
+// deferred_replay authenticates SS2022 without reading or mutating replay_cache;
+// the caller must commit packet_id in the full session_owner/session_id namespace.
+// Classic AEAD behavior is unchanged.
 // ============================================================================
 [[nodiscard]] std::optional<SsUdpDecodeResult> DecodeUdpPacket(
     const uint8_t*               datagram,
@@ -119,7 +156,8 @@ struct SsUdpDecodeResult {
     SsCipherType                 cipher_type,
     size_t                       key_size,
     size_t                       salt_size,
-    Ss2022UdpReplayCache&        replay_cache);
+    Ss2022UdpReplayCache&        replay_cache,
+    bool                        deferred_replay = false);
 
 // ============================================================================
 // EncodeUdpPacket — 编码 SS AEAD UDP 回包
@@ -139,7 +177,8 @@ struct SsUdpDecodeResult {
     size_t                      key_size,
     size_t                      salt_size,
     uint8_t*                    output,
-    size_t                      output_size);
+    size_t                      output_size,
+    ForwardedMetadataView       forwarded = {});
 
 [[nodiscard]] std::optional<SsUdpDecodeResult> DecodeUdpPacketWithKey(
     const uint8_t* datagram,
@@ -161,7 +200,8 @@ struct SsUdpDecodeResult {
     Ss2022UdpSessionState& state,
     std::span<const KeyBytes> psk_chain,
     uint8_t* output,
-    size_t output_size);
+    size_t output_size,
+    ForwardedMetadataView forwarded = {});
 
 [[nodiscard]] size_t Encode2022UdpResponsePacketTo(
     const TargetAddress& target,
@@ -176,4 +216,4 @@ struct SsUdpDecodeResult {
     size_t datagram_len,
     Ss2022UdpSessionState& state);
 
-}  // namespace acpp::ss
+}  // namespace ss

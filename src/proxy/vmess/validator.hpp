@@ -11,7 +11,8 @@
 //   - 在线用户追踪
 // ============================================================================
 
-#include "acppnode/app/proxyman/inbound/user_store.hpp"
+#include "app/proxyman/inbound/user_store.hpp"
+#include "common/sharded_user_stats.hpp"
 
 #include <cstdint>
 #include <memory>
@@ -19,8 +20,6 @@
 #include <string_view>
 #include <vector>
 
-namespace acpp {
-struct OnlineDevice;
 
 namespace vmess {
 
@@ -28,19 +27,17 @@ namespace vmess {
 // TimedUserValidator — 用户验证器
 //
 // 线程模型：
-//   - 认证用户表为进程级单份 RCU 快照，认证路径只做 atomic load
-//   - 面板/静态更新在冷路径构建新快照后无锁发布
-//   - 在线追踪为 Worker 私有状态
+//   - Credentials are immutable snapshots leased by the current session domain.
+//   - Online leases and hot credential caches stay in that stable domain.
+//   - Replay admission runs on the bounded process control coordinator.
 // ============================================================================
-class TimedUserValidator {
+class TimedUserValidator : public UserOnlineTracker {
 public:
     TimedUserValidator();
     ~TimedUserValidator();
 
     TimedUserValidator(const TimedUserValidator&) = delete;
     TimedUserValidator& operator=(const TimedUserValidator&) = delete;
-    TimedUserValidator(TimedUserValidator&&) noexcept;
-    TimedUserValidator& operator=(TimedUserValidator&&) noexcept;
 
     // 通过 AuthID 查找用户，限定 tag（优化：O(N_tag) 而非 O(N_total)）
     std::shared_ptr<const proxyman::inbound::UserStore::VmessCredential>
@@ -50,36 +47,10 @@ public:
 
     // Records AEAD request body key/IV for replay protection.
     // Returns false if the same user/key/IV tuple is still inside the replay window.
-    [[nodiscard]] bool RegisterSessionIfNew(
+    [[nodiscard]] net::awaitable<bool> RegisterSessionIfNew(
         const proxyman::inbound::UserStore::VmessCredential& user,
         const std::array<uint8_t, 16>& body_key,
         const std::array<uint8_t, 16>& body_iv) const;
-
-    // ── 在线追踪 ─────────────────────────────────────────────────────────────
-
-    void OnUserConnected(std::string_view tag,
-                         uint64_t user_id,
-                         std::string_view client_ip);
-
-    void OnUserDisconnected(std::string_view tag,
-                            uint64_t user_id,
-                            std::string_view client_ip);
-
-    [[nodiscard]] bool CanAcceptDevice(std::string_view tag,
-                                       uint64_t user_id,
-                                       std::string_view client_ip,
-                                       uint32_t device_limit) const;
-
-    [[nodiscard]] size_t OnlineDeviceCount(std::string_view tag,
-                                           uint64_t user_id) const;
-
-    [[nodiscard]] std::vector<OnlineDevice>
-    GetOnlineDevices(std::string_view tag) const;
-
-private:
-    struct Impl;
-    std::unique_ptr<Impl> impl_;
 };
 
 }  // namespace vmess
-}  // namespace acpp

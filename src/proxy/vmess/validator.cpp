@@ -1,73 +1,82 @@
 #include "validator.hpp"
-#include "acppnode/app/proxyman/inbound/user_store.hpp"
-#include "acppnode/common/allocator.hpp"
-#include "acppnode/common/sharded_user_stats.hpp"
-#include "acppnode/common/string_hash.hpp"
+#include "app/proxyman/inbound/user_store.hpp"
+#include "common/allocator.hpp"
+#include "common/sharded_user_stats.hpp"
+#include "common/string_hash.hpp"
+#include "common/container_util.hpp"
 #include "vmess_crypto.hpp"
 #include "vmess_request.hpp"
+#include "app/session_group_executor.hpp"
 
+#include <algorithm>
+#include <openssl/mem.h>
+#include <openssl/rand.h>
+#include <openssl/siphash.h>
+#include <cstdlib>
 #include <array>
 #include <chrono>
 #include <cstring>
 #include <utility>
 
-namespace acpp {
 namespace vmess {
 
-struct TimedUserValidator::Impl : memory::ThreadAllocated {
-    struct SessionKey {
-        std::array<uint8_t, 16> user{};
-        std::array<uint8_t, 16> key{};
-        std::array<uint8_t, 16> iv{};
+namespace {
 
-        [[nodiscard]] bool operator==(const SessionKey& other) const noexcept {
-            return user == other.user && key == other.key && iv == other.iv;
-        }
-    };
+using SessionKey = std::array<uint8_t, 32>;
 
-    struct SessionKeyHash {
-        [[nodiscard]] size_t operator()(const SessionKey& value) const noexcept {
-            uint64_t words[6]{};
-            std::memcpy(&words[0], value.user.data(), 16);
-            std::memcpy(&words[2], value.key.data(), 16);
-            std::memcpy(&words[4], value.iv.data(), 16);
-            uint64_t h = 1469598103934665603ull;
-            for (uint64_t word : words) {
-                h ^= word;
-                h *= 1099511628211ull;
-            }
-            return static_cast<size_t>(h);
-        }
-    };
+struct SessionKeyEqual {
+    [[nodiscard]] bool operator()(const SessionKey& a, const SessionKey& b) const noexcept {
+        return CRYPTO_memcmp(a.data(), b.data(), a.size()) == 0;
+    }
+};
+
+struct SessionKeyHash {
+    std::array<uint64_t, 2> key{};
+
+    [[nodiscard]] size_t operator()(const SessionKey& value) const noexcept {
+        return static_cast<size_t>(SIPHASH_24(key.data(), value.data(), value.size()));
+    }
+};
 
     struct SessionHistory {
         static constexpr int64_t kTtlSeconds = 180;
         static constexpr int64_t kCleanupIntervalSeconds = 30;
         static constexpr size_t kMaxEntries = 65536;
 
-        memory::ThreadLocalUnorderedMap<SessionKey, int64_t, SessionKeyHash> entries;
-        memory::ThreadLocalDeque<std::pair<SessionKey, int64_t>> order;
+        memory::ThreadLocalUnorderedMap<SessionKey, int64_t, SessionKeyHash, SessionKeyEqual> entries;
+        memory::ThreadLocalDeque<std::pair<const SessionKey*, int64_t>> order;
         int64_t last_cleanup = 0;
 
+        SessionHistory()
+            : entries(0, [] {
+                  SessionKeyHash hash;
+                  if (RAND_bytes(reinterpret_cast<uint8_t*>(hash.key.data()),
+                                 sizeof(hash.key)) != 1) {
+                      std::abort();
+                  }
+                  return hash;
+              }()) {}
         void Cleanup(int64_t now) {
             if (now - last_cleanup < kCleanupIntervalSeconds &&
-                entries.size() <= kMaxEntries) {
+                entries.size() < kMaxEntries) {
                 return;
             }
             last_cleanup = now;
             while (!order.empty()) {
-                const auto& [key, expires_at] = order.front();
-                auto it = entries.find(key);
+                const auto [key_ptr, expires_at] = order.front();
+                auto it = entries.find(*key_ptr);
                 if (it == entries.end() || it->second != expires_at) {
                     order.pop_front();
                     continue;
                 }
-                if (expires_at > now && entries.size() <= kMaxEntries) {
+                if (expires_at > now) {
                     break;
                 }
                 entries.erase(it);
                 order.pop_front();
             }
+            MaybeShrinkHashContainer(entries);
+            order.shrink_to_fit();
         }
 
         bool AddIfNew(SessionKey key, int64_t now) {
@@ -77,96 +86,113 @@ struct TimedUserValidator::Impl : memory::ThreadAllocated {
                 return false;
             }
             const int64_t expires_at = now + kTtlSeconds;
-            entries[key] = expires_at;
-            order.emplace_back(std::move(key), expires_at);
+            if (it != entries.end()) {
+                order.emplace_back(&it->first, expires_at);
+                it->second = expires_at;
+                return true;
+            }
+            while (entries.size() >= kMaxEntries && !order.empty()) {
+                const auto [oldest_key_ptr, oldest_expires] = order.front();
+                order.pop_front();
+                if (auto oldest_it = entries.find(*oldest_key_ptr);
+                    oldest_it != entries.end() && oldest_it->second == oldest_expires) {
+                    entries.erase(oldest_it);
+                }
+            }
+            auto [inserted_it, inserted] = entries.emplace(std::move(key), expires_at);
+            try {
+                order.emplace_back(&inserted_it->first, expires_at);
+            } catch (...) {
+                if (inserted) {
+                    entries.erase(inserted_it);
+                }
+                throw;
+            }
             return true;
         }
 
-        void Clear() {
-            entries.clear();
-            order.clear();
-            last_cleanup = 0;
-        }
     };
 
     struct alignas(64) HotUserCache {
-        static constexpr size_t kMaxEntries = 8192;
+        static constexpr size_t kMaxHotUsers = 32;
         static constexpr int64_t kWindowSeconds = 300;
         using Credential = proxyman::inbound::UserStore::VmessCredential;
-        using ActiveList = memory::ThreadLocalList<const Credential*>;
+        using AuthIDLookupTable = proxyman::inbound::UserStore::VmessUserMap;
 
-        struct Entry {
-            memory::ThreadLocalString tag;
-            int64_t timestamp;
-            ActiveList::iterator order_it;
+        struct HotEntry {
+            const Credential* user = nullptr;
+            const AuthIDLookupTable* table = nullptr;
+            int64_t last_seen = 0;
         };
 
-        memory::ThreadLocalUnorderedMap<const Credential*, Entry> entries;
-        ActiveList active_order;
+        std::array<HotEntry, kMaxHotUsers> entries{};
+        size_t size = 0;
+        uint64_t view_revision = 0;
+        int64_t last_cleanup = 0;
 
-        void Touch(const Credential* user, std::string_view tag, int64_t now) {
-            auto it = entries.find(user);
-            if (it != entries.end()) {
-                it->second.tag.assign(tag.data(), tag.size());
-                it->second.timestamp = now;
-                if (it->second.order_it != active_order.begin()) {
-                    active_order.splice(active_order.begin(), active_order, it->second.order_it);
-                }
-                return;
-            }
-
-            active_order.push_front(user);
-            Entry entry;
-            entry.tag.assign(tag.data(), tag.size());
-            entry.timestamp = now;
-            entry.order_it = active_order.begin();
-            entries.emplace(user, std::move(entry));
-            if (entries.size() > kMaxEntries && !active_order.empty()) {
-                const auto* tail = active_order.back();
-                active_order.pop_back();
-                entries.erase(tail);
-            }
-        }
-
-        void Cleanup(int64_t now) {
-            for (auto it = entries.begin(); it != entries.end(); ) {
-                if (it->second.timestamp + kWindowSeconds < now) {
-                    active_order.erase(it->second.order_it);
-                    it = entries.erase(it);
-                } else {
-                    ++it;
+        void Touch(const Credential* user,
+                   const AuthIDLookupTable* table,
+                   int64_t now) noexcept {
+            const auto begin = entries.begin();
+            const auto end = begin + size;
+            for (auto it = begin; it != end; ++it) {
+                if (it->user == user) {
+                    HotEntry entry = *it;
+                    entry.table = table;
+                    entry.last_seen = now;
+                    if (it != begin) {
+                        std::move_backward(begin, it, it + 1);
+                        entries.front() = entry;
+                    } else {
+                        *it = entry;
+                    }
+                    return;
                 }
             }
-        }
 
-        void Clear() {
-            entries.clear();
-            active_order.clear();
-        }
-
-        void UpdateTime(const Credential* user, int64_t now) {
-            auto it = entries.find(user);
-            if (it != entries.end()) {
-                it->second.timestamp = now;
+            const size_t shift = std::min(size, kMaxHotUsers - 1);
+            if (shift > 0) {
+                std::move_backward(begin, begin + shift, begin + shift + 1);
             }
+            entries.front() = HotEntry{user, table, now};
+            if (size < kMaxHotUsers) {
+                ++size;
+            }
+        }
+
+        void Cleanup(int64_t now) noexcept {
+            size_t write = 0;
+            for (size_t read = 0; read < size; ++read) {
+                if (entries[read].last_seen + kWindowSeconds >= now) {
+                    if (write != read) {
+                        entries[write] = entries[read];
+                    }
+                    ++write;
+                }
+            }
+            size = write;
+        }
+
+        void Clear() noexcept {
+            size = 0;
         }
     };
+    static HotUserCache& ThreadHotCache() noexcept {
+        thread_local HotUserCache cache;
+        return cache;
+    }
 
-    mutable HotUserCache hot_cache;
-    // Cache entries borrow credentials only while the currently loaded table
-    // owns them. An idle validator must not retain a replaced authentication table.
-    mutable std::weak_ptr<const proxyman::inbound::UserStore::VmessUserMap> hot_users;
-    mutable int64_t last_hot_cache_cleanup = 0;
-    mutable SessionHistory session_history;
-    UserOnlineTracker stats;
-};
+    struct HistoryService final : net::execution_context::service {
+        inline static net::execution_context::id id;
+        explicit HistoryService(net::execution_context& context) : service(context) {}
+        void shutdown() override {}
+        SessionHistory history;
+    };
+}  // namespace
 
-TimedUserValidator::TimedUserValidator()
-    : impl_(std::make_unique<Impl>()) {}
+TimedUserValidator::TimedUserValidator() = default;
 
 TimedUserValidator::~TimedUserValidator() = default;
-TimedUserValidator::TimedUserValidator(TimedUserValidator&&) noexcept = default;
-TimedUserValidator& TimedUserValidator::operator=(TimedUserValidator&&) noexcept = default;
 
 std::shared_ptr<const proxyman::inbound::UserStore::VmessCredential>
 TimedUserValidator::FindByAuthIDForTag(
@@ -178,8 +204,8 @@ TimedUserValidator::FindByAuthIDForTag(
         std::chrono::system_clock::now().time_since_epoch()).count();
 
     auto tryUser = [&](const proxyman::inbound::UserStore::VmessCredential& user) -> bool {
-        std::array<uint8_t, 16> plaintext;
-        AES128ECBDecrypt(user.cached_auth_aes_key.data(), auth_id, plaintext.data());
+        std::array<uint8_t, 16> plaintext{};
+        AES_decrypt(auth_id, plaintext.data(), &user.auth_id_key);
 
         int64_t timestamp = 0;
         for (int i = 0; i < 8; i++) {
@@ -187,6 +213,7 @@ TimedUserValidator::FindByAuthIDForTag(
         }
 
         if (timestamp > now + TIMESTAMP_TOLERANCE || timestamp < now - TIMESTAMP_TOLERANCE) {
+            OPENSSL_cleanse(plaintext.data(), plaintext.size());
             return false;
         }
 
@@ -195,6 +222,7 @@ TimedUserValidator::FindByAuthIDForTag(
                                 (static_cast<uint32_t>(plaintext[13]) << 16) |
                                 (static_cast<uint32_t>(plaintext[14]) << 8) |
                                 plaintext[15];
+        OPENSSL_cleanse(plaintext.data(), plaintext.size());
 
         if (crc == expected_crc) {
             out_timestamp = timestamp;
@@ -204,48 +232,42 @@ TimedUserValidator::FindByAuthIDForTag(
     };
 
     auto view = proxyman::inbound::UserStore::VmessUsers(tag);
-    const auto hot_users = impl_->hot_users.lock();
-    if (!hot_users || view.users.get() != hot_users.get()) {
-        impl_->hot_cache.Clear();
-        impl_->hot_users = view.users;
+    const uint64_t revision = proxyman::inbound::UserStore::WorkerViewRevision();
+    auto& tls_hot_cache = ThreadHotCache();
+    if (revision == 0 || tls_hot_cache.view_revision != revision) {
+        tls_hot_cache.Clear();
+        tls_hot_cache.view_revision = revision;
     }
 
-    if (now - impl_->last_hot_cache_cleanup > 60) {
-        impl_->last_hot_cache_cleanup = now;
-        impl_->hot_cache.Cleanup(now);
-    }
-
-    {
-        std::array<const proxyman::inbound::UserStore::VmessCredential*, 32> candidates{};
-        size_t candidate_count = 0;
-        for (const auto* user : impl_->hot_cache.active_order) {
-            auto it = impl_->hot_cache.entries.find(user);
-            if (it != impl_->hot_cache.entries.end() &&
-                std::string_view(it->second.tag.data(), it->second.tag.size()) == tag &&
-                it->second.timestamp + Impl::HotUserCache::kWindowSeconds >= now) {
-                candidates[candidate_count++] = user;
-                if (candidate_count == candidates.size()) {
-                    break;
-                }
-            }
-        }
-
-        for (size_t i = 0; i < candidate_count; ++i) {
-            const auto* user = candidates[i];
-            if (tryUser(*user)) {
-                impl_->hot_cache.UpdateTime(user, now);
-                return view.Share(*user);
-            }
-        }
+    if (revision != 0 && now - tls_hot_cache.last_cleanup > 60) {
+        tls_hot_cache.last_cleanup = now;
+        tls_hot_cache.Cleanup(now);
     }
 
     if (!view.users) {
         return {};
     }
 
-    for (const auto& [uuid, user] : *view.users) {
+    if (revision != 0) {
+        for (auto it = tls_hot_cache.entries.begin();
+             it != tls_hot_cache.entries.begin() + tls_hot_cache.size;
+             ++it) {
+            if (it->table == view.users.get() &&
+                it->last_seen + HotUserCache::kWindowSeconds >= now) {
+                const auto* user = it->user;
+                if (tryUser(*user)) {
+                    tls_hot_cache.Touch(user, view.users.get(), now);
+                    return view.Share(*user);
+                }
+            }
+        }
+    }
+
+    for (const auto& user : *view.users) {
         if (tryUser(user)) {
-            impl_->hot_cache.Touch(&user, tag, now);
+            if (revision != 0) {
+                tls_hot_cache.Touch(&user, view.users.get(), now);
+            }
             return view.Share(user);
         }
     }
@@ -253,48 +275,26 @@ TimedUserValidator::FindByAuthIDForTag(
     return {};
 }
 
-bool TimedUserValidator::RegisterSessionIfNew(
+net::awaitable<bool> TimedUserValidator::RegisterSessionIfNew(
     const proxyman::inbound::UserStore::VmessCredential& user,
     const std::array<uint8_t, 16>& body_key,
     const std::array<uint8_t, 16>& body_iv) const {
-    const int64_t now = std::chrono::duration_cast<std::chrono::seconds>(
-        std::chrono::system_clock::now().time_since_epoch()).count();
-
-    Impl::SessionKey key;
-    key.user = user.uuid_bytes;
-    key.key = body_key;
-    key.iv = body_iv;
-    return impl_->session_history.AddIfNew(std::move(key), now);
+    auto domain = ExecutionDomain::Current();
+    if (!domain) throw std::logic_error("VMess replay admission requires an execution domain");
+    std::array<uint8_t, 48> material{};
+    std::memcpy(material.data(), user.uuid_bytes.data(), 16);
+    std::memcpy(material.data() + 16, body_key.data(), 16);
+    std::memcpy(material.data() + 32, body_iv.data(), 16);
+    const SessionKey key = SHA256Hash(material.data(), material.size());
+    OPENSSL_cleanse(material.data(), material.size());
+    auto* coordinator = &domain->Coordinator();
+    return coordinator->PostCall([coordinator, key] {
+        const int64_t now = std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+        return net::use_service<HistoryService>(
+            coordinator->Services()).history.AddIfNew(key, now);
+    });
 }
 
-void TimedUserValidator::OnUserConnected(std::string_view tag,
-                                         uint64_t user_id,
-                                         std::string_view client_ip) {
-    impl_->stats.OnUserConnected(tag, user_id, client_ip);
-}
-
-void TimedUserValidator::OnUserDisconnected(std::string_view tag,
-                                            uint64_t user_id,
-                                            std::string_view client_ip) {
-    impl_->stats.OnUserDisconnected(tag, user_id, client_ip);
-}
-
-bool TimedUserValidator::CanAcceptDevice(std::string_view tag,
-                                         uint64_t user_id,
-                                         std::string_view client_ip,
-                                         uint32_t device_limit) const {
-    return impl_->stats.CanAcceptDevice(tag, user_id, client_ip, device_limit);
-}
-
-size_t TimedUserValidator::OnlineDeviceCount(std::string_view tag,
-                                             uint64_t user_id) const {
-    return impl_->stats.OnlineDeviceCount(tag, user_id);
-}
-
-std::vector<OnlineDevice>
-TimedUserValidator::GetOnlineDevices(std::string_view tag) const {
-    return impl_->stats.GetOnlineDevices(tag);
-}
 
 }  // namespace vmess
-}  // namespace acpp

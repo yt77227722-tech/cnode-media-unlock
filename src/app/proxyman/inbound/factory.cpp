@@ -1,12 +1,12 @@
-#include "acppnode/app/proxyman/inbound/factory.hpp"
+#include "app/proxyman/inbound/factory.hpp"
 
-#include "acppnode/proxy/inbound.hpp"
+#include "infra/config_types.hpp"
+#include "proxy/inbound.hpp"
 
 #include <map>
-#include <ranges>
 #include <stdexcept>
 
-namespace acpp::proxyman::inbound {
+namespace proxyman::inbound {
 
 namespace {
 
@@ -22,10 +22,16 @@ RegistrationMap& Registrations() noexcept {
 void RegisterProxy(
     std::string_view protocol,
     ProxyRegistration registration) {
-    const bool has_user_builders = registration.build_static_users ||
-                                   registration.build_users;
+    const bool has_user_builders = registration.build_users != nullptr;
+    const bool has_tcp = registration.create_tcp_handler != nullptr;
+    const bool has_packet_datagrams =
+        registration.create_datagram_handler != nullptr;
+    const bool transport_consistent =
+        (registration.datagram_transport == DatagramTransport::Packet) ==
+            has_packet_datagrams;
     if (protocol.empty() || !registration.create_runtime ||
-        !registration.create_tcp_handler ||
+        !has_tcp ||
+        !transport_consistent ||
         has_user_builders != registration.user_protocol.has_value()) {
         throw std::invalid_argument(
             "invalid inbound protocol registration for '" +
@@ -43,21 +49,21 @@ bool HasProxy(std::string_view protocol) {
     return Registrations().contains(protocol);
 }
 
-std::vector<std::string> RegisteredProtocols() {
-    auto& registrations = Registrations();
-    std::vector<std::string> result;
-    result.reserve(registrations.size());
-    for (const auto& name : registrations | std::views::keys) {
-        result.push_back(name);
-    }
-    return result;
-}
 
 std::optional<UserProtocol> RegisteredUserProtocol(
     std::string_view protocol) {
     auto& registrations = Registrations();
     auto it = registrations.find(protocol);
     return it == registrations.end() ? std::nullopt : it->second.user_protocol;
+}
+
+DatagramTransport RegisteredDatagramTransport(
+    std::string_view protocol) {
+    auto& registrations = Registrations();
+    auto it = registrations.find(protocol);
+    return it == registrations.end()
+        ? DatagramTransport::None
+        : it->second.datagram_transport;
 }
 
 std::unique_ptr<ProtocolRuntime> NewProtocolRuntime(
@@ -70,11 +76,11 @@ std::unique_ptr<ProtocolRuntime> NewProtocolRuntime(
     return it->second.create_runtime();
 }
 
-std::unique_ptr<::acpp::Inbound> NewHandler(
+std::unique_ptr<::Inbound> NewHandler(
     std::string_view protocol,
     ProtocolRuntime& runtime,
-    ::acpp::StatsShard& stats,
-    ::acpp::ConnectionLimiterPtr limiter,
+    ::StatsShard& stats,
+    ::ConnectionLimiter* limiter,
     const BuildRequest& req) {
     auto& registrations = Registrations();
     auto it = registrations.find(protocol);
@@ -87,8 +93,8 @@ std::unique_ptr<::acpp::Inbound> NewHandler(
 DatagramHandlerBuildResult NewDatagramHandler(
     std::string_view protocol,
     ProtocolRuntime& runtime,
-    ::acpp::StatsShard& stats,
-    ::acpp::ConnectionLimiterPtr limiter,
+    ::StatsShard& stats,
+    ::ConnectionLimiter* limiter,
     const BuildRequest& req) {
     auto& registrations = Registrations();
     auto it = registrations.find(protocol);
@@ -109,7 +115,7 @@ DatagramHandlerBuildResult NewDatagramHandler(
 std::optional<BuildRequest> PrepareBuildRequest(
     std::string_view protocol,
     std::string_view tag,
-    const ::acpp::StaticUserConfig& config) {
+    const ::InboundProtocolSettings& settings) {
     auto& registrations = Registrations();
     auto it = registrations.find(protocol);
     if (it == registrations.end()) {
@@ -122,37 +128,20 @@ std::optional<BuildRequest> PrepareBuildRequest(
         .settings = {},
     };
     if (it->second.prepare_settings) {
-        auto settings = it->second.prepare_settings(tag, config);
-        if (!settings) {
+        auto prepared = it->second.prepare_settings(tag, settings);
+        if (!prepared) {
             return std::nullopt;
         }
-        request.settings = std::move(*settings);
+        request.settings = std::move(*prepared);
     }
     return request;
 }
 
-std::optional<UserSet> BuildStaticUsers(
-    std::string_view protocol,
-    std::string_view tag,
-    const ::acpp::StaticUserConfig& config) {
-    auto& registrations = Registrations();
-    auto it = registrations.find(protocol);
-    if (it == registrations.end() || !it->second.build_static_users) {
-        return std::nullopt;
-    }
-    auto result = it->second.build_static_users(tag, config);
-    if (result && UserProtocolOf(*result) != *it->second.user_protocol) {
-        return std::nullopt;
-    }
-    return result;
-}
-
 std::optional<UserSet> BuildUsers(
-    std::string_view protocol,
     const BuildRequest& req,
-    std::span<const RuntimeUser> users) {
+    std::span<const ::InboundUserSpec> users) {
     auto& registrations = Registrations();
-    auto it = registrations.find(protocol);
+    auto it = registrations.find(req.protocol);
     if (it == registrations.end() || !it->second.build_users) {
         return std::nullopt;
     }
@@ -163,4 +152,4 @@ std::optional<UserSet> BuildUsers(
     return result;
 }
 
-}  // namespace acpp::proxyman::inbound
+}  // namespace proxyman::inbound

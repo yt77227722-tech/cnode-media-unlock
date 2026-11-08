@@ -1,42 +1,39 @@
 #pragma once
 
-#include "acppnode/common/allocator.hpp"
-#include "acppnode/proxy/outbound.hpp"
-#include "acppnode/transport/internet/stream_settings.hpp"
-#include "acppnode/transport/internet/outbound_bind.hpp"
+#include "common/allocator.hpp"
+#include "proxy/outbound.hpp"
+#include "transport/internet/outbound_sender.hpp"
 
 #include <array>
+#include "common/unsafe.hpp"
 #include <chrono>
 #include <cstdint>
 #include <memory>
-#include <optional>
-#include <span>
-#include <string>
 #include <string_view>
-#include <utility>
-#include <vector>
 
-namespace acpp {
 
-namespace app::dns {
-class DNS;
-}  // namespace app::dns
+class AwaitableTaskGroup;
 
-// 协议核心 codec/validator 位于 acpp::anytls；handler 与其它协议一致归于
-// acpp::proxy::<name>::outbound（对应 vmess core=acpp::vmess, handler=acpp::proxy::vmess::*）。
+// 协议核心 codec/validator 位于 anytls；handler 与其它协议一致归于
+// proxy::<name>::outbound（对应 vmess core=vmess, handler=proxy::vmess::*）。
 namespace proxy::anytls::outbound {
 
-template<class Session> class SessionPool;
-
+// 传输层与 sendThrough 属于 Handler 的 sender settings。
 struct Settings {
-    std::string address;
-    uint16_t port = 0;
+    OutboundServer server;
     std::array<uint8_t, 32> password_hash{};
-    std::optional<net::ip::address> literal_address;
-    OutboundBind send_through;
     std::chrono::seconds idle_session_check_interval{30};
     std::chrono::seconds idle_session_timeout{60};
     size_t min_idle_sessions = 0;
+
+    Settings() = default;
+    Settings(const Settings&) = default;
+    Settings& operator=(const Settings&) = default;
+    Settings(Settings&&) noexcept = default;
+    Settings& operator=(Settings&&) noexcept = default;
+    ~Settings() noexcept {
+        ::SecureZeroMemory(password_hash.data(), password_hash.size());
+    }
 };
 
 // ============================================================================
@@ -44,47 +41,49 @@ struct Settings {
 //
 // AnyTLS 客户端侧协议处理器：负责 TLS 承载连接、sha256(password)
 // 认证头、settings/SYN/PSH/FIN 帧、padding scheme、session read loop
-// sid demux 和 Xray-core 风格 idle session pool 复用。
+// sid demux 和 Xray-core 风格 idle session pool 复用。物理连接经 Handler 的
+// OutboundDialer 拨号。
 // ============================================================================
 class Handler final : public Outbound {
 public:
-    Handler(std::string tag,
+    // `tasks` accounts and joins physical readers, but each reader executes in
+    // its own leaseable domain. The host retains the original configuration/
+    // credential namespace; idle sessions are selected only on their current
+    // Worker. Negotiated padding is published on that host, then captured with
+    // checkout for each new handshake. The host task owner outlives Handler.
+    Handler(std::string_view tag,
             net::io_context& io_context,
-            Settings settings,
-            StreamSettings stream_settings,
-            std::chrono::seconds dial_timeout,
-            app::dns::DNS& dns_service);
+            std::shared_ptr<const Settings> settings,
+            AwaitableTaskGroup& tasks);
     ~Handler() noexcept override;
 
     net::awaitable<OutboundProcessResult> Process(
-        net::io_context& io_context,
-        const tcp::endpoint* inbound_local_addr,
         session::Context& ctx,
-        const TimeoutsConfig& timeouts,
         transport::Link inbound,
+        OutboundDialer& dialer,
+        const TimeoutsConfig& timeouts,
         StatsShard& stats,
         const RelayConfig& relay_config,
-        buf::MultiBuffer first_payload,
+        buf::MultiBufferBatch first_payload,
         std::chrono::seconds relay_idle_timeout,
         std::chrono::seconds relay_write_timeout) override;
-
-    [[nodiscard]] std::string_view Tag() const noexcept override {
-        return tag_;
-    }
 
 private:
     struct PaddingState;
     struct ClientSession;
+    class SessionPool;
     struct LogicalStreamLease;
 
-    std::string tag_;
-    const Settings settings_;
-    const StreamSettings stream_settings_;
-    std::chrono::seconds dial_timeout_;
-    app::dns::DNS& dns_service_;
+    net::awaitable<OutboundProcessResult> ProcessSession(
+        session::Context& ctx, transport::Link inbound, OutboundDialer& dialer,
+        const TimeoutsConfig& timeouts, StatsShard& stats, const RelayConfig& relay_config,
+        buf::MultiBufferBatch first_payload, std::chrono::seconds relay_idle_timeout,
+        std::chrono::seconds relay_write_timeout,
+        std::shared_ptr<ClientSession> session, bool& reusable);
+    memory::ThreadLocalString tag_;
+    std::shared_ptr<const Settings> settings_;
     std::shared_ptr<PaddingState> padding_;
-    std::unique_ptr<SessionPool<ClientSession>> pool_;
+    std::unique_ptr<SessionPool> pool_;
 };
 
 }  // namespace proxy::anytls::outbound
-}  // namespace acpp

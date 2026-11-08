@@ -1,30 +1,37 @@
+#include <stdexcept>
+#include <gtest/gtest.h>
+
 #include "worker/udp_association_reclaimer.hpp"
 #include "worker/udp_ingress.hpp"
 
-#include "acppnode/app/proxyman/inbound/receiver_settings.hpp"
-#include "acppnode/app/stats.hpp"
-#include "acppnode/common/session.hpp"
-#include "acppnode/common/target_address.hpp"
-#include "acppnode/features/routing/dispatcher.hpp"
-#include "acppnode/infra/config_types.hpp"
-#include "acppnode/proxy/inbound.hpp"
-#include "acppnode/proxy/inbound_datagram.hpp"
-#include "acppnode/transport/async_stream.hpp"
-#include "acppnode/transport/cancellation.hpp"
+#include "app/proxyman/inbound/receiver_settings.hpp"
+#include "app/stats.hpp"
+#include "common/sharded_user_stats.hpp"
+#include "common/user_profile.hpp"
+#include "common/session.hpp"
+#include "common/target_address.hpp"
+#include "features/routing/dispatcher.hpp"
+#include "infra/config_types.hpp"
+#include "proxy/inbound.hpp"
+#include "proxy/inbound_datagram.hpp"
+#include "transport/async_stream.hpp"
+#include "transport/cancellation.hpp"
 
 #include <asio/co_spawn.hpp>
-#include <asio/steady_timer.hpp>
 #include <asio/detached.hpp>
+#include <asio/post.hpp>
 #include <asio/use_awaitable.hpp>
 
 #include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstdlib>
+#include <initializer_list>
 #include <iostream>
 #include <memory>
 #include <memory_resource>
 #include <new>
+#include <span>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -32,29 +39,33 @@
 
 namespace {
 using namespace std::chrono_literals;
+using Clock = std::chrono::steady_clock;
+
+// Rows a single maintenance wake may reclaim (README: bounded batch).
+constexpr size_t kBatchLimit = 64;
 
 [[noreturn]] void Fail(std::string_view message) {
     std::cerr << message << '\n';
-    std::exit(1);
+    ADD_FAILURE() << "contract assertion failed; see diagnostic above"; throw std::runtime_error("contract assertion failed");
 }
 
-class DummyInbound : public acpp::Inbound {
+class DummyInbound : public ::Inbound {
 public:
-    acpp::net::awaitable<acpp::RelayResult> Process(
-        std::unique_ptr<acpp::AsyncStream>, acpp::routing::Dispatcher&,
-        const acpp::proxyman::inbound::ReceiverSettings&, acpp::net::io_context&,
-        acpp::session::Context&, const acpp::TimeoutsConfig&, uint32_t) override {
-        co_return acpp::RelayResult{};
+    ::net::awaitable<::RelayResult> Process(
+        std::unique_ptr<::AsyncStream>, ::routing::Dispatcher&,
+        const ::proxyman::inbound::ReceiverSettings&, ::net::io_context&,
+        ::session::Context&, const ::TimeoutsConfig&, uint32_t) override {
+        co_return ::RelayResult{};
     }
 
-    std::expected<acpp::InboundDatagramResult, acpp::ErrorCode> Process(
-        const acpp::InboundDatagramRequest&) override {
-        return std::unexpected(acpp::ErrorCode::PROTOCOL_AUTH_FAILED);
+    tl::expected<::InboundDatagramResult, ::ErrorCode> Process(
+        const ::InboundDatagramRequest&) override {
+        return tl::unexpected(::ErrorCode::PROTOCOL_AUTH_FAILED);
     }
 };
 
-using Ingress = acpp::worker_detail::UdpIngress;
-using Reclaimer = acpp::worker_detail::UdpAssociationReclaimer;
+using Ingress = ::worker_detail::UdpIngress;
+using Reclaimer = ::worker_detail::UdpAssociationReclaimer;
 using SessionPtr = Ingress::ClientSessionPtr;
 
 class CountingPmrResource final : public std::pmr::memory_resource {
@@ -66,13 +77,13 @@ public:
 private:
     void* do_allocate(size_t bytes, size_t alignment) override {
         ++allocation_calls;
-        if (void* ptr = acpp::memory::AllocatePmr(bytes, alignment)) return ptr;
+        if (void* ptr = ::memory::AllocatePmr(bytes, alignment)) return ptr;
         throw std::bad_alloc();
     }
     void do_deallocate(void* ptr, size_t bytes, size_t alignment) override {
         ++deallocation_calls;
         deallocated_bytes += bytes;
-        acpp::memory::DeallocatePmr(ptr, bytes, alignment);
+        ::memory::DeallocatePmr(ptr, bytes, alignment);
     }
     bool do_is_equal(const std::pmr::memory_resource& other) const noexcept override {
         return this == &other;
@@ -85,482 +96,637 @@ struct ReenterOnCancel {
     bool close_all = false;
     size_t calls = 0;
 
-    static void Cancel(void* raw, acpp::transport::Cancellation) noexcept {
-        auto& self = *static_cast<ReenterOnCancel*>(raw);
-        ++self.calls;
-        if (self.close_all) self.ingress->CloseAllSockets();
-        else self.ingress->CloseSocket(self.key);
+    void Cancel() noexcept {
+        ++calls;
+        if (close_all) ingress->CloseAllSockets();
+        else ingress->CloseSocket(key);
     }
 };
 
-class DatagramResponse final : public acpp::InboundDatagramResponse {
-public:
-    acpp::buf::MultiBuffer Encode(acpp::UDPPacketView) override { return {}; }
+struct ReentryCancellation final : ::transport::CancellationSubscription {
+    explicit ReentryCancellation(ReenterOnCancel& owner) noexcept : owner(owner) {}
+    ReenterOnCancel& owner;
+private:
+    void OnCancellation(::transport::Cancellation) noexcept override {
+        owner.Cancel();
+    }
 };
 
+class DatagramResponse final : public ::InboundDatagramResponse {
+public:
+    ::buf::MultiBuffer Encode(::UDPPacketView) override { return {}; }
+};
+
+class AcceptedReplyResponse final : public ::InboundDatagramResponse {
+public:
+    ::buf::MultiBuffer Encode(::UDPPacketView packet) override {
+        ::buf::MultiBuffer result;
+        if (!::buf::AppendSpanToMultiBuffer(packet.data, result)) throw std::bad_alloc();
+        return result;
+    }
+};
+
+class AcceptedReplySink final : public ::worker_detail::UdpReplySink {
+public:
+    bool EnqueueUdpReply(std::string_view, ::udp::socket*, ::udp::endpoint,
+                         ::buf::MultiBuffer, uint32_t,
+                         std::shared_ptr<::worker_detail::UdpReplyFence> = {}) override {
+        ++packets;
+        return true;
+    }
+    size_t packets = 0;
+};
+
+// Decodes every datagram as owner 0x71 carrying one 0x42 byte; a first byte of
+// 0x43 selects protocol session 2, anything else session 1.
 class DatagramInbound final : public DummyInbound {
 public:
-    std::expected<acpp::InboundDatagramResult, acpp::ErrorCode> Process(
-        const acpp::InboundDatagramRequest& request) override {
-        acpp::InboundDatagramResult result;
+    tl::expected<::InboundDatagramResult, ::ErrorCode> Process(
+        const ::InboundDatagramRequest& request) override {
+        ::InboundDatagramResult result;
+        result.user = &profile_;
+        result.tracker = tracker_;
         const std::array<uint8_t, 1> owner{0x71};
         if (!result.session_owner.Assign(owner)) {
-            return std::unexpected(acpp::ErrorCode::RESOURCE_EXHAUSTED);
+            return tl::unexpected(::ErrorCode::RESOURCE_EXHAUSTED);
         }
-        result.session_key = !request.payload.empty() && request.payload[0] == 0x43
-            ? "zero-timeout"
-            : "fixed-session";
-        result.response = std::make_shared<DatagramResponse>();
-        result.target = acpp::TargetAddress(
-            acpp::net::ip::address_v4::loopback(), 53);
-        acpp::buf::BufferGuard payload{acpp::buf::Buffer::New()};
-        if (!payload) return std::unexpected(acpp::ErrorCode::RESOURCE_EXHAUSTED);
+        result.session_id = !request.payload.empty() && request.payload[0] == 0x43 ? 2 : 1;
+        result.target = ::TargetAddress(
+            ::net::ip::address_v4::loopback(), 53);
+        ::buf::BufferGuard payload{::buf::Buffer::New()};
+        if (!payload) return tl::unexpected(::ErrorCode::RESOURCE_EXHAUSTED);
         payload->Tail()[0] = 0x42;
         payload->Produce(1);
         result.payload.push_back(std::move(payload));
         return result;
     }
+    tl::expected<std::shared_ptr<::InboundDatagramResponse>, ::ErrorCode>
+    CreateDatagramResponse(const ::InboundDatagramResult&) override {
+        return std::make_shared<DatagramResponse>();
+    }
+private:
+    std::shared_ptr<::UserOnlineTracker> tracker_ = std::make_shared<::UserOnlineTracker>();
+    ::UserProfile profile_;
 };
 
-class DatagramDispatcher final : public acpp::routing::Dispatcher {
+bool IsDecodedPayload(const ::buf::MultiBuffer& payload) {
+    if (payload.size() != 1) return false;
+    for (const auto* buffer : payload)
+        if (!buffer || buffer->Len() != 1 || buffer->Bytes()[0] != 0x42) return false;
+    return true;
+}
+
+// The reader of a dispatched native request is the association's session.
+class DatagramDispatcher final : public ::routing::Dispatcher {
 public:
     unsigned dispatched = 0;
     unsigned packets_read = 0;
-    acpp::net::awaitable<acpp::RelayResult> Dispatch(
-        acpp::net::io_context&, const acpp::routing::DispatchPolicy&,
-        std::unique_ptr<acpp::AsyncStream>, acpp::transport::Link link,
-        acpp::InitialPayload, acpp::session::Context&, acpp::StatsShard&,
-        const acpp::TimeoutsConfig&) override {
+    const ::transport::MultiBufferReader* last_reader = nullptr;
+    ::net::awaitable<::RelayResult> Dispatch(
+        ::net::io_context&, const ::routing::DispatchPolicy&,
+        std::unique_ptr<::AsyncStream>, ::transport::Link link,
+        ::InitialPayload, ::session::Context&, ::StatsShard&,
+        const ::TimeoutsConfig&) override {
         ++dispatched;
         if (!link.reader) Fail("rebuilt native request has no reader");
+        last_reader = link.reader;
         auto payload = co_await link.reader->ReadMultiBuffer();
-        if (payload.size() != 1)
-            Fail("rebuilt native request did not receive exactly one decoded packet");
-        for (const auto* buffer : payload)
-            if (!buffer || buffer->Len() != 1 || buffer->Bytes()[0] != 0x42)
-                Fail("rebuilt native request did not receive its decoded first packet");
+        if (!IsDecodedPayload(payload))
+            Fail("rebuilt native request did not receive exactly its decoded first packet");
         ++packets_read;
-        co_return acpp::RelayResult{};
+        co_return ::RelayResult{};
     }
 };
 
-class DiscardReplySink final : public acpp::worker_detail::UdpReplySink {
+class DiscardReplySink final : public ::worker_detail::UdpReplySink {
 public:
-    bool EnqueueUdpReply(std::string_view, acpp::udp::socket*,
-                         acpp::udp::endpoint, acpp::buf::MultiBuffer,
-                         uint32_t) override {
+    bool EnqueueUdpReply(std::string_view, ::udp::socket*,
+                         ::udp::endpoint, ::buf::MultiBuffer,
+                         uint32_t,
+                         std::shared_ptr<::worker_detail::UdpReplyFence> = {}) override {
         return false;
     }
 };
 
-SessionPtr MakeSession(Ingress& ingress, acpp::net::io_context& io,
-                       std::string socket_key, std::string client_key,
-                       std::chrono::steady_clock::time_point last_active,
-                       std::chrono::seconds idle_timeout,
-                       acpp::InboundDatagramOwner owner = {}) {
+// Everything ProcessDatagram needs besides the ingress, socket and packet.
+struct DatagramSource {
+    DatagramDispatcher dispatcher;
+    DiscardReplySink reply_sink;
+    ::StatsShard stats;
+    ::proxyman::inbound::ReceiverSettings receiver{
+        .inbound_tag = {}, .inbound_tags = {}, .protocol = {},
+        .stream_settings = {},
+        .dispatch_policy = {.sniffing = {}, .outbound = ::routing::ForceOutbound{"loopback"}}};
+
+    void Send(Ingress& ingress, ::net::io_context& io, std::string_view socket_key,
+              ::udp::socket* sock, uint16_t client_port,
+              std::span<const uint8_t> packet, const ::TimeoutsConfig& timeouts) {
+        ingress.ProcessDatagram(::worker_detail::UdpDatagramContext{
+            .socket_key = socket_key,
+            .sock = sock,
+            .client_endpoint = {::net::ip::address_v4::loopback(), client_port},
+            .payload = packet,
+            .receiver = &receiver,
+            .io_context = io,
+            .dispatcher = &dispatcher,
+            .stats = stats,
+            .timeouts = timeouts,
+            .reply_sink = reply_sink,
+        });
+    }
+};
+
+::net::awaitable<void> ReadDecodedPayload(SessionPtr session, bool& received) {
+    auto payload = co_await session->ReadMultiBuffer();
+    received = IsDecodedPayload(payload);
+}
+
+::worker_detail::ClientSessionKey Key(uint64_t id) {
+    ::InboundDatagramOwner owner;
+    const std::array<uint8_t, 1> bytes{0x71};
+    if (!owner.Assign(bytes)) Fail("failed to prepare typed session owner");
+    return {owner, id};
+}
+
+SessionPtr MakeSession(Ingress& ingress, ::net::io_context& io,
+                       std::string socket_key, ::worker_detail::ClientSessionKey client_key,
+                       Clock::time_point last_active,
+                       std::chrono::seconds idle_timeout) {
     return ingress.CreateClientSession(
         socket_key, client_key, io,
-        [](acpp::UDPPacketView, const acpp::udp::endpoint&) {},
-        {acpp::net::ip::address_v4::loopback(), 10001}, std::move(owner), last_active,
+        {},
+        {::net::ip::address_v4::loopback(), 10001}, client_key.owner, last_active,
         idle_timeout);
 }
 
-void RunFor(acpp::net::io_context& io, std::chrono::milliseconds duration) {
+Ingress::SocketPtr AttachOpenSocket(Ingress& ingress, ::net::io_context& io,
+                                    std::string_view socket_key) {
+    auto socket = Ingress::MakeSocket(io);
+    ::IoErrorCode ec;
+    socket->open(::udp::v4(), ec);
+    if (ec || !ingress.AttachSocket(socket_key, socket)) {
+        Fail("failed to attach an open UDP socket");
+    }
+    return socket;
+}
+
+size_t Associations(std::initializer_list<const Ingress*> ingresses) {
+    size_t total = 0;
+    for (const auto* ingress : ingresses) total += ingress->GetResourceStats().associations;
+    return total;
+}
+
+size_t ActiveEvents(const ::TimeoutScheduler& scheduler) {
+    return scheduler.GetResourceStats().active_events;
+}
+
+void RunFor(::net::io_context& io, std::chrono::milliseconds duration) {
     io.run_for(duration);
     io.restart();
 }
+
+// Runs handlers until `done` holds or the generous bound elapses.
+template <class Done>
+bool RunUntil(::net::io_context& io, Done done, std::chrono::milliseconds limit = 5000ms) {
+    const auto deadline = Clock::now() + limit;
+    while (!done()) {
+        if (Clock::now() >= deadline) return false;
+        if (io.stopped()) io.restart();
+        io.run_one_for(10ms);
+    }
+    if (io.stopped()) io.restart();
+    return true;
+}
+
+// Executes one handler at a time until `count()` reaches `target`. Fails if a
+// single handler reclaims more than one batch. `after_batch` runs after every
+// handler that reclaimed rows.
+template <class Count, class AfterBatch>
+bool StepReclaimBatches(::net::io_context& io, Count count, size_t target,
+                        AfterBatch after_batch, size_t& reclaiming_handlers) {
+    const auto deadline = Clock::now() + 5000ms;
+    size_t current = count();
+    while (current > target) {
+        if (Clock::now() >= deadline) return false;
+        if (io.stopped()) io.restart();
+        if (io.run_one_for(10ms) == 0) continue;
+        const size_t next = count();
+        if (next > current || current - next > kBatchLimit) return false;
+        if (next != current) {
+            ++reclaiming_handlers;
+            after_batch();
+        }
+        current = next;
+    }
+    if (io.stopped()) io.restart();
+    return true;
+}
 } // namespace
 
-int main() {
+TEST(UdpAssociationReclaimer, Contract) {
     struct PmrScope {
         CountingPmrResource resource;
         std::pmr::memory_resource* previous = std::pmr::set_default_resource(&resource);
         ~PmrScope() { std::pmr::set_default_resource(previous); }
     } pmr_scope;
-    acpp::net::io_context io;
-    auto& scheduler = acpp::TimeoutScheduler::ForIoContext(io);
-    Reclaimer reclaimer(scheduler);
-    Ingress first("first", std::make_unique<DummyInbound>(), reclaimer, io);
-    Ingress second("second", std::make_unique<DummyInbound>(), reclaimer, io);
-    const auto now = std::chrono::steady_clock::now();
+    ::net::io_context io;
+    auto& scheduler = ::TimeoutScheduler::ForIoContext(io);
+    const size_t idle_events = ActiveEvents(scheduler);
+    Reclaimer reclaimer(scheduler, nullptr, [](void*, std::exception_ptr) { std::terminate(); });
+    ::worker_detail::UdpResourceBudget budget;
+    Ingress first("first", std::make_unique<DummyInbound>(), reclaimer, budget, io);
+    Ingress second("second", std::make_unique<DummyInbound>(), reclaimer, budget, io);
+    const auto now = Clock::now();
 
     // Many map insertions force rehashes while hooks remain embedded in nodes.
+    // Closed rows across both ingresses share one Worker-wide batch bound.
     std::vector<SessionPtr> closed_sessions;
     closed_sessions.reserve(130);
     for (size_t i = 0; i < 65; ++i) {
-        auto one = MakeSession(first, io, "batch", "first-" + std::to_string(i),
-                               now, 0s);
-        auto two = MakeSession(second, io, "batch", "second-" + std::to_string(i),
-                               now, 0s);
+        auto one = MakeSession(first, io, "batch", Key(i), now, 0s);
+        auto two = MakeSession(second, io, "batch", Key(i), now, 0s);
+        if (!one || !two) Fail("failed to create batch associations");
         one->Close();
         two->Close();
         closed_sessions.push_back(std::move(one));
         closed_sessions.push_back(std::move(two));
     }
-    if (reclaimer.GetStats().rows != 130) Fail("reclaimer did not register all Worker rows");
-
+    if (Associations({&first, &second}) != 130) {
+        Fail("closed associations were removed before the maintenance wake ran");
+    }
+    if (ActiveEvents(scheduler) != idle_events + 1) {
+        Fail("closed associations did not arm exactly one maintenance event");
+    }
     bool loop_progress = false;
-    asio::steady_timer progress(io);
-    progress.expires_after(150ms);
-    progress.async_wait([&](acpp::IoErrorCode ec) { loop_progress = !ec; });
-    RunFor(io, 125ms);
-    auto stats = reclaimer.GetStats();
-    if (stats.rows != 66 || stats.last_batch_checks != 64 ||
-        stats.max_batch_checks > 64 || loop_progress) {
+    bool progress_posted = false;
+    size_t associations_at_progress = 0;
+    size_t batch_handlers = 0;
+    const auto batch_count = [&] { return Associations({&first, &second}); };
+    if (!StepReclaimBatches(io, batch_count, 0, [&] {
+            if (progress_posted) return;
+            progress_posted = true;
+            asio::post(io, [&] {
+                loop_progress = true;
+                associations_at_progress = batch_count();
+            });
+        }, batch_handlers)) {
         Fail("UDP reclaimer did not enforce the shared 64-row batch limit");
     }
-    RunFor(io, 35ms);
-    if (!loop_progress) Fail("event loop did not progress alongside UDP maintenance");
-    RunFor(io, 240ms);
-    if (reclaimer.GetStats().rows != 0 || first.GetResourceStats().associations != 0 ||
-        second.GetResourceStats().associations != 0) {
-        Fail("bounded UDP batches did not eventually reclaim closed rows across ingresses");
+    if (batch_handlers < (130 + kBatchLimit - 1) / kBatchLimit) {
+        Fail("UDP reclaimer drained more than one batch per maintenance wake");
     }
+    if (!loop_progress || associations_at_progress == 0) {
+        Fail("event loop did not progress between bounded UDP maintenance batches");
+    }
+    if (ActiveEvents(scheduler) != idle_events) {
+        Fail("drained reclaimer kept a maintenance event armed");
+    }
+    closed_sessions.clear();
 
+    // Open rows with idle expiry disabled never become due, so they neither
+    // consume batch budget nor keep the maintenance event armed.
     std::vector<SessionPtr> mixed_live;
     std::vector<SessionPtr> mixed_closed;
     mixed_live.reserve(65);
     mixed_closed.reserve(65);
     for (size_t i = 0; i < 65; ++i) {
-        auto closed = MakeSession(first, io, "mixed", "closed-" + std::to_string(i),
-                                  now, 0s);
-        auto live = MakeSession(second, io, "mixed", "live-" + std::to_string(i),
-                                now, 0s);
+        auto closed = MakeSession(first, io, "mixed", Key(i), now, 0s);
+        auto live = MakeSession(second, io, "mixed", Key(i), now, 0s);
+        if (!closed || !live) Fail("failed to create mixed associations");
         closed->Close();
         mixed_closed.push_back(std::move(closed));
         mixed_live.push_back(std::move(live));
     }
-    RunFor(io, 125ms);
-    stats = reclaimer.GetStats();
-    if (stats.last_batch_checks != 64 || stats.max_batch_checks > 64 ||
-        stats.rows != 98 || first.GetResourceStats().associations != 33 ||
+    size_t mixed_handlers = 0;
+    if (!StepReclaimBatches(io, [&] { return Associations({&first, &second}); }, 65,
+                            [] {}, mixed_handlers) ||
+        mixed_handlers < 2 || first.GetResourceStats().associations != 0 ||
         second.GetResourceStats().associations != 65) {
-        Fail("mixed live/closed batch did not check 64 distinct Worker-global rows");
+        Fail("mixed live/closed associations did not progress across bounded batches");
     }
-    RunFor(io, 360ms);
-    if (reclaimer.GetStats().rows != 65 || first.GetResourceStats().associations != 0 ||
-        second.GetResourceStats().associations != 65) {
-        Fail("mixed associations did not progress across bounded batches");
+    if (ActiveEvents(scheduler) != idle_events) {
+        Fail("open associations with idle expiry disabled armed a maintenance event");
+    }
+    for (const auto& live : mixed_live) {
+        if (live->Closed()) Fail("maintenance closed an open association with idle expiry disabled");
     }
     second.CleanupAllClientSessions();
-    if (reclaimer.GetStats().rows != 0) Fail("closed mixed rows remained registered");
+    if (second.GetResourceStats().associations != 0) Fail("live mixed rows remained registered");
     mixed_live.clear();
     mixed_closed.clear();
 
     // Removing a row is independent of the lifetime of an externally held session.
-    auto detached = MakeSession(first, io, "detached", "client", now, 0s);
+    Ingress detached_ingress("detached", std::make_unique<DummyInbound>(), reclaimer, budget, io);
+    auto detached = MakeSession(detached_ingress, io, "detached", Key(1), now, 0s);
     std::weak_ptr<Ingress::ClientSession> detached_weak = detached;
     detached->Close();
-    RunFor(io, 120ms);
-    if (first.FindClientSession("detached", "client") || detached_weak.expired()) {
+    if (!RunUntil(io, [&] { return detached_ingress.GetResourceStats().associations == 0; }) ||
+        detached_weak.expired()) {
         Fail("row reclamation was incorrectly coupled to external session lifetime");
     }
     detached.reset();
     if (!detached_weak.expired()) Fail("released detached UDP session remained alive");
 
-    auto disabled_open = MakeSession(first, io, "disabled", "open", now, 0s);
-    RunFor(io, 120ms);
-    if (first.FindClientSession("disabled", "open") != disabled_open ||
-        disabled_open->Closed()) {
+    Ingress disabled_ingress("disabled", std::make_unique<DummyInbound>(), reclaimer, budget, io);
+    auto disabled_open = MakeSession(disabled_ingress, io, "disabled", Key(1), now, 0s);
+    RunFor(io, 20ms);
+    if (disabled_ingress.GetResourceStats().associations != 1 || disabled_open->Closed()) {
         Fail("zero idle timeout did not retain an open UDP association");
     }
     disabled_open->Close();
-    RunFor(io, 120ms);
-    if (first.FindClientSession("disabled", "open")) {
+    if (!RunUntil(io, [&] { return disabled_ingress.GetResourceStats().associations == 0; })) {
         Fail("closed UDP association was retained with idle timeout disabled");
     }
 
-    // Idle snapshots are per row. Uplink refreshes activity; downlink does not.
-    const auto aged = std::chrono::steady_clock::now() - 2s;
-    auto idle_socket = Ingress::MakeSocket(io);
-    acpp::IoErrorCode idle_socket_ec;
-    idle_socket->open(acpp::udp::v4(), idle_socket_ec);
-    if (idle_socket_ec || !first.AttachSocket("idle", idle_socket)) {
-        Fail("failed to attach socket for expiry reentry test");
-    }
-    auto idle = MakeSession(first, io, "idle", "expired", aged, 1s);
-    ReenterOnCancel expiry_reentry{.ingress = &first, .key = "idle"};
-    acpp::transport::CancellationSubscription expiry_subscription(
-        idle->Cancellation(), &ReenterOnCancel::Cancel, &expiry_reentry);
-    if (!first.ReplaceHandler(std::make_unique<DummyInbound>())) {
+    // Idle expiry closes the session; its cancellation may synchronously
+    // retire the socket that owns the expiring row.
+    Ingress idle_ingress("idle", std::make_unique<DummyInbound>(), reclaimer, budget, io);
+    auto idle_socket = AttachOpenSocket(idle_ingress, io, "idle");
+    auto idle = MakeSession(idle_ingress, io, "idle", Key(1), Clock::now() - 2s, 1s);
+    ReenterOnCancel expiry_reentry{.ingress = &idle_ingress, .key = "idle"};
+    ReentryCancellation expiry_subscription(expiry_reentry);
+    expiry_subscription.Resubscribe(idle->Cancellation());
+    if (!idle_ingress.ReplaceHandler(std::make_unique<DummyInbound>())) {
         Fail("UDP handler replacement was rejected");
     }
-    RunFor(io, 120ms);
-    if (first.FindClientSession("idle", "expired") || !idle->Closed() ||
-        expiry_reentry.calls != 1 || first.FindSocket("idle")) {
+    if (!RunUntil(io, [&] { return idle->Closed(); }) ||
+        idle_ingress.GetResourceStats().associations != 0 ||
+        expiry_reentry.calls != 1 || idle_ingress.FindSocket("idle")) {
         Fail("natural expiry reentry did not safely retire the association and socket");
     }
 
-    acpp::TargetAddress target;
-    target.type = acpp::AddressType::IPv4;
-    target.resolved_addr = acpp::net::ip::address_v4::loopback();
+    // Downlink traffic does not refresh idle time: the row still expires at
+    // its original deadline, well before a refreshed deadline could pass.
+    ::TargetAddress target;
+    target.type = ::AddressType::IPv4;
+    target.resolved_addr = ::net::ip::address_v4::loopback();
     target.port = 53;
-    auto downlink = MakeSession(first, io, "activity", "downlink", aged, 1s);
-    acpp::buf::BufferGuard reply{acpp::buf::Buffer::New()};
+    Ingress downlink_ingress("downlink", std::make_unique<DummyInbound>(), reclaimer, budget, io);
+    AcceptedReplySink accepted_reply;
+    constexpr auto downlink_idle = 2s;
+    auto downlink = downlink_ingress.CreateClientSession(
+        "activity", Key(1), io,
+        {.socket_key = {}, .socket = {}, .response = std::make_shared<AcceptedReplyResponse>(),
+         .sink = &accepted_reply, .worker_id = 0, .fence = {}},
+        {::net::ip::address_v4::loopback(), 10001}, Key(1).owner,
+        Clock::now() - downlink_idle + 200ms, downlink_idle);
+    ::buf::BufferGuard reply{::buf::Buffer::New()};
     if (!reply) Fail("failed to allocate UDP downlink activity payload");
     reply->Tail()[0] = 2;
     reply->Produce(1);
     reply->SetUDP(target);
     bool reply_completed = false;
-    acpp::net::co_spawn(io,
-        downlink->WriteMultiBuffer(acpp::buf::MultiBuffer{std::move(reply)}),
+    ::net::co_spawn(io,
+        downlink->WriteMultiBuffer(::buf::MultiBuffer{std::move(reply)}),
         [&](std::exception_ptr error) { reply_completed = !error; });
-    RunFor(io, 120ms);
-    if (!reply_completed || first.FindClientSession("activity", "downlink") ||
-        !downlink->Closed()) {
+    if (!RunUntil(io, [&] { return reply_completed; }) || accepted_reply.packets != 1) {
+        Fail("UDP downlink write did not complete");
+    }
+    const auto downlink_written = Clock::now();
+    if (!RunUntil(io, [&] { return downlink->Closed(); }) ||
+        Clock::now() - downlink_written >= downlink_idle ||
+        downlink_ingress.GetResourceStats().associations != 0) {
         Fail("UDP downlink traffic incorrectly refreshed association idle time");
-    }
-
-    auto uplink = MakeSession(first, io, "activity", "uplink",
-                              std::chrono::steady_clock::now() - 950ms, 1s);
-    acpp::buf::BufferGuard input{acpp::buf::Buffer::New()};
-    if (!input) Fail("failed to allocate UDP activity-test payload");
-    input->Tail()[0] = 1;
-    input->Produce(1);
-    if (!first.PushClientPayload(
-            "activity", "uplink", target,
-            {acpp::net::ip::address_v4::loopback(), 10002}, {},
-            acpp::buf::MultiBuffer{std::move(input)},
-            std::chrono::steady_clock::now())) {
-        Fail("UDP uplink activity update was rejected");
-    }
-    RunFor(io, 120ms);
-    if (first.FindClientSession("activity", "uplink") != uplink || uplink->Closed()) {
-        Fail("UDP uplink activity did not refresh association idle time");
     }
     downlink.reset();
 
-    // Closing the replaced session re-enters CloseSocket and retires the replacement.
-    acpp::IoErrorCode ec;
-    auto replace_socket = Ingress::MakeSocket(io);
-    replace_socket->open(acpp::udp::v4(), ec);
-    if (ec || !first.AttachSocket("replace", replace_socket)) {
-        Fail("failed to attach socket for replacement reentry test");
+    // Valid uplink only moves last activity. When the original deadline passes
+    // the row is re-checked and re-armed; it expires one idle period after the
+    // uplink, not before.
+    Ingress activity_ingress("activity", std::make_unique<DatagramInbound>(), reclaimer, budget, io);
+    auto activity_socket = AttachOpenSocket(activity_ingress, io, "activity");
+    DatagramSource activity_source;
+    ::TimeoutsConfig activity_timeouts;
+    activity_timeouts.idle = 1;
+    constexpr auto uplink_idle = 1s;
+    auto uplink = MakeSession(activity_ingress, io, "activity", Key(1),
+                              Clock::now() - uplink_idle + 300ms, uplink_idle);
+    const std::array<uint8_t, 1> uplink_packet{0x42};
+    const auto uplink_sent = Clock::now();
+    activity_source.Send(activity_ingress, io, "activity", activity_socket.get(), 10002,
+                         uplink_packet, activity_timeouts);
+    const auto uplink_stats = activity_ingress.GetResourceStats();
+    if (uplink_stats.associations != 1 || uplink_stats.input_datagrams != 1 ||
+        uplink_stats.input_bytes != 1 || uplink_stats.native_dispatches != 0) {
+        Fail("UDP uplink was not delivered to its existing association");
     }
-    auto prior = MakeSession(first, io, "replace", "same", now, 0s);
-    ReenterOnCancel replacement_reentry{.ingress = &first, .key = "replace"};
-    acpp::transport::CancellationSubscription replacement_subscription(
-        prior->Cancellation(), &ReenterOnCancel::Cancel, &replacement_reentry);
-    auto replacement = MakeSession(first, io, "replace", "same",
-                                   std::chrono::steady_clock::now(), 0s);
+    bool uplink_received = false;
+    ::net::co_spawn(io, ReadDecodedPayload(uplink, uplink_received), asio::detached);
+    RunFor(io, 600ms);
+    if (!uplink_received || uplink->Closed() ||
+        activity_ingress.GetResourceStats().associations != 1) {
+        Fail("UDP uplink activity did not refresh association idle time");
+    }
+    if (!RunUntil(io, [&] { return uplink->Closed(); }) ||
+        Clock::now() - uplink_sent < uplink_idle ||
+        activity_ingress.GetResourceStats().associations != 0) {
+        Fail("refreshed UDP association was not re-armed to expire after its idle period");
+    }
+    uplink.reset();
+
+    // Closing the replaced session re-enters CloseSocket and retires the replacement.
+    Ingress replace_ingress("replace", std::make_unique<DummyInbound>(), reclaimer, budget, io);
+    auto replace_socket = AttachOpenSocket(replace_ingress, io, "replace");
+    auto prior = MakeSession(replace_ingress, io, "replace", Key(1), now, 0s);
+    ReenterOnCancel replacement_reentry{.ingress = &replace_ingress, .key = "replace"};
+    ReentryCancellation replacement_subscription(replacement_reentry);
+    replacement_subscription.Resubscribe(prior->Cancellation());
+    auto replacement = MakeSession(replace_ingress, io, "replace", Key(1), Clock::now(), 0s);
     if (!replacement || replacement == prior || !prior->Closed() ||
-        !replacement->Closed() || first.FindClientSession("replace", "same") ||
-        replacement_reentry.calls != 1 || first.FindSocket("replace")) {
+        !replacement->Closed() || replace_ingress.GetResourceStats().associations != 0 ||
+        replacement_reentry.calls != 1 || replace_ingress.FindSocket("replace")) {
         Fail("same-key replacement was unsafe under synchronous cancellation reentry");
     }
 
-    auto bulk_socket = Ingress::MakeSocket(io);
-    bulk_socket->open(acpp::udp::v4(), ec);
-    if (ec || !first.AttachSocket("bulk", bulk_socket)) {
-        Fail("failed to attach socket for bulk cleanup reentry test");
-    }
-    auto bulk_a = MakeSession(first, io, "bulk", "a", now, 0s);
-    auto bulk_b = MakeSession(first, io, "bulk", "b", now, 0s);
-    ReenterOnCancel bulk_reentry_a{.ingress = &first, .key = "bulk"};
-    ReenterOnCancel bulk_reentry_b{.ingress = &first, .key = "bulk"};
-    acpp::transport::CancellationSubscription bulk_subscription_a(
-        bulk_a->Cancellation(), &ReenterOnCancel::Cancel, &bulk_reentry_a);
-    acpp::transport::CancellationSubscription bulk_subscription_b(
-        bulk_b->Cancellation(), &ReenterOnCancel::Cancel, &bulk_reentry_b);
-    first.CleanupClientSessions("bulk");
-    if (first.FindClientSession("bulk", "a") || first.FindClientSession("bulk", "b") ||
+    Ingress bulk_ingress("bulk", std::make_unique<DummyInbound>(), reclaimer, budget, io);
+    auto bulk_socket = AttachOpenSocket(bulk_ingress, io, "bulk");
+    auto bulk_a = MakeSession(bulk_ingress, io, "bulk", Key(1), now, 0s);
+    auto bulk_b = MakeSession(bulk_ingress, io, "bulk", Key(2), now, 0s);
+    ReenterOnCancel bulk_reentry_a{.ingress = &bulk_ingress, .key = "bulk"};
+    ReenterOnCancel bulk_reentry_b{.ingress = &bulk_ingress, .key = "bulk"};
+    ReentryCancellation bulk_subscription_a(bulk_reentry_a);
+    ReentryCancellation bulk_subscription_b(bulk_reentry_b);
+    bulk_subscription_a.Resubscribe(bulk_a->Cancellation());
+    bulk_subscription_b.Resubscribe(bulk_b->Cancellation());
+    if (bulk_ingress.GetResourceStats().associations != 2) Fail("bulk associations were not registered");
+    bulk_ingress.CleanupClientSessions("bulk");
+    if (bulk_ingress.GetResourceStats().associations != 0 ||
         !bulk_a->Closed() || !bulk_b->Closed() || bulk_reentry_a.calls != 1 ||
-        bulk_reentry_b.calls != 1 || first.FindSocket("bulk")) {
+        bulk_reentry_b.calls != 1 || bulk_ingress.FindSocket("bulk")) {
         Fail("bulk cleanup was unsafe under synchronous cancellation reentry");
     }
 
     // Existing row timeout snapshots, not the current packet snapshot, decide
     // whether same-key datagrams reuse or rebuild an association.
     Ingress request_ingress("request", std::make_unique<DatagramInbound>(),
-                            reclaimer, io);
-    DatagramDispatcher request_dispatcher;
-    DiscardReplySink reply_sink;
-    acpp::StatsShard request_stats;
-    acpp::TimeoutsConfig packet_timeouts;
-    acpp::proxyman::inbound::ReceiverSettings request_receiver{
-        .inbound_tag = {}, .inbound_tags = {}, .protocol = {},
-        .stream_settings = {},
-        .dispatch_policy = {.sniffing = {}, .outbound = acpp::routing::ForceOutbound{"loopback"}}};
-    auto request_socket = Ingress::MakeSocket(io);
-    request_socket->open(acpp::udp::v4(), ec);
-    if (ec || !request_ingress.AttachSocket("request", request_socket))
-        Fail("failed to own datagram request socket");
-    acpp::InboundDatagramOwner request_owner;
-    const std::array<uint8_t, 1> request_owner_bytes{0x71};
-    if (!request_owner.Assign(request_owner_bytes)) Fail("failed to assign request owner");
-    const auto scoped_key = request_owner.ScopeSessionKey("fixed-session");
+                            reclaimer, budget, io);
+    DatagramSource request_source;
+    ::TimeoutsConfig packet_timeouts;
+    auto request_socket = AttachOpenSocket(request_ingress, io, "request");
+    const auto scoped_key = Key(1);
     auto expired_same_key = MakeSession(
-        request_ingress, io, "request", scoped_key,
-        std::chrono::steady_clock::now() - 2s, 1s, request_owner);
+        request_ingress, io, "request", scoped_key, Clock::now() - 2s, 1s);
     packet_timeouts.idle = 0;
     const std::array<uint8_t, 1> request_packet{0x42};
-    request_ingress.ProcessDatagram(acpp::worker_detail::UdpDatagramContext{
-        .socket_key = "request",
-        .sock = request_socket.get(),
-        .client_endpoint = {acpp::net::ip::address_v4::loopback(), 20001},
-        .payload = request_packet,
-        .receiver = &request_receiver,
-        .io_context = io,
-        .dispatcher = request_dispatcher,
-        .stats = request_stats,
-        .timeouts = packet_timeouts,
-        .reply_sink = reply_sink,
-    });
-    auto rebuilt_same_key = request_ingress.FindClientSession("request", scoped_key);
-    if (!rebuilt_same_key || rebuilt_same_key == expired_same_key ||
-        !expired_same_key->Closed()) {
+    request_source.Send(request_ingress, io, "request", request_socket.get(), 20001,
+                        request_packet, packet_timeouts);
+    if (!expired_same_key->Closed() || request_ingress.GetResourceStats().associations != 1 ||
+        request_ingress.GetResourceStats().native_dispatches != 1) {
         Fail("current-key request revived an expired association before its scan turn");
     }
 
-    const auto zero_timeout_key = request_owner.ScopeSessionKey("zero-timeout");
     auto zero_timeout_row = MakeSession(
-        request_ingress, io, "request", zero_timeout_key,
-        std::chrono::steady_clock::now() - 2s, 0s, request_owner);
+        request_ingress, io, "request", Key(2), Clock::now() - 2s, 0s);
     packet_timeouts.idle = 1;
     const std::array<uint8_t, 1> zero_timeout_packet{0x43};
-    request_ingress.ProcessDatagram(acpp::worker_detail::UdpDatagramContext{
-        .socket_key = "request",
-        .sock = request_socket.get(),
-        .client_endpoint = {acpp::net::ip::address_v4::loopback(), 20002},
-        .payload = zero_timeout_packet,
-        .receiver = &request_receiver,
-        .io_context = io,
-        .dispatcher = request_dispatcher,
-        .stats = request_stats,
-        .timeouts = packet_timeouts,
-        .reply_sink = reply_sink,
-    });
-    if (request_ingress.FindClientSession("request", zero_timeout_key) != zero_timeout_row ||
-        zero_timeout_row->Closed()) {
+    request_source.Send(request_ingress, io, "request", request_socket.get(), 20002,
+                        zero_timeout_packet, packet_timeouts);
+    if (zero_timeout_row->Closed() || request_ingress.GetResourceStats().associations != 2 ||
+        request_ingress.GetResourceStats().native_dispatches != 1) {
         Fail("current packet timeout overwrote the row's zero-timeout snapshot");
     }
+    bool zero_timeout_received = false;
+    ::net::co_spawn(io, ReadDecodedPayload(zero_timeout_row, zero_timeout_received),
+                        asio::detached);
 
     io.poll();
     io.restart();
-    if (request_dispatcher.dispatched != 1 || request_dispatcher.packets_read != 1)
+    const ::transport::MultiBufferReader* expired_reader = expired_same_key.get();
+    const ::transport::MultiBufferReader* zero_timeout_reader = zero_timeout_row.get();
+    if (request_source.dispatcher.dispatched != 1 || request_source.dispatcher.packets_read != 1)
         Fail("same-key rebuild did not dispatch exactly one request with its first packet");
+    if (!request_source.dispatcher.last_reader ||
+        request_source.dispatcher.last_reader == expired_reader ||
+        request_source.dispatcher.last_reader == zero_timeout_reader) {
+        Fail("same-key rebuild dispatched a request for a stale association");
+    }
+    if (!zero_timeout_received || zero_timeout_row->Closed()) {
+        Fail("zero-timeout association did not receive its same-key packet");
+    }
 
     // Expiring the current key can synchronously retire the original socket.
     // Do not recreate a row or launch a request for that retired identity.
     auto retiring_current_key = MakeSession(
-        request_ingress, io, "request", scoped_key,
-        std::chrono::steady_clock::now() - 2s, 1s, request_owner);
+        request_ingress, io, "request", scoped_key, Clock::now() - 2s, 1s);
     ReenterOnCancel retiring_key_reentry{.ingress = &request_ingress, .key = "request"};
-    acpp::transport::CancellationSubscription retiring_key_subscription(
-        retiring_current_key->Cancellation(), &ReenterOnCancel::Cancel, &retiring_key_reentry);
-    request_ingress.ProcessDatagram(acpp::worker_detail::UdpDatagramContext{
-        .socket_key = "request",
-        .sock = request_socket.get(),
-        .client_endpoint = {acpp::net::ip::address_v4::loopback(), 20001},
-        .payload = request_packet,
-        .receiver = &request_receiver,
-        .io_context = io,
-        .dispatcher = request_dispatcher,
-        .stats = request_stats,
-        .timeouts = packet_timeouts,
-        .reply_sink = reply_sink,
-    });
+    ReentryCancellation retiring_key_subscription(retiring_key_reentry);
+    retiring_key_subscription.Resubscribe(retiring_current_key->Cancellation());
+    request_source.Send(request_ingress, io, "request", request_socket.get(), 20001,
+                        request_packet, packet_timeouts);
     io.poll();
     io.restart();
     if (retiring_key_reentry.calls != 1 || request_socket->is_open() ||
-        request_ingress.FindClientSession("request", scoped_key) ||
+        !retiring_current_key->Closed() ||
         request_ingress.GetResourceStats().associations != 0 ||
-        request_dispatcher.dispatched != 1 || request_dispatcher.packets_read != 1)
+        request_ingress.GetResourceStats().native_dispatches != 0 ||
+        request_source.dispatcher.dispatched != 1 || request_source.dispatcher.packets_read != 1)
         Fail("current-key expiry recreated a request for its synchronously retired socket");
 
-    auto all_socket_a = Ingress::MakeSocket(io);
-    auto all_socket_b = Ingress::MakeSocket(io);
-    all_socket_a->open(acpp::udp::v4(), ec);
-    all_socket_b->open(acpp::udp::v4(), ec);
-    if (ec || !first.AttachSocket("all-a", all_socket_a) ||
-        !first.AttachSocket("all-b", all_socket_b)) {
-        Fail("failed to attach sockets for CloseAllSockets reentry test");
-    }
-    auto all_session = MakeSession(first, io, "all-a", "client", now, 0s);
-    ReenterOnCancel all_reentry{.ingress = &first, .key = {}, .close_all = true};
-    acpp::transport::CancellationSubscription all_subscription(
-        all_session->Cancellation(), &ReenterOnCancel::Cancel, &all_reentry);
-    first.CloseAllSockets();
-    if (first.FindSocket("all-a") || first.FindSocket("all-b") ||
-        !all_session->Closed() || all_reentry.calls != 1) {
+    Ingress all_ingress("all", std::make_unique<DummyInbound>(), reclaimer, budget, io);
+    auto all_socket_a = AttachOpenSocket(all_ingress, io, "all-a");
+    auto all_socket_b = AttachOpenSocket(all_ingress, io, "all-b");
+    auto all_session = MakeSession(all_ingress, io, "all-a", Key(1), now, 0s);
+    ReenterOnCancel all_reentry{.ingress = &all_ingress, .key = {}, .close_all = true};
+    ReentryCancellation all_subscription(all_reentry);
+    all_subscription.Resubscribe(all_session->Cancellation());
+    all_ingress.CloseAllSockets();
+    if (all_ingress.FindSocket("all-a") || all_ingress.FindSocket("all-b") ||
+        !all_session->Closed() || all_reentry.calls != 1 ||
+        all_ingress.GetResourceStats().associations != 0) {
         Fail("CloseAllSockets used an invalid borrowed key after reentry");
     }
 
-    // Cursor-row retirement must unlink all hooks before their maps disappear.
-    auto socket = Ingress::MakeSocket(io);
-    socket->open(acpp::udp::v4(), ec);
-    if (ec || !first.AttachSocket("retire", socket)) {
-        Fail("failed to attach socket for reclaimer retirement test");
-    }
-    auto retire_a = MakeSession(first, io, "retire", "a", now, 0s);
-    auto retire_b = MakeSession(first, io, "retire", "b", now, 0s);
-    const size_t rows_before_retire = reclaimer.GetStats().rows;
-    first.CloseSocket("retire");
-    if (first.FindClientSession("retire", "a") ||
-        first.FindClientSession("retire", "b") ||
-        reclaimer.GetStats().rows + 2 != rows_before_retire) {
-        Fail("socket retirement left a reclaimer hook linked");
+    // Socket retirement must unlink every row before its map disappears.
+    Ingress retire_ingress("retire", std::make_unique<DummyInbound>(), reclaimer, budget, io);
+    auto retire_socket = AttachOpenSocket(retire_ingress, io, "retire");
+    auto retire_a = MakeSession(retire_ingress, io, "retire", Key(1), now, 0s);
+    auto retire_b = MakeSession(retire_ingress, io, "retire", Key(2), now, 0s);
+    if (retire_ingress.GetResourceStats().associations != 2) Fail("retire rows were not registered");
+    retire_ingress.CloseSocket("retire");
+    if (retire_ingress.GetResourceStats().associations != 0 || retire_ingress.FindSocket("retire")) {
+        Fail("socket retirement left an association row registered");
     }
     retire_a.reset();
     retire_b.reset();
+    RunFor(io, 20ms);
 
-    Reclaimer cursor_reclaimer(scheduler);
-    Ingress cursor_ingress("cursor", std::make_unique<DummyInbound>(), cursor_reclaimer, io);
-    auto cursor_socket = Ingress::MakeSocket(io);
-    cursor_socket->open(acpp::udp::v4(), ec);
-    if (ec || !cursor_ingress.AttachSocket("cursor-key", cursor_socket)) {
-        Fail("failed to attach socket for cursor-row retirement test");
+    // A due closed row unlinked by CloseSocket before its wake runs must not
+    // be visited, and its now-empty reclaimer must disarm.
+    Reclaimer cursor_reclaimer(scheduler, nullptr, [](void*, std::exception_ptr) { std::terminate(); });
+    Ingress cursor_ingress("cursor", std::make_unique<DummyInbound>(), cursor_reclaimer, budget, io);
+    auto cursor_socket = AttachOpenSocket(cursor_ingress, io, "cursor-key");
+    const size_t events_before_cursor = ActiveEvents(scheduler);
+    auto cursor_row = MakeSession(cursor_ingress, io, "cursor-key", Key(1), now, 0s);
+    if (ActiveEvents(scheduler) != events_before_cursor) {
+        Fail("open association with idle expiry disabled armed a maintenance event");
     }
-    auto cursor_row = MakeSession(cursor_ingress, io, "cursor-key", "cursor-row", now, 0s);
-    if (cursor_reclaimer.GetStats().rows != 1) Fail("cursor hook was not registered");
+    cursor_row->Close();
+    if (ActiveEvents(scheduler) != events_before_cursor + 1 ||
+        cursor_ingress.GetResourceStats().associations != 1) {
+        Fail("closed association was not marked due for the next maintenance wake");
+    }
     cursor_ingress.CloseSocket("cursor-key");
-    if (cursor_reclaimer.GetStats().rows != 0) {
-        Fail("CloseSocket did not unlink the reclaimer cursor row");
+    if (cursor_ingress.GetResourceStats().associations != 0 ||
+        ActiveEvents(scheduler) != events_before_cursor) {
+        Fail("CloseSocket did not unlink the due reclaimer row");
     }
-    RunFor(io, 120ms);
-    if (cursor_reclaimer.GetStats().rows != 0 || cursor_ingress.GetResourceStats().associations) {
-        Fail("retired reclaimer cursor row was visited after socket close");
+    RunFor(io, 50ms);
+    if (cursor_ingress.GetResourceStats().associations != 0) {
+        Fail("retired reclaimer row was visited after socket close");
     }
     cursor_row.reset();
     cursor_ingress.RequestStop();
     cursor_reclaimer.Stop();
 
-    Reclaimer stopped_reclaimer(scheduler);
-    Ingress stopped_ingress("stopped", std::make_unique<DummyInbound>(), stopped_reclaimer, io);
-    const auto scheduled_before_stop = scheduler.GetResourceStats().active_events;
-    auto stopped_row = MakeSession(stopped_ingress, io, "stopped-key", "live", now, 0s);
-    if (scheduler.GetResourceStats().active_events != scheduled_before_stop + 1) {
-        Fail("live stopped-test row did not arm a scheduler event");
+    // One event per reclaimer: idle-disabled open rows arm nothing, the first
+    // expiring row arms the event and an earlier deadline reuses it.
+    Reclaimer stopped_reclaimer(scheduler, nullptr, [](void*, std::exception_ptr) { std::terminate(); });
+    Ingress stopped_ingress("stopped", std::make_unique<DummyInbound>(), stopped_reclaimer, budget, io);
+    const size_t events_before_stop = ActiveEvents(scheduler);
+    auto never_expiring = MakeSession(stopped_ingress, io, "stopped-key", Key(1), Clock::now(), 0s);
+    if (ActiveEvents(scheduler) != events_before_stop) {
+        Fail("open association with idle expiry disabled armed a maintenance event");
+    }
+    auto later_expiring = MakeSession(stopped_ingress, io, "stopped-key", Key(2), Clock::now(), 1s);
+    if (ActiveEvents(scheduler) != events_before_stop + 1) {
+        Fail("expiring association did not arm exactly one maintenance event");
+    }
+    auto due_row = MakeSession(stopped_ingress, io, "stopped-key", Key(3), Clock::now() - 2s, 1s);
+    if (ActiveEvents(scheduler) != events_before_stop + 1) {
+        Fail("an earlier association deadline armed a second maintenance event");
     }
     stopped_reclaimer.Stop();
-    if (scheduler.GetResourceStats().active_events != scheduled_before_stop) {
-        Fail("Stop did not cancel the pending association timer");
+    if (ActiveEvents(scheduler) != events_before_stop) {
+        Fail("Stop did not cancel the pending association event");
     }
-    RunFor(io, 120ms);
-    if (stopped_reclaimer.GetStats().rows != 1 ||
-        stopped_reclaimer.GetStats().last_batch_checks != 0 || stopped_row->Closed()) {
-        Fail("stopped reclaimer processed a pending live row");
+    RunFor(io, 50ms);
+    if (stopped_ingress.GetResourceStats().associations != 3 || due_row->Closed() ||
+        later_expiring->Closed() || never_expiring->Closed()) {
+        Fail("stopped reclaimer processed a due association");
     }
     stopped_ingress.RequestStop();
-    RunFor(io, 120ms);
-    if (stopped_reclaimer.GetStats().rows != 0) {
-        Fail("unlink after Stop left a stale reclaimer hook");
+    RunFor(io, 20ms);
+    if (stopped_ingress.GetResourceStats().associations != 0 ||
+        ActiveEvents(scheduler) != events_before_stop) {
+        Fail("owner cleanup after Stop left an association registered");
     }
-    stopped_row.reset();
+    never_expiring.reset();
+    later_expiring.reset();
+    due_row.reset();
 
-    Reclaimer allocation_reclaimer(scheduler);
+    Reclaimer allocation_reclaimer(scheduler, nullptr, [](void*, std::exception_ptr) { std::terminate(); });
     Ingress allocation_ingress(
-        "allocation", std::make_unique<DummyInbound>(), allocation_reclaimer, io);
+        "allocation", std::make_unique<DummyInbound>(), allocation_reclaimer, budget, io);
     const std::string long_socket_key(4096, 'k');
     const auto deallocated_before = pmr_scope.resource.deallocated_bytes;
     auto allocation_row = MakeSession(
-        allocation_ingress, io, long_socket_key, "client",
-        std::chrono::steady_clock::now() - 2s, 1s);
+        allocation_ingress, io, long_socket_key, Key(1), Clock::now() - 2s, 1s);
     std::weak_ptr<Ingress::ClientSession> allocation_weak = allocation_row;
-    RunFor(io, 120ms);
+    if (!RunUntil(io, [&] { return allocation_ingress.GetResourceStats().associations == 0; })) {
+        Fail("expired association in an otherwise empty group was not reclaimed");
+    }
     const auto deallocated_after = pmr_scope.resource.deallocated_bytes;
-    if (allocation_reclaimer.GetStats().rows != 0 ||
-        allocation_ingress.GetResourceStats().associations != 0 ||
+    if (!allocation_row->Closed() ||
         deallocated_after - deallocated_before < long_socket_key.size() ||
         allocation_weak.expired()) {
         Fail("empty association group did not release its long key independently of session lifetime");
@@ -571,17 +737,20 @@ int main() {
     allocation_reclaimer.Stop();
 
     RunFor(io, 20ms);
-    request_ingress.RequestStop();
-    request_socket->close(ec);
     prior.reset();
-    replacement->Close();
     replacement.reset();
-    uplink->Close();
-    uplink.reset();
-    RunFor(io, 120ms);
-    first.RequestStop();
-    second.RequestStop();
-    if (reclaimer.GetStats().rows != 0) Fail("reclaimer retained rows after owner cleanup");
+    zero_timeout_row.reset();
+    for (auto* ingress : {&first, &second, &detached_ingress, &disabled_ingress, &idle_ingress,
+                          &downlink_ingress, &activity_ingress, &replace_ingress, &bulk_ingress,
+                          &request_ingress, &all_ingress, &retire_ingress}) {
+        ingress->RequestStop();
+        if (ingress->GetResourceStats().associations != 0) {
+            Fail("ingress retained association rows after owner cleanup");
+        }
+    }
+    RunFor(io, 20ms);
+    if (ActiveEvents(scheduler) != idle_events) {
+        Fail("reclaimer kept a maintenance event armed after owner cleanup");
+    }
     reclaimer.Stop();
-    return 0;
 }

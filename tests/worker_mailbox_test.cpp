@@ -1,4 +1,6 @@
-#include "acppnode/app/worker_mailbox.hpp"
+#include <gtest/gtest.h>
+
+#include "app/worker_mailbox.hpp"
 
 #include <asio/as_tuple.hpp>
 #include <asio/co_spawn.hpp>
@@ -10,9 +12,12 @@
 #include <chrono>
 #include <cstdio>
 #include <exception>
+#include <future>
 #include <stdexcept>
-#include <string>
+#include <system_error>
 #include <thread>
+#include <type_traits>
+#include <utility>
 
 namespace {
 
@@ -22,95 +27,138 @@ void Require(bool condition, const char* message) {
     }
 }
 
-acpp::net::awaitable<int> AddOne(int value) {
+::net::awaitable<int> AddOne(int value) {
     co_return value + 1;
 }
 
-acpp::net::awaitable<void> WaitTimer(acpp::net::steady_timer& timer) {
-    auto [ec] = co_await timer.async_wait(acpp::net::as_tuple(acpp::net::use_awaitable));
+::net::awaitable<void> WaitTimer(::net::steady_timer& timer) {
+    auto [ec] = co_await timer.async_wait(::net::as_tuple(::net::use_awaitable));
     (void)ec;
 }
 
-acpp::net::awaitable<void> FailTask() {
+::net::awaitable<void> FailTask() {
     throw std::runtime_error("posted task failed");
     co_return;
 }
 
+// Completes caller-side awaits; the posted bodies run on the worker thread.
+template <typename T>
+T Await(::net::io_context& caller_io, ::net::awaitable<T> awaitable) {
+    auto future = ::net::co_spawn(caller_io, std::move(awaitable), ::net::use_future);
+    caller_io.run();
+    caller_io.restart();
+    return future.get();
+}
+
+// Starts a caller-side await and returns once its admission has been decided.
+template <typename T>
+std::future<T> Start(::net::io_context& caller_io, ::net::awaitable<T> awaitable) {
+    auto future = ::net::co_spawn(caller_io, std::move(awaitable), ::net::use_future);
+    caller_io.poll();
+    return future;
+}
+
+// Admission is decided before the first suspension, so rejection is observable
+// without running the caller loop to completion (a held post may still be open).
+template <typename Error, typename T>
+bool RejectsAdmission(::net::io_context& caller_io, ::net::awaitable<T> awaitable) {
+    auto future = Start(caller_io, std::move(awaitable));
+    if (future.wait_for(std::chrono::seconds(0)) != std::future_status::ready) return false;
+    try {
+        (void)future.get();
+    } catch (const Error& error) {
+        if constexpr (std::is_same_v<Error, std::system_error>) {
+            return error.code() == ::net::error::operation_aborted;
+        }
+        return true;
+    }
+    return false;
+}
+
+template <typename T>
+bool ThrowsRuntimeError(::net::io_context& caller_io, ::net::awaitable<T> awaitable) {
+    try {
+        Await(caller_io, std::move(awaitable));
+    } catch (const std::runtime_error&) {
+        return true;
+    }
+    return false;
+}
+
 int Run() {
-    acpp::net::io_context worker_io;
-    auto work = acpp::net::make_work_guard(worker_io);
+    ::net::io_context worker_io;
+    auto work = ::net::make_work_guard(worker_io);
     std::thread worker_thread([&] { worker_io.run(); });
 
-    acpp::WorkerMailbox mailbox(worker_io, 1);
-    acpp::net::io_context caller_io;
+    ::WorkerMailbox mailbox(worker_io, 1);
+    ::net::io_context caller_io;
 
-    auto result = acpp::net::co_spawn(
-        caller_io,
-        mailbox.Post(AddOne(40)),
-        acpp::net::use_future);
-    caller_io.run();
-    caller_io.restart();
-    Require(result.get() == 41, "posted task did not return the worker result");
+    Require(Await(caller_io, mailbox.Post(AddOne(40))) == 41,
+        "posted task did not return the worker result");
     Require(mailbox.Outstanding() == 0, "successful post must release its slot");
 
-    acpp::net::steady_timer blocker(worker_io);
+    const auto caller_thread = std::this_thread::get_id();
+    const auto call_thread = Await(caller_io, mailbox.PostCall([] {
+        return std::this_thread::get_id();
+    }));
+    Require(call_thread != caller_thread, "posted call must run on the owner thread");
+    Require(mailbox.Outstanding() == 0, "successful call must release its slot");
+    bool void_call_ran = false;
+    Await(caller_io, mailbox.PostCall([&void_call_ran] { void_call_ran = true; }));
+    Require(void_call_ran, "void posted call must run before completion");
+
+    ::net::steady_timer blocker(worker_io);
     blocker.expires_after(std::chrono::hours(1));
-    auto held = mailbox.PostForFuture(WaitTimer(blocker));
-    auto rejected = acpp::net::co_spawn(
-        caller_io,
-        mailbox.Post(AddOne(1)),
-        acpp::net::use_future);
+    auto held = Start(caller_io, mailbox.Post(WaitTimer(blocker)));
+    Require(mailbox.Outstanding() == 1, "accepted post must hold its slot");
+    Require(RejectsAdmission<::WorkerMailboxFull>(caller_io, mailbox.Post(AddOne(1))),
+        "capacity 1 mailbox must reject a second in-flight post");
+    Require(RejectsAdmission<::WorkerMailboxFull>(caller_io, mailbox.PostCall([] { return 1; })),
+        "capacity 1 mailbox must reject a call while a post is in flight");
+    Require(mailbox.Outstanding() == 1, "rejected admissions must not consume the held slot");
+    ::net::post(worker_io, [&] { blocker.cancel(); });
     caller_io.run();
     caller_io.restart();
-    bool full = false;
-    try {
-        (void)rejected.get();
-    } catch (const acpp::WorkerMailboxFull&) {
-        full = true;
-    }
-    Require(full, "capacity 1 mailbox must reject a second in-flight post");
-    Require(mailbox.Outstanding() == 1, "rejected post must not consume the held slot");
-    acpp::net::post(worker_io, [&] { blocker.cancel(); });
     held.get();
     Require(mailbox.Outstanding() == 0, "held post must release its slot");
 
-    auto after = acpp::net::co_spawn(
-        caller_io,
-        mailbox.Post(AddOne(2)),
-        acpp::net::use_future);
-    caller_io.run();
-    caller_io.restart();
-    Require(after.get() == 3, "mailbox must accept work after a slot is released");
+    Require(Await(caller_io, mailbox.Post(AddOne(2))) == 3,
+        "mailbox must accept work after a slot is released");
 
-    auto failed = acpp::net::co_spawn(
-        caller_io,
-        mailbox.Post(FailTask()),
-        acpp::net::use_future);
-    caller_io.run();
-    caller_io.restart();
-    bool failed_released = false;
-    try {
-        failed.get();
-    } catch (const std::runtime_error& error) {
-        failed_released = std::string(error.what()) == "posted task failed";
-    }
-    Require(failed_released, "posted exception must propagate to the caller");
+    Require(ThrowsRuntimeError(caller_io, mailbox.Post(FailTask())),
+        "posted exception must propagate to the caller");
     Require(mailbox.Outstanding() == 0, "failed post must still release its slot");
+    Require(ThrowsRuntimeError(caller_io, mailbox.PostCall([]() -> int {
+                throw std::runtime_error("posted call failed");
+            })),
+        "posted call exception must propagate to the caller");
+    Require(mailbox.Outstanding() == 0, "failed call must still release its slot");
 
-    acpp::net::steady_timer future_blocker(worker_io);
-    future_blocker.expires_after(std::chrono::hours(1));
-    auto future_held = mailbox.PostForFuture(WaitTimer(future_blocker));
-    auto second_future = mailbox.PostForFuture(AddOne(8));
-    bool future_full = false;
-    try {
-        (void)second_future.get();
-    } catch (const acpp::WorkerMailboxFull&) {
-        future_full = true;
-    }
-    Require(future_full, "PostForFuture must reject when the mailbox is full");
-    acpp::net::post(worker_io, [&] { future_blocker.cancel(); });
-    future_held.get();
-    Require(mailbox.Outstanding() == 0, "PostForFuture must release its slot");
+    // Closing must work even when every ordinary slot is occupied. Join is
+    // not a posted task and must wait for the accepted coroutine to finish.
+    ::net::steady_timer close_blocker(worker_io);
+    close_blocker.expires_after(std::chrono::hours(1));
+    auto close_held = Start(caller_io, mailbox.Post(WaitTimer(close_blocker)));
+    mailbox.CloseAdmission();
+    mailbox.CloseAdmission();
+    Require(mailbox.IsClosed(), "admission closure must be permanent");
+    auto joined = ::net::co_spawn(worker_io,
+        mailbox.AsyncJoinAccepted(), ::net::use_future);
+    Require(joined.wait_for(std::chrono::milliseconds(20)) == std::future_status::timeout,
+        "join returned while accepted I/O was still pending");
+    Require(RejectsAdmission<std::system_error>(caller_io, mailbox.Post(AddOne(10))),
+        "closed awaitable admission must report cancellation, not full");
+    Require(RejectsAdmission<std::system_error>(caller_io, mailbox.PostCall([] { return 10; })),
+        "closed call admission must report cancellation, not full");
+    ::net::post(worker_io, [&] { close_blocker.cancel(); });
+    caller_io.run();
+    caller_io.restart();
+    close_held.get();
+    Require(mailbox.Outstanding() == 0, "accepted post must release its slot after closure");
+    joined.get();
+    auto joined_again = ::net::co_spawn(worker_io,
+        mailbox.AsyncJoinAccepted(), ::net::use_future);
+    joined_again.get();
 
     work.reset();
     worker_thread.join();
@@ -119,11 +167,11 @@ int Run() {
 
 }  // namespace
 
-int main() {
+TEST(WorkerMailbox, Contract) {
     try {
-        return Run();
+        { ASSERT_EQ((::Run()), 0); return; }
     } catch (const std::exception& error) {
         std::fprintf(stderr, "worker_mailbox_test: %s\n", error.what());
-        return 1;
+        FAIL() << error.what();
     }
 }

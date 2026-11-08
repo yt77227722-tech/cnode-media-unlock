@@ -1,14 +1,14 @@
 #pragma once
 
-#include "acppnode/infra/json.hpp"
+#include "infra/json.hpp"
 #include "anytls_outbound.hpp"
 
-#include <expected>
+#include <tl/expected.hpp>
 #include <string>
 
-namespace acpp::proxy::anytls::outbound {
+namespace proxy::anytls::outbound {
 
-[[nodiscard]] std::expected<Settings, std::string> ParseSettings(
+[[nodiscard]] tl::expected<Settings, std::string> ParseSettings(
     const json::object& source);
 
-}  // namespace acpp::proxy::anytls::outbound
+}  // namespace proxy::anytls::outbound

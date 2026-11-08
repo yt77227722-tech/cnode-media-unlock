@@ -1,3 +1,5 @@
+#include <gtest/gtest.h>
+
 #include "padding.hpp"
 
 #include <algorithm>
@@ -41,8 +43,8 @@ void* operator new(std::size_t size, const std::nothrow_t&) noexcept {
 }
 void operator delete(void* value, const std::nothrow_t&) noexcept { ::operator delete(value); }
 
-int main() {
-    (void)acpp::anytls::DefaultPaddingScheme();
+TEST(AnytlsPadding, Contract) {
+    (void)::anytls::DefaultPaddingScheme();
     constexpr std::array cases{
         std::string_view("stop=8\n0=30-30\n1=64-65\n7=96-96\n"),
         std::string_view("stop=2\n1=64-65\n2147483647=64-65\n"),
@@ -57,7 +59,7 @@ int main() {
         bool parsed = false;
         measuring = true;
         try {
-            parsed = acpp::anytls::ParsePaddingScheme(cases[index]).has_value();
+            parsed = ::anytls::ParsePaddingScheme(cases[index]).has_value();
         } catch (const std::bad_alloc&) {
         }
         measuring = false;
@@ -68,7 +70,7 @@ int main() {
             parsed, bounded ? "PASS" : "FAIL");
     }
 
-    using namespace acpp::anytls;
+    using namespace ::anytls;
     const PaddingScheme empty;
     Check(empty.RecordFor(0).empty() && empty.RecordFor(UINT32_MAX).empty() &&
           empty.SampleAuthPaddingSize() == 0, "disabled scheme");
@@ -176,5 +178,5 @@ int main() {
         Check(dense->RecordFor(UINT32_MAX - 1 - index * 1000000).size() == 1, "all sparse entries retained");
     std::printf("padding-policy checks=%zu failures=%zu scaling_raw=%zu scaling_total=%zu\n",
         checks, failures, many.size(), total_requested);
-    return passed && failures == 0 ? 0 : 1;
+    { ASSERT_TRUE(passed && failures == 0); return; }
 }

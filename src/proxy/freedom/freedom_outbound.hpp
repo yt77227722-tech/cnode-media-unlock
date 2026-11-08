@@ -1,94 +1,65 @@
 #pragma once
 
-#include "acppnode/common/defaults.hpp"
-#include "acppnode/common/target_address.hpp"
-#include "acppnode/proxy/outbound.hpp"
-#include "acppnode/transport/internet/outbound_bind.hpp"
-#include "acppnode/transport/internet/stream_settings.hpp"
+#include "common/target_address.hpp"
+#include "proxy/outbound.hpp"
+#include "proxy/freedom_domain_strategy.hpp"
+#include "app/proxyman/outbound/prepared_config.hpp"
+#include "common/allocator.hpp"
 
 #include <chrono>
-#include <cstdint>
-#include <expected>
+#include <tl/expected.hpp>
 #include <memory>
 #include <optional>
-#include <span>
-#include <string>
 #include <string_view>
-#include <vector>
 
-namespace acpp {
 namespace app::dns {
 class DNS;
 }  // namespace app::dns
-}  // namespace acpp
 
-namespace acpp::proxy::freedom::outbound {
-
-enum class DomainStrategy : uint8_t {
-    AsIs,
-    UseIP,
-    UseIPv6v4,
-    UseIPv4,
-    UseIPv4v6,
-    UseIPv6,
-    ForceIP,
-    ForceIPv6v4,
-    ForceIPv6,
-    ForceIPv4v6,
-    ForceIPv4,
-};
+namespace proxy::freedom::outbound {
 
 // ============================================================================
-// Freedom 出站设置
+// Freedom 出站设置（sendThrough 属于 Handler 的 sender settings）
 // ============================================================================
 struct FreedomSettings {
-    OutboundBind send_through = OutboundBind::Auto();
     DomainStrategy domain_strategy = DomainStrategy::AsIs;
-    std::string redirect;                 // 重定向目标 "host:port"（空=不重定向）
-    bool enable_udp = true;               // 是否启用 UDP
+    std::optional<TargetAddress> redirect;  // 重定向目标（缺省=不重定向），加载时已校验
 };
+
+[[nodiscard]] proxyman::outbound::PreparedOutboundCreator
+PrepareOutbound(FreedomSettings settings);
 
 // ============================================================================
 // Handler - 直连出站
+//
+// domainStrategy 是协议策略（同 Xray freedom）：本协议解析并排序目标地址，
+// 再经 Handler 的 OutboundDialer 拨号；原生 UDP 同样经 dialer 选择绑定地址。
 // ============================================================================
 class Handler final : public Outbound {
 public:
-    Handler(const std::string& tag,
-            const FreedomSettings& settings,
-            ::acpp::app::dns::DNS& dns_service,
-            std::chrono::seconds dial_timeout = std::chrono::seconds(defaults::kDialTimeout));
+    explicit Handler(const FreedomSettings& settings);
 
     net::awaitable<OutboundProcessResult> Process(
-        net::io_context& io_context,
-        const tcp::endpoint* inbound_local_addr,
         session::Context& ctx,
-        const TimeoutsConfig& timeouts,
         transport::Link inbound,
+        OutboundDialer& dialer,
+        const TimeoutsConfig& timeouts,
         StatsShard& stats,
         const RelayConfig& relay_config,
-        buf::MultiBuffer first_payload,
+        buf::MultiBufferBatch first_payload,
         std::chrono::seconds relay_idle_timeout,
         std::chrono::seconds relay_write_timeout) override;
 
-    std::string_view Tag() const noexcept override { return tag_; }
-
 private:
+    net::awaitable<tl::expected<std::unique_ptr<AsyncStream>, ErrorCode>>
+    DialTarget(OutboundDialer& dialer, session::Context& ctx);
+
     // 解析目标地址列表（保留多 IP 顺序，按策略过滤/排序）
-    net::awaitable<std::expected<std::vector<net::ip::address>, ErrorCode>>
-    ResolveTargets(session::Context& ctx);
+    net::awaitable<tl::expected<memory::ThreadLocalVector<net::ip::address>, ErrorCode>>
+    ResolveTargets(::app::dns::DNS& dns, session::Context& ctx);
 
-    // 确定本地绑定地址
-    std::optional<net::ip::address> DetermineLocalAddress(
-        const tcp::endpoint* inbound_local_addr,
-        const net::ip::address& remote_addr);
-
-    std::string tag_;
-    FreedomSettings settings_;
-    ::acpp::app::dns::DNS& dns_service_;
-    std::chrono::seconds dial_timeout_;
+    DomainStrategy domain_strategy_;
     std::optional<TargetAddress> redirect_target_;
-    std::string redirect_target_text_;
-    StreamSettings stream_settings_;          // 默认 tcp/none
 };
 
-}  // namespace acpp::proxy::freedom::outbound
+}  // namespace proxy::freedom::outbound

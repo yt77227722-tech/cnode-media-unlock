@@ -1,47 +1,41 @@
-#include "acppnode/sniff/sniffer.hpp"
-#include "acppnode/core/constants.hpp"
+#include "sniff/sniffer.hpp"
+#include "core/constants.hpp"
 
 #include <algorithm>
 
-namespace acpp {
 
-SniffResult BittorrentSniffer::Sniff(std::span<const uint8_t> data) {
+SniffResult SniffBittorrent(std::span<const uint8_t> data) {
     SniffResult result;
     static constexpr std::string_view kHandshake = "BitTorrent protocol";
-    if (data.size() >= kHandshake.size() + 1 &&
-        data[0] == static_cast<uint8_t>(kHandshake.size()) &&
-        std::equal(kHandshake.begin(), kHandshake.end(), data.begin() + 1)) {
+    if (data.empty() || data[0] != static_cast<uint8_t>(kHandshake.size())) {
+        return result;
+    }
+    const size_t prefix_len = std::min(data.size() - 1, kHandshake.size());
+    if (!std::equal(data.begin() + 1,
+                    data.begin() + 1 + static_cast<std::ptrdiff_t>(prefix_len),
+                    kHandshake.begin())) {
+        return result;
+    }
+    result.protocol = constants::protocol::kBitTorrent;
+    if (data.size() < kHandshake.size() + 1) {
+        result.need_more = true;
+    } else {
         result.success = true;
-        result.protocol = constants::protocol::kBitTorrent;
     }
     return result;
 }
 
-SniffResult Sniff(std::span<const uint8_t> data) {
-    return Sniff(data, Network::TCP);
-}
-
-SniffResult Sniff(std::span<const uint8_t> data, Network network) {
+SniffResult Sniffer::Sniff(std::span<const uint8_t> data, Network network) {
     if (network == Network::UDP) {
-        return QuicSniffer{}.Sniff(data);
+        return quic_.Sniff(data);
     }
 
-    TlsSniffer tls;
-    if (auto result = tls.Sniff(data); result.success) {
+    if (auto result = SniffTls(data); result.success || result.need_more) {
         return result;
     }
-
-    HttpSniffer http;
-    if (auto result = http.Sniff(data); result.success) {
+    if (auto result = SniffHttp(data); result.success || result.need_more) {
         return result;
     }
-
-    BittorrentSniffer bittorrent;
-    if (auto result = bittorrent.Sniff(data); result.success) {
-        return result;
-    }
-
-    return SniffResult{};
+    return SniffBittorrent(data);
 }
 
-}  // namespace acpp

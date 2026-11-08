@@ -1,27 +1,27 @@
-#include "acppnode/app/dispatcher/default_dispatcher.hpp"
+#include "app/dispatcher/default_dispatcher.hpp"
 
 #include "outbound_selection.hpp"
 #include "../../common/awaitable_task_group.hpp"
 
-#include "acppnode/app/stats.hpp"
-#include "acppnode/app/session_tracking.hpp"
-#include "acppnode/app/request_load_state.hpp"
-#include "acppnode/app/dns/dns.hpp"
-#include "acppnode/common/session.hpp"
-#include "acppnode/features/policy/request_policy.hpp"
-#include "acppnode/features/outbound/outbound.hpp"
-#include "acppnode/proxy/outbound.hpp"
-#include "acppnode/infra/runtime_config_types.hpp"
-#include "acppnode/infra/log.hpp"
-#include "acppnode/features/routing/router.hpp"
-#include "acppnode/sniff/sniffer.hpp"
-#include "acppnode/transport/link.hpp"
-#include "acppnode/transport/async_stream.hpp"
-#include "acppnode/common/buf/multi_buffer.hpp"
+#include "app/stats.hpp"
+#include "app/session_tracking.hpp"
+#include "app/request_load_state.hpp"
+#include "app/dns/dns.hpp"
+#include "common/session.hpp"
+#include "features/policy/request_policy.hpp"
+#include "app/proxyman/outbound/handler.hpp"
+#include "infra/runtime_config_types.hpp"
+#include "infra/log.hpp"
+#include "features/routing/router.hpp"
+#include "sniff/sniffer.hpp"
+#include "transport/link.hpp"
+#include "transport/async_stream.hpp"
+#include "common/buf/multi_buffer.hpp"
+#include "common/buf/multi_buffer_batch.hpp"
 
 #include <algorithm>
 #include <asio/experimental/awaitable_operators.hpp>
-#include <asio/steady_timer.hpp>
+#include "transport/internet/async_delay.hpp"
 #include <asio/this_coro.hpp>
 #include <asio/use_awaitable.hpp>
 #include <charconv>
@@ -30,8 +30,9 @@
 #include <new>
 #include <string>
 #include <vector>
+#include <variant>
 
-namespace acpp::app::dispatcher {
+namespace app::dispatcher {
 
 namespace {
 
@@ -42,13 +43,12 @@ void ApplySniffOverride(
     if (!result.success) {
         return;
     }
-    ctx.content.protocol.assign(result.protocol.data(), result.protocol.size());
-    ctx.content.sniff_domain.assign(result.domain.data(), result.domain.size());
+    ctx.content.protocol.assign(result.protocol);
     if (result.domain.empty()) {
         return;
     }
     const std::string_view sniff_domain(result.domain.data(), result.domain.size());
-    LOG_CONN_DEBUG(ctx, "[Session] Sniff: proto={} domain={}",
+    LOG_CONN_DEBUG(ctx, "sniffed protocol={} domain={}",
                    result.protocol, sniff_domain);
     if (sniffing.IsDomainExcluded(sniff_domain) ||
         !sniffing.MatchesDestOverride(result.protocol)) {
@@ -58,7 +58,7 @@ void ApplySniffOverride(
         ? result.port
         : ctx.outbound.original_target.port;
     TargetAddress sniffed(sniff_domain, final_port);
-    if (!sniffed.IsValid()) {
+    if (!sniffed.IsValid() || !sniffed.IsDomain()) {
         return;
     }
     ctx.outbound.route_target = sniffed;
@@ -84,32 +84,193 @@ std::chrono::seconds ResolveRelayIdleTimeout(
     return idle_timeout;
 }
 
-net::awaitable<std::vector<net::ip::address>> ResolveRoutingAddresses(
-    app::dns::DNS& dns_service,
-    session::Context& ctx) {
-    const auto& target = ctx.outbound.target;
-    const int64_t started_at_us = NowMicros();
-    auto dns_result = co_await dns_service.Resolve(target.host);
-    // DNS may return a failed result after cancellation. Do not publish that
-    // result into the request or continue to route/outbound lookup.
-    const auto cancellation = co_await net::this_coro::cancellation_state;
-    if (cancellation.cancelled() != net::cancellation_type::none)
-        throw IoSystemError(net::error::operation_aborted);
-    const int64_t elapsed_us = std::max<int64_t>(0, NowMicros() - started_at_us);
-    ctx.outbound.dns_latency_ms = static_cast<uint32_t>(
-        std::min<int64_t>(elapsed_us / 1000, std::numeric_limits<uint32_t>::max()));
-    ctx.outbound.dns_answer_count = static_cast<uint32_t>(
-        std::min<size_t>(dns_result.addresses.size(), std::numeric_limits<uint32_t>::max()));
-    if (!dns_result.Ok()) {
-        ctx.content.dns_result = session::DnsResultState::Failed;
-        LOG_CONN_DEBUG(ctx, "[Dispatcher] route DNS resolve failed for {}", target.host);
-        co_return std::vector<net::ip::address>{};
-    }
+net::awaitable<bool> SniffInitialPayload(
+    net::io_context& io_context,
+    const SniffConfig& sniffing,
+    transport::MultiBufferReader* inbound_reader,
+    AsyncStream* inbound_control,
+    InitialPayload& first_packet,
+    session::Context& ctx,
+    StatsShard& stats,
+    buf::MultiBufferBatch& outbound_first_payload,
+    RelayResult& result,
+    ErrorCode& cancellation_reason,
+    const net::cancellation_state& sniff_cancellation) {
+    using net::experimental::awaitable_operators::operator||;
+    const bool datagram = ctx.content.network == Network::UDP;
+    const size_t sniff_byte_limit = datagram ? 64 * 1024 : 4096;
+    static constexpr size_t kSniffMaxDatagrams = 64;
+    static constexpr auto kSniffWindow = std::chrono::milliseconds(200);
+    buf::MultiBuffer sniff_payload;
+    memory::ByteVector sniff_scratch;
+    Sniffer sniffer;
+    size_t cached_bytes = 0;
+    size_t cached_datagrams = 0;
 
-    ctx.content.dns_result = dns_result.from_cache
-        ? session::DnsResultState::Cache
-        : session::DnsResultState::Resolve;
-    co_return std::move(dns_result.addresses);
+    auto copy_cached_bytes = [&](const buf::MultiBuffer& mb) {
+        const size_t total = mb.byte_size();
+        if (total == 0) {
+            return std::span<const uint8_t>{};
+        }
+        const size_t want = std::min(total, sniff_byte_limit);
+        if (auto direct = mb.PrefixSpan(want); !direct.empty()) {
+            return direct;
+        }
+        sniff_scratch.resize(want);
+        const size_t copied = mb.CopyPrefixTo(
+            std::span<uint8_t>(sniff_scratch.data(), sniff_scratch.size()));
+        return copied == 0
+            ? std::span<const uint8_t>{}
+            : std::span<const uint8_t>(sniff_scratch.data(), copied);
+    };
+
+    auto sniff_cached = [&]() {
+        const auto sniff_data = copy_cached_bytes(sniff_payload);
+        if (sniff_data.empty()) {
+            return SniffResult{};
+        }
+        return sniffer.Sniff(sniff_data, ctx.content.network);
+    };
+
+    bool read_timed_out = false;
+    auto consume_inbound_timeout = [&]() noexcept {
+        if (!inbound_control) return false;
+        const bool read_to = inbound_control->ConsumeReadTimeout();
+        const bool idle_to = inbound_control->ConsumeIdleTimeout();
+        return read_to || idle_to;
+    };
+    try {
+        auto cache_more = [&]() -> net::awaitable<bool> {
+            buf::MultiBuffer payload;
+            try {
+                payload = co_await inbound_reader->ReadMultiBuffer();
+            } catch (const IoSystemError& e) {
+                if (e.code() == net::error::eof && cached_bytes > 0) {
+                    co_return false;
+                }
+                throw;
+            }
+            if (payload.empty()) {
+                if (consume_inbound_timeout()) {
+                    read_timed_out = true;
+                    throw IoSystemError(net::error::timed_out);
+                }
+                co_return false;
+            }
+            cached_bytes += payload.byte_size();
+            ++cached_datagrams;
+            if (datagram) {
+                sniff_payload = std::move(payload);
+            } else {
+                sniff_payload.AppendAndCoalesce(std::move(payload));
+            }
+            co_return true;
+        };
+        const auto sniff_started = std::chrono::steady_clock::now();
+        if (!first_packet.empty()) {
+            sniff_payload = first_packet.MoveToMultiBuffer();
+            cached_bytes = sniff_payload.byte_size();
+            cached_datagrams = 1;
+        }
+
+        int no_clue_attempts = 0;
+        for (;;) {
+            if (!sniff_payload.empty()) {
+                const auto sniffed = sniff_cached();
+                if (datagram) {
+                    // Keep each original read result intact. Only decrypted
+                    // handshake fragments are combined inside the sniffer.
+                    outbound_first_payload.Push(std::move(sniff_payload));
+                }
+                if (sniffed.success) {
+                    ApplySniffOverride(ctx, sniffing, sniffed);
+                    break;
+                }
+                if (datagram && !sniffed.need_more) {
+                    break;
+                }
+                if (!sniffed.need_more) {
+                    ++no_clue_attempts;
+                    if (no_clue_attempts >= 2) {
+                        break;
+                    }
+                }
+                // Stop before another read once the inspection budget is
+                // exhausted. Preserve an already-read final datagram even
+                // when it crosses the byte limit (at most one UDP packet).
+                if (cached_bytes >= sniff_byte_limit ||
+                    (datagram && cached_datagrams >= kSniffMaxDatagrams)) {
+                    break;
+                }
+            }
+            const auto remaining = kSniffWindow -
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - sniff_started);
+            if (remaining <= std::chrono::milliseconds::zero()) {
+                break;
+            }
+            struct ReadResult {
+                bool received = false;
+                std::exception_ptr error;
+            } read;
+            auto read_more = [&]() -> net::awaitable<void> {
+                try {
+                    read.received = co_await cache_more();
+                } catch (...) {
+                    read.error = std::current_exception();
+                }
+            };
+            memory::ByteVector{}.swap(sniff_scratch);
+            AsyncDelay delay(io_context);
+            auto next = co_await (read_more() || delay.WaitFor(remaining));
+            if (sniff_cancellation.cancelled() != net::cancellation_type::none) {
+                throw IoSystemError(net::error::operation_aborted);
+            }
+            if (read.error) {
+                if (next.index() == 0) std::rethrow_exception(read.error);
+                try {
+                    std::rethrow_exception(read.error);
+                } catch (const IoSystemError& e) {
+                    if (consume_inbound_timeout()) {
+                        read_timed_out = true;
+                        throw;
+                    }
+                    if (e.code() != net::error::operation_aborted) throw;
+                }
+            }
+            if (!read.received) break;
+        }
+        if (!sniff_payload.empty()) {
+            outbound_first_payload.Push(std::move(sniff_payload));
+        }
+    } catch (const std::bad_alloc&) {
+        throw;
+    } catch (const transport::LinkError& e) {
+        stats.OnError();
+        result = MakeRelayError(e.code());
+        co_return false;
+    } catch (const IoSystemError& e) {
+        if (read_timed_out || consume_inbound_timeout()) {
+            stats.OnError();
+            result = MakeRelayError(ErrorCode::TIMEOUT);
+            co_return false;
+        }
+        if (e.code() == net::error::operation_aborted &&
+            (cancellation_reason != ErrorCode::OK ||
+             sniff_cancellation.cancelled() != net::cancellation_type::none)) {
+            throw;
+        }
+        stats.OnError();
+        result = MakeRelayError(MapAsioError(e.code()));
+        co_return false;
+    } catch (...) {
+        stats.OnError();
+        result = MakeRelayError(ErrorCode::SOCKET_READ_FAILED);
+        co_return false;
+    }
+    sniff_payload.ReleaseIfIdle();
+    memory::ByteVector{sniff_scratch.get_allocator()}.swap(sniff_scratch);
+    co_return true;
 }
 
 struct ActiveSessionScope {
@@ -117,12 +278,12 @@ struct ActiveSessionScope {
     app::SessionTrackingState::ActiveSession node{};
 
     ActiveSessionScope(session::Context& session_ctx,
-                       app::SessionTrackingState& tracking) noexcept
+                       app::SessionTrackingState& tracking)
         : session_tracking(tracking) {
         if (session_ctx.inbound.user_id > 0) {
             session_tracking.RegisterActiveSession(
                 node,
-                session_ctx.inbound.tag,
+                session_ctx.inbound.accounting_key,
                 session_ctx.inbound.user_id,
                 session_ctx.traffic);
         }
@@ -137,22 +298,17 @@ struct ActiveSessionScope {
 
 DefaultDispatcher::DefaultDispatcher(
     const routing::Router& router,
-    features::outbound::Manager& outbound_manager,
+    proxyman::outbound::HandlerLookup& outbound_handlers,
     features::policy::RequestPolicy& request_policy,
     app::SessionTrackingState& session_tracking,
     app::dns::DNS& dns_service,
     app::RequestLoadState& request_load) noexcept
     : router_(router)
-    , outbound_manager_(outbound_manager)
+    , outbound_handlers_(outbound_handlers)
     , request_policy_(request_policy)
     , session_tracking_(session_tracking)
     , dns_service_(dns_service)
     , request_load_(request_load) {}
-
-std::shared_ptr<Outbound> DefaultDispatcher::ResolveOutboundHandler(
-    std::string_view tag) const noexcept {
-    return outbound_manager_.GetHandler(tag);
-}
 
 net::awaitable<RelayResult> DefaultDispatcher::Dispatch(
     net::io_context& io_context,
@@ -165,20 +321,10 @@ net::awaitable<RelayResult> DefaultDispatcher::Dispatch(
     const TimeoutsConfig& timeouts) {
     app::RequestLoadState::DispatchScope load_scope(request_load_);
     const uint32_t pressure_idle_timeout = request_load_.PressureIdleTimeout();
-    const int64_t auth_completed_at_us = NowMicros();
-    const int64_t auth_started_at_us = ctx.inbound.transport_ready_at_unix_us > 0
-        ? ctx.inbound.transport_ready_at_unix_us
-        : ctx.accept_time_us;
-    if (ctx.auth_ms == 0 && auth_started_at_us > 0 &&
-        auth_completed_at_us >= auth_started_at_us) {
-        ctx.auth_ms = static_cast<uint32_t>(std::min<int64_t>(
-            (auth_completed_at_us - auth_started_at_us) / 1000,
-            std::numeric_limits<uint32_t>::max()));
-    }
     RelayResult result;
     ErrorCode cancellation_reason = ErrorCode::OK;
     try {
-        co_await RunAwaitableTaskGroup(io_context.get_executor(), [&](AwaitableTaskGroup& group) {
+        co_await RunAwaitableTaskGroup(co_await net::this_coro::executor, [&](AwaitableTaskGroup& group) {
             group.Spawn(DispatchPreparedLink(
                 io_context, policy, std::move(inbound), inbound_link,
                 std::move(first_packet), ctx, stats, timeouts, pressure_idle_timeout,
@@ -187,13 +333,15 @@ net::awaitable<RelayResult> DefaultDispatcher::Dispatch(
     } catch (const std::bad_alloc&) {
         stats.OnError();
         result = MakeRelayError(ErrorCode::RESOURCE_EXHAUSTED);
-        LOG_CONN_WARN(ctx, "failed to process outbound traffic > out of memory");
+        try { LOG_CONN_WARN(ctx, "failed to process outbound traffic > out of memory"); }
+        catch (...) {} // Logging must not escape the allocation-failure boundary.
     } catch (const IoSystemError& e) {
-        stats.OnError();
-        result = MakeRelayError(MapAsioError(e.code()));
-        ctx.outbound.os_error_code = e.code().value();
-        ctx.outbound.failure_detail_code = ErrorCodeToString(result.error);
-        LOG_CONN_WARN(ctx, "failed to process outbound traffic > {}", e.what());
+        if (e.code() != net::error::operation_aborted || result.error == ErrorCode::OK) {
+            stats.OnError();
+            result = MakeRelayError(MapAsioError(e.code()));
+        }
+        if (e.code() != net::error::operation_aborted && e.code() != net::error::eof)
+            LOG_CONN_WARN(ctx, "failed to process outbound traffic > {}", e.what());
     } catch (const std::exception& e) {
         stats.OnError();
         result = MakeRelayError(ErrorCode::INTERNAL);
@@ -205,7 +353,6 @@ net::awaitable<RelayResult> DefaultDispatcher::Dispatch(
     }
     if (result.error == ErrorCode::CANCELLED && cancellation_reason != ErrorCode::OK) {
         result.error = cancellation_reason;
-        ctx.outbound.failure_detail_code = ErrorCodeToString(result.error);
     }
     co_return result;
 }
@@ -224,19 +371,21 @@ net::awaitable<void> DefaultDispatcher::DispatchPreparedLink(
     AwaitableTaskGroup& request_group,
     ErrorCode& cancellation_reason) {
 
-    struct CancellationContext {
+    struct RequestCancellation final : transport::CancellationSubscription {
+        RequestCancellation(AwaitableTaskGroup& group, ErrorCode& reason) noexcept
+            : group(group), reason(reason) {}
         AwaitableTaskGroup& group;
         ErrorCode& reason;
-    } cancellation{request_group, cancellation_reason};
-    const auto cancel = [](void* raw, transport::Cancellation event) noexcept {
-        auto& state = *static_cast<CancellationContext*>(raw);
-        state.reason = event.reason == ErrorCode::OK ? ErrorCode::CANCELLED : event.reason;
-        state.group.Cancel();
-    };
+
+    private:
+        void OnCancellation(transport::Cancellation event) noexcept override {
+            reason = event.reason == ErrorCode::OK ? ErrorCode::CANCELLED : event.reason;
+            group.Cancel();
+        }
+    } cancellation(request_group, cancellation_reason);
     auto* cancellation_reader = inbound_link.Valid() ? inbound_link.reader : inbound.get();
-    std::optional<transport::CancellationSubscription> subscription;
     if (cancellation_reader) {
-        subscription.emplace(cancellation_reader->Cancellation(), cancel, &cancellation);
+        cancellation.Resubscribe(cancellation_reader->Cancellation());
     }
     if (cancellation_reason != ErrorCode::OK) {
         stats.OnError();
@@ -264,192 +413,74 @@ net::awaitable<void> DefaultDispatcher::DispatchPreparedLink(
 
     if (!ctx.outbound.target.IsValid()) {
         stats.OnError();
-        LOG_CONN_DEBUG(ctx, "[Session] Reject invalid outbound target");
+        LOG_CONN_DEBUG(ctx, "rejected outbound request > invalid target");
         result = MakeRelayError(ErrorCode::PROTOCOL_DECODE_FAILED);
         co_return;
     }
 
-    LOG_CONN_DEBUG(ctx, "[Session] Protocol auth ok: [{}] -> {} user={}",
-                   ctx.inbound.tag, ctx.outbound.original_target, ctx.inbound.user_email);
+    LOG_CONN_DEBUG(ctx, "protocol authenticated target={} email={}",
+                   ctx.outbound.original_target, ctx.inbound.user_email);
 
-    buf::MultiBuffer outbound_first_payload;
+    buf::MultiBufferBatch outbound_first_payload;
+    const auto sniff_cancellation = co_await net::this_coro::cancellation_state;
     if (policy.sniffing.enabled && !policy.sniffing.metadata_only) {
-        using net::experimental::awaitable_operators::operator||;
-        static constexpr size_t kSniffMaxBytes = 4096;
-        buf::MultiBuffer sniff_payload;
-        static constexpr auto kTcpSniffWindow = std::chrono::milliseconds(200);
-        memory::ByteVector sniff_scratch;
-
-        auto copy_cached_bytes = [&](const buf::MultiBuffer& mb) {
-            const size_t total = buf::TotalLen(mb);
-            if (total == 0) {
-                return std::span<const uint8_t>{};
-            }
-            const size_t want = std::min(total, kSniffMaxBytes);
-            if (auto direct = mb.PrefixSpan(want); !direct.empty()) {
-                return direct;
-            }
-            sniff_scratch.resize(want);
-            const size_t copied = mb.CopyPrefixTo(
-                std::span<uint8_t>(sniff_scratch.data(), sniff_scratch.size()));
-            return copied == 0
-                ? std::span<const uint8_t>{}
-                : std::span<const uint8_t>(sniff_scratch.data(), copied);
-        };
-
-        auto sniff_cached = [&]() {
-            const auto sniff_data = copy_cached_bytes(sniff_payload);
-            if (sniff_data.empty()) {
-                return SniffResult{};
-            }
-            return Sniff(sniff_data, ctx.content.network);
-        };
-
-        try {
-            if (inbound_reader) {
-                auto cache_more = [&]() -> net::awaitable<bool> {
-                    auto payload = co_await inbound_reader->ReadMultiBuffer();
-                    if (payload.empty()) {
-                        co_return false;
-                    }
-                    payload.MoveTo(sniff_payload);
-                    co_return true;
-                };
-                if (!first_packet.empty()) {
-                    sniff_payload = first_packet.MoveToMultiBuffer();
-                } else {
-                    if (inbound_control) {
-                        inbound_control->SetReadTimeout(timeouts.ReadTimeout());
-                    }
-                    (void)co_await cache_more();
-                }
-
-                const auto sniff_started = std::chrono::steady_clock::now();
-                int no_clue_attempts = 0;
-                for (;;) {
-                    const auto sniffed = sniff_cached();
-                    if (sniffed.success) {
-                        ApplySniffOverride(ctx, policy.sniffing, sniffed);
-                        break;
-                    }
-                    // Datagram boundaries must survive sniffing. Additional
-                    // reads are stream-only: never merge subsequent UDP packets
-                    // into the first payload or wait for another request packet.
-                    if (ctx.content.network == Network::UDP) {
-                        break;
-                    }
-                    if (!sniffed.need_more) {
-                        ++no_clue_attempts;
-                        if (no_clue_attempts >= 2) {
-                            break;
-                        }
-                    }
-                    if (buf::TotalLen(sniff_payload) >= kSniffMaxBytes) {
-                        break;
-                    }
-                    const auto remaining = kTcpSniffWindow -
-                        std::chrono::duration_cast<std::chrono::milliseconds>(
-                            std::chrono::steady_clock::now() - sniff_started);
-                    if (remaining <= std::chrono::milliseconds::zero()) {
-                        break;
-                    }
-                    const auto bytes_before = buf::TotalLen(sniff_payload);
-                    net::steady_timer timer(io_context);
-                    timer.expires_after(remaining);
-                    try {
-                        co_await (cache_more() ||
-                                  timer.async_wait(net::use_awaitable));
-                    } catch (...) {
-                        break;
-                    }
-                    if (buf::TotalLen(sniff_payload) <= bytes_before) {
-                        break;
-                    }
-                }
-                outbound_first_payload = std::move(sniff_payload);
-            } else if (!first_packet.empty()) {
-                const auto sniff_data = first_packet.IsContiguous()
-                    ? first_packet.span()
-                    : std::span<const uint8_t>{};
-                memory::ByteVector leftover;
-                std::span<const uint8_t> view = sniff_data;
-                if (view.empty()) {
-                    const size_t want =
-                        std::min(first_packet.size(), kSniffMaxBytes);
-                    leftover.resize(want);
-                    const size_t got = first_packet.CopyPrefixTo(
-                        leftover.data(), leftover.size());
-                    if (got > 0) {
-                        view = std::span<const uint8_t>(leftover.data(), got);
-                    }
-                } else if (view.size() > kSniffMaxBytes) {
-                    view = view.first(kSniffMaxBytes);
-                }
-                if (!view.empty()) {
-                    ApplySniffOverride(
-                        ctx, policy.sniffing, Sniff(view, ctx.content.network));
-                }
-            }
-        } catch (const std::bad_alloc&) {
-            throw;
-        } catch (const transport::LinkError& e) {
-            stats.OnError();
-            result = MakeRelayError(e.code());
-            co_return;
-        } catch (const IoSystemError& e) {
-            stats.OnError();
-            result = MakeRelayError(inbound_control && inbound_control->ConsumeReadTimeout()
-                ? ErrorCode::TIMEOUT
-                : MapAsioError(e.code()));
-            co_return;
-        } catch (...) {
-            stats.OnError();
-            result = MakeRelayError(ErrorCode::SOCKET_READ_FAILED);
+        if (!co_await SniffInitialPayload(
+                io_context, policy.sniffing, inbound_reader, inbound_control,
+                first_packet, ctx, stats, outbound_first_payload, result,
+                cancellation_reason, sniff_cancellation)) {
             co_return;
         }
+    }
+    if (sniff_cancellation.cancelled() != net::cancellation_type::none ||
+        cancellation_reason != ErrorCode::OK) {
+        throw IoSystemError(net::error::operation_aborted);
     }
 
     RouteResult dispatch = co_await RouteAsync(ctx, policy);
     auto outbound_handler = std::move(dispatch.handler);
     if (!outbound_handler) {
         if (dispatch.error == ErrorCode::BLOCKED) {
-            LOG_CONN_WARN(ctx, "destination rejected user={} target={}",
-                              ctx.inbound.user_email, ctx.outbound.target);
+            LOG_CONN_WARN(ctx, "destination rejected source={}:{} target={} email={} > policy blocked",
+                          ctx.inbound.source_ip, ctx.inbound.source_port,
+                          ctx.outbound.target, ctx.inbound.user_email);
+            if (ctx.inbound.user_id > 0 && ctx.outbound.target.IsValid()) {
+                LOG_ACCESS(FormatAccessLog(ctx, AccessStatus::Rejected, "policy blocked"));
+            }
             stats.OnError();
             result = MakeRelayError(ErrorCode::BLOCKED);
             co_return;
         }
-        LOG_CONN_WARN(ctx, "failed to find outbound handler {} -> {} via {}",
-                          ctx.inbound.source_ip, ctx.outbound.target, ctx.outbound.tag);
+        LOG_CONN_WARN(ctx, "failed to find outbound handler source={}:{} target={}",
+                          ctx.inbound.source_ip, ctx.inbound.source_port, ctx.outbound.target);
         stats.OnError();
         result = MakeRelayError(ErrorCode::ROUTER_OUTBOUND_NOT_FOUND);
         co_return;
     }
 
-    // UDP 与 TCP 共用主链路：dispatcher.Dispatch -> outbound.Process -> relay。
-    // UDP 数据面（Full Cone + framer）下沉到 UDP-capable 出站的 Process，由下方
-    // 通用路径设置入站 idle/write timeout 并调用 outbound.Process。
+    // UDP 与 TCP 共用主链路：dispatcher.Dispatch -> Handler.Dispatch ->
+    // proxy::Outbound::Process（唯一一次动态分派）-> relay。
 
-    std::optional<tcp::endpoint> inbound_local_addr =
-        inbound_endpoint ? inbound_endpoint->LocalEndpoint() : std::nullopt;
-    if (!inbound_local_addr && ctx.inbound.local_endpoint) {
-        inbound_local_addr = ctx.inbound.local_endpoint;
+    // The handler's dialer reads the inbound local address from the session
+    // (Xray: inbound connection local address); fill it from the control
+    // stream when the ingress did not record one.
+    if (!ctx.inbound.local_endpoint && inbound_control) {
+        ctx.inbound.local_endpoint = inbound_control->LocalEndpoint();
     }
     const auto relay_idle_timeout = ResolveRelayIdleTimeout(
         timeouts, pressure_idle_timeout);
     if (pressure_idle_timeout > 0 &&
         relay_idle_timeout < timeouts.IdleTimeout()) {
         LOG_CONN_DEBUG(ctx,
-                       "[Session] Pressure mode: relay_idle={}s -> {}s",
+                       "pressure mode reduced relay idle timeout from {}s to {}s",
                        timeouts.IdleTimeout().count(),
                        relay_idle_timeout.count());
     }
     const auto relay_write_timeout =
         std::min(timeouts.WriteTimeout(), relay_idle_timeout);
-    if (inbound_endpoint) {
-        inbound_endpoint->SetIdleTimeout(relay_idle_timeout);
-        inbound_endpoint->SetReadTimeout(std::chrono::seconds(0));
-        inbound_endpoint->SetWriteTimeout(relay_write_timeout);
+    if (inbound_control) {
+        inbound_control->SetIdleTimeout(relay_idle_timeout);
+        inbound_control->SetReadTimeout(std::chrono::seconds(0));
+        inbound_control->SetWriteTimeout(relay_write_timeout);
     }
 
     RelayConfig relay_cfg;
@@ -458,21 +489,20 @@ net::awaitable<void> DefaultDispatcher::DispatchPreparedLink(
     relay_cfg.speed_limit   = ctx.content.speed_limit;
 
     if (outbound_first_payload.empty() && !first_packet.empty()) {
-        outbound_first_payload = first_packet.MoveToMultiBuffer();
+        outbound_first_payload.Push(first_packet.MoveToMultiBuffer());
     }
-    const size_t relay_payload_size = buf::TotalLen(outbound_first_payload);
+    first_packet = {};
+    const size_t relay_payload_size = outbound_first_payload.byte_size();
 
-    LOG_CONN_DEBUG(ctx, "[Session] Relay start: {} -> {} via {} payload={}B",
-                   ctx.inbound.source_ip, ctx.outbound.target, ctx.outbound.tag,
-                   relay_payload_size);
+    LOG_CONN_DEBUG(ctx, "relay started source={}:{} target={} payload={}B",
+                   ctx.inbound.source_ip, ctx.inbound.source_port,
+                   ctx.outbound.target, relay_payload_size);
 
     ActiveSessionScope relay_scope{ctx, session_tracking_};
-    auto outbound_process = co_await outbound_handler->Process(
-        io_context,
-        inbound_local_addr ? &*inbound_local_addr : nullptr,
+    auto outbound_process = co_await outbound_handler->Dispatch(
         ctx,
-        timeouts,
         transport::Link{inbound_reader, inbound_writer, inbound_control},
+        timeouts,
         stats,
         relay_cfg,
         std::move(outbound_first_payload),
@@ -483,9 +513,12 @@ net::awaitable<void> DefaultDispatcher::DispatchPreparedLink(
         if (process_error == ErrorCode::OK) {
             process_error = ErrorCode::PROTOCOL_AUTH_FAILED;
         }
-        LOG_CONN_WARN(ctx, "failed to process outbound traffic {} -> {} via {} > {}",
-                          ctx.inbound.source_ip, ctx.outbound.target,
-                          ctx.outbound.tag, ErrorCodeToLogReason(process_error));
+        if (process_error != ErrorCode::CANCELLED && process_error != ErrorCode::SOCKET_EOF &&
+            process_error != ErrorCode::SOCKET_CLOSED && process_error != ErrorCode::CONNECTION_CLOSED) {
+            LOG_CONN_WARN(ctx, "failed to process outbound traffic source={}:{} target={} > {}",
+                          ctx.inbound.source_ip, ctx.inbound.source_port,
+                          ctx.outbound.target, ErrorCodeToLogReason(process_error));
+        }
         stats.OnError();
         result = MakeRelayError(process_error);
         co_return;
@@ -493,13 +526,13 @@ net::awaitable<void> DefaultDispatcher::DispatchPreparedLink(
     RelayResult relay_result = std::move(*outbound_process);
 
     if (relay_result.error != ErrorCode::OK) {
-        LOG_CONN_DEBUG(ctx, "[Session] Relay end: {} up={}B down={}B closer={} target={}",
+        LOG_CONN_DEBUG(ctx, "relay ended > {} up={}B down={}B closer={} target={}",
                        ErrorCodeToString(relay_result.error),
                        ctx.traffic.bytes_up, ctx.traffic.bytes_down,
                        relay_result.client_closed_first ? "client" : "target",
                        ctx.outbound.target);
     } else {
-        LOG_CONN_DEBUG(ctx, "[Session] Relay end: OK up={}B down={}B target={}",
+        LOG_CONN_DEBUG(ctx, "relay completed up={}B down={}B target={}",
                        ctx.traffic.bytes_up, ctx.traffic.bytes_down,
                        ctx.outbound.target);
     }
@@ -511,35 +544,10 @@ DefaultDispatcher::RouteResult DefaultDispatcher::FinishRoute(
     session::Context& ctx,
     const detail::OutboundSelection& selection) const {
     ctx.outbound.tag = selection.outbound_tag;
-    switch (selection.source) {
-        case detail::SelectionSource::Forced:
-            ctx.outbound.route_rule = "fixed";
-            break;
-        case detail::SelectionSource::Rule: {
-            char rule_buf[24] = "rule:";
-            const auto [ptr, ec] = std::to_chars(
-                rule_buf + 5,
-                rule_buf + sizeof(rule_buf),
-                selection.rule_index);
-            if (ec == std::errc{}) {
-                ctx.outbound.route_rule.assign(
-                    rule_buf,
-                    static_cast<size_t>(ptr - rule_buf));
-            } else {
-                ctx.outbound.route_rule = "rule:0";
-            }
-            break;
-        }
-        case detail::SelectionSource::Fallback:
-            ctx.outbound.route_rule = "fallback";
-            break;
-    }
     if (selection.source == detail::SelectionSource::Forced) {
-        LOG_CONN_DEBUG(ctx, "[Dispatcher] {} -> outbound={} (fixed)",
-                       ctx.outbound.target, ctx.outbound.tag);
+        LOG_CONN_DEBUG(ctx, "selected fixed route target={}", ctx.outbound.target);
     } else {
-        LOG_CONN_DEBUG(ctx, "[Dispatcher] {} -> outbound={}",
-                       ctx.outbound.target, ctx.outbound.tag);
+        LOG_CONN_DEBUG(ctx, "selected route target={}", ctx.outbound.target);
     }
 
     if (request_policy_.Blocked(ctx)) {
@@ -549,7 +557,7 @@ DefaultDispatcher::RouteResult DefaultDispatcher::FinishRoute(
         };
     }
 
-    auto handler = ResolveOutboundHandler(selection.outbound_tag);
+    auto handler = outbound_handlers_.GetHandler(selection.outbound_tag);
     if (!handler) {
         return RouteResult{
             .handler = {},
@@ -577,9 +585,12 @@ detail::OutboundSelection DefaultDispatcher::SelectRoute(
 net::awaitable<DefaultDispatcher::RouteResult> DefaultDispatcher::RouteAsync(
     session::Context& ctx,
     const routing::DispatchPolicy& policy) {
+    TargetAddress& route_target = ctx.outbound.route_target.IsValid()
+        ? ctx.outbound.route_target
+        : ctx.outbound.target;
     if (!detail::RequiresRouting(policy.outbound) ||
-        !ctx.outbound.target.IsDomain() ||
-        ctx.outbound.target.resolved_addr) {
+        !route_target.IsDomain() ||
+        route_target.resolved_addr) {
         co_return FinishRoute(ctx, SelectRoute(ctx, policy));
     }
 
@@ -588,15 +599,22 @@ net::awaitable<DefaultDispatcher::RouteResult> DefaultDispatcher::RouteAsync(
         co_return FinishRoute(ctx, SelectRoute(ctx, policy));
     }
 
+    const bool sync_dial_target =
+        &route_target == &ctx.outbound.target ||
+        (ctx.outbound.target.IsDomain() &&
+         domain::DnsHostnamesEqual(ctx.outbound.target.host, route_target.host));
+
+    auto set_resolved_address = [&](const net::ip::address& addr) {
+        route_target.resolved_addr = addr;
+        if (sync_dial_target) {
+            ctx.outbound.target.resolved_addr = addr;
+        }
+    };
+
     auto select_with_addresses =
         [&](const std::vector<net::ip::address>& addresses) -> detail::OutboundSelection {
             auto select_address = [&](const net::ip::address& addr) {
-                ctx.outbound.target.resolved_addr = addr;
-                if (ctx.outbound.route_target.IsDomain() &&
-                    ctx.outbound.route_target.host == ctx.outbound.target.host &&
-                    ctx.outbound.route_target.port == ctx.outbound.target.port) {
-                    ctx.outbound.route_target.resolved_addr = addr;
-                }
+                set_resolved_address(addr);
                 return SelectRoute(ctx, policy);
             };
 
@@ -612,7 +630,7 @@ net::awaitable<DefaultDispatcher::RouteResult> DefaultDispatcher::RouteAsync(
                     return selection;
                 }
             }
-            ctx.outbound.target.resolved_addr = addresses.front();
+            set_resolved_address(addresses.front());
             return last;
         };
 
@@ -624,13 +642,21 @@ net::awaitable<DefaultDispatcher::RouteResult> DefaultDispatcher::RouteAsync(
         }
     }
 
-    auto addresses = co_await ResolveRoutingAddresses(dns_service_, ctx);
-    if (!addresses.empty()) {
-        co_return FinishRoute(ctx, select_with_addresses(addresses));
+    auto dns_result = co_await dns_service_.Resolve(route_target.host);
+    // DNS may return a failed result after cancellation. Do not publish that
+    // result into the request or continue to route/outbound lookup.
+    const auto cancellation = co_await net::this_coro::cancellation_state;
+    if (cancellation.cancelled() != net::cancellation_type::none)
+        throw IoSystemError(net::error::operation_aborted);
+    if (!dns_result.Ok()) {
+        LOG_CONN_DEBUG(ctx, "routing DNS lookup failed target={} > {}: {}",
+                       route_target.host, ErrorCodeToString(dns_result.error), dns_result.error_msg);
+    } else if (!dns_result.addresses.empty()) {
+        co_return FinishRoute(ctx, select_with_addresses(dns_result.addresses));
     }
     co_return FinishRoute(
         ctx,
         initial_selection ? *initial_selection : SelectRoute(ctx, policy));
 }
 
-}  // namespace acpp::app::dispatcher
+}  // namespace app::dispatcher

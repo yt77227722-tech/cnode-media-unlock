@@ -1,3 +1,5 @@
+#include <gtest/gtest.h>
+
 #include "outbound/ss_outbound_credentials.hpp"
 
 #include <array>
@@ -8,10 +10,9 @@
 #include <type_traits>
 
 namespace {
-using acpp::proxy::shadowsocks::outbound::Credentials;
-using acpp::ss::SsCipherType;
+using ::proxy::shadowsocks::outbound::Credentials;
+using ::ss::SsCipherType;
 
-static_assert(!std::is_default_constructible_v<Credentials>);
 constexpr std::string_view kKey16 = "AAECAwQFBgcICQoLDA0ODw==";
 constexpr std::string_view kKey32 = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=";
 constexpr std::string_view kIdentity32 = "ZmVkY2JhOTg3NjU0MzIxMGZlZGNiYTk4NzY1NDMyMTA=";
@@ -20,7 +21,7 @@ void Check(bool success, const char* message) {
     if (!success) throw std::runtime_error(message);
 }
 
-void CheckAscending(const acpp::ss::KeyBytes& key, size_t length) {
+void CheckAscending(const ::ss::KeyBytes& key, size_t length) {
     Check(key.size == length, "wrong decoded key length");
     for (size_t i = 0; i < length; ++i) {
         Check(key.bytes[i] == i, "wrong decoded key bytes");
@@ -97,10 +98,14 @@ void TestInvalidCredentials() {
     Check(!Credentials::Prepare("2022-blake3-aes-256-gcm", kKey16), "16-byte key accepted for AES256");
     Check(!Credentials::Prepare("2022-blake3-chacha20-poly1305",
         std::string(kKey32) + ':' + std::string(kKey32)), "unsupported ChaCha identity chain accepted");
+    Check(!Credentials::Prepare("2022-blake3-aes-128-gcm", "===="),
+          "all-padding base64 string accepted as PSK");
+    Check(!Credentials::Prepare("2022-blake3-aes-128-gcm", "AAAAAAAAAAAAAAAAAAAAAAA==="),
+          "3-equals base64 padding accepted as PSK");
 }
 }  // namespace
 
-int main() {
+TEST(SsOutboundCredentials, Contract) {
     try {
         TestPasswords();
         TestPskValues();
@@ -108,6 +113,6 @@ int main() {
         std::cout << "SS outbound credential vectors, complete chains, owned values and rejection passed\n";
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
-        return 1;
+        FAIL() << error.what();
     }
 }

@@ -1,3 +1,6 @@
+#include <stdexcept>
+#include <gtest/gtest.h>
+
 #include "http_path_match.hpp"
 
 #include <cstdlib>
@@ -9,14 +12,14 @@ namespace {
 void Require(bool condition, std::string_view message) {
     if (!condition) {
         std::cerr << message << '\n';
-        std::exit(1);
+        ADD_FAILURE() << "contract assertion failed; see diagnostic above"; throw std::runtime_error("contract assertion failed");
     }
 }
 
 }  // namespace
 
-int main() {
-    using acpp::transport::internet::detail::PathPrefixMatchesSegment;
+TEST(HttpPathMatch, Contract) {
+    using ::transport::internet::detail::PathPrefixMatchesSegment;
 
     Require(PathPrefixMatchesSegment("/api", "/api"), "exact path rejected");
     Require(PathPrefixMatchesSegment("/api", "/api/child"), "child path rejected");

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "common/unsafe.hpp"
 #include <algorithm>
 #include <array>
 #include <cstddef>
@@ -9,7 +10,7 @@
 #include <string>
 #include <string_view>
 
-namespace acpp::ss {
+namespace ss {
 
 // ============================================================================
 // 密码类型
@@ -30,11 +31,9 @@ struct SsCipherInfo {
     static constexpr size_t tag_size = 16;
 };
 
-// 根据方法名获取密码参数（不区分大小写）
-// 支持: aes-128-gcm, aes-256-gcm, chacha20-ietf-poly1305
+// 根据方法名获取密码参数（不区分大小写），含 AEAD 与 2022-blake3 方法。
 [[nodiscard]] std::optional<SsCipherInfo> ParseCipherMethod(std::string_view method);
 [[nodiscard]] bool Is2022Cipher(SsCipherType type) noexcept;
-[[nodiscard]] bool Is2022Cipher(const SsCipherInfo& info) noexcept;
 [[nodiscard]] bool Is2022AesCipher(SsCipherType type) noexcept;
 [[nodiscard]] SsCipherType BaseCipherType(SsCipherType type) noexcept;
 
@@ -48,6 +47,15 @@ struct KeyBytes {
     std::array<uint8_t, kMaxSize> bytes{};
     size_t size = 0;
 
+
+    KeyBytes() = default;
+    KeyBytes(const KeyBytes&) = default;
+    KeyBytes& operator=(const KeyBytes&) = default;
+    KeyBytes(KeyBytes&&) noexcept = default;
+    KeyBytes& operator=(KeyBytes&&) noexcept = default;
+    ~KeyBytes() noexcept {
+        ::SecureZeroMemory(bytes.data(), bytes.size());
+    }
     [[nodiscard]] const uint8_t* data() const noexcept { return bytes.data(); }
     [[nodiscard]] uint8_t* data() noexcept { return bytes.data(); }
     [[nodiscard]] bool empty() const noexcept { return size == 0; }
@@ -67,7 +75,7 @@ struct KeyBytes {
 };
 
 // 从密码派生主密钥（EVP_BytesToKey + MD5，Shadowsocks 标准）
-[[nodiscard]] KeyBytes DeriveKey(const std::string& password, size_t key_size);
+[[nodiscard]] KeyBytes DeriveKey(std::string_view password, size_t key_size);
 [[nodiscard]] KeyBytes Decode2022Psk(std::string_view password, size_t key_size);
 [[nodiscard]] KeyBytes Build2022UserKeyFromUuid(
     std::string_view uuid,
@@ -83,4 +91,4 @@ struct KeyBytes {
 [[nodiscard]] bool Hash2022Psk(std::span<const uint8_t> key,
                                std::span<uint8_t, 16> out_hash);
 
-}  // namespace acpp::ss
+}  // namespace ss

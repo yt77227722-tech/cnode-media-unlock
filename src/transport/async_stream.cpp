@@ -1,66 +1,73 @@
-#include "acppnode/transport/async_stream.hpp"
-#include "acppnode/common/allocator.hpp"
-#include "acppnode/common/memory_stats.hpp"
-#include "acppnode/transport/internet/tcp_stream.hpp"
+#include "transport/async_stream.hpp"
+#include "common/allocator.hpp"
+#include "common/buffer_util.hpp"
+#include "common/memory_stats.hpp"
+#include "transport/internet/tcp_stream.hpp"
 
 #include <new>
 
-namespace acpp {
 
-void* AsyncStream::operator new(std::size_t size) {
-    if (void* ptr = memory::AllocatePmr(size, alignof(AsyncStream))) {
-        memory::OnAsyncStreamNew();
-        return ptr;
+StreamPhaseDeadline::StreamPhaseDeadline(net::io_context& io_context, AsyncStream& owner)
+    : TimeoutEvent(io_context), owner_(owner) {}
+
+StreamPhaseDeadline::~StreamPhaseDeadline() noexcept {
+    Clear();
+}
+
+PhaseDeadlineHandle StreamPhaseDeadline::Start(std::chrono::seconds timeout) {
+    ++generation_;
+    expired_ = 0;
+    if (timeout <= std::chrono::seconds::zero() || !owner_.IsOpen()) {
+        TimeoutEvent::Cancel();
+        return {};
     }
-    throw std::bad_alloc();
-}
-
-void* AsyncStream::operator new(std::size_t size, std::align_val_t alignment) {
-    if (void* ptr = memory::AllocatePmr(size, static_cast<std::size_t>(alignment))) {
-        memory::OnAsyncStreamNew();
-        return ptr;
+    constexpr auto maximum =
+        std::chrono::duration_cast<std::chrono::seconds>(std::chrono::milliseconds::max());
+    const auto delay = timeout >= maximum
+        ? std::chrono::milliseconds::max()
+        : std::chrono::duration_cast<std::chrono::milliseconds>(timeout);
+    if (!ScheduleAfter(delay)) {
+        TimeoutEvent::Cancel();
+        return {};
     }
-    throw std::bad_alloc();
+    return {&expired_, 1, &generation_, generation_};
 }
 
-void AsyncStream::operator delete(void* ptr) noexcept {
-    memory::OnAsyncStreamFree();
-    memory::DeallocatePmr(ptr, 0, alignof(AsyncStream));
+void StreamPhaseDeadline::Clear() noexcept {
+    TimeoutEvent::Cancel();
+    ++generation_;
+    expired_ = 0;
 }
 
-void AsyncStream::operator delete(void* ptr, std::size_t size) noexcept {
-    memory::OnAsyncStreamFree();
-    memory::DeallocatePmr(ptr, size, alignof(AsyncStream));
+bool StreamPhaseDeadline::Consume() noexcept {
+    return std::exchange(expired_, uint8_t{0}) != 0;
 }
 
-void AsyncStream::operator delete(void* ptr, std::align_val_t alignment) noexcept {
-    memory::OnAsyncStreamFree();
-    memory::DeallocatePmr(ptr, 0, static_cast<std::size_t>(alignment));
-}
-
-void AsyncStream::operator delete(
-    void* ptr,
-    std::size_t size,
-    std::align_val_t alignment) noexcept {
-    memory::OnAsyncStreamFree();
-    memory::DeallocatePmr(ptr, size, static_cast<std::size_t>(alignment));
+void StreamPhaseDeadline::OnTimeout() noexcept {
+    expired_ = 1;
+    // Do not touch this owner after cancellation: its callback may close it.
+    owner_.Cancel();
 }
 
 // ============================================================================
 // AsyncStream::WriteMultiBuffer - 默认实现
 //
-// 逐个 Buffer 调用 AsyncWrite，写完后释放。
-// TcpStream override 使用 scatter-write (writev) 将多个 Buffer 合并为单次系统调用。
+// 将 MultiBuffer 展开为 const_buffer 视图序列转发至 WriteBuffers，完成后释放。
 // ============================================================================
 net::awaitable<void> AsyncStream::WriteMultiBuffer(buf::MultiBuffer mb) {
-
-    for (auto* b : mb) {
-        auto bytes = b->Bytes();
-        if (bytes.empty()) continue;
-
-        // AsyncWrite 保证写完整个 buffer（内部循环）
-        co_await AsyncWrite(net::const_buffer(bytes.data(), bytes.size()));
+    if (mb.byte_size() == 0) {
+        mb.clear();
+        co_return;
     }
+    ConstBufferSpanBuilder<buf::MultiBuffer::kInlineCapacity> buffers;
+    buffers.AppendMultiBuffer(mb);
+    try {
+        co_await WriteBuffers(buffers.Span());
+    } catch (...) {
+        mb.clear();
+        throw;
+    }
+    mb.clear();
 }
 
 net::awaitable<void> AsyncStream::WriteBuffers(
@@ -92,13 +99,9 @@ void AsyncStream::SetWriteTimeout(std::chrono::seconds timeout) {
     }
 }
 
-void AsyncStream::SetStreamLabel(std::string_view label) noexcept {
-    if (auto* tcp = BaseTcpStream()) {
-        tcp->SetStreamLabel(label);
-    }
-}
 
 void AsyncStream::SetAbortiveClose(bool enable) noexcept {
+    if (LogicalPhaseDeadline()) return;
     if (auto* tcp = BaseTcpStream()) {
         tcp->SetAbortiveClose(enable);
     }
@@ -126,6 +129,7 @@ void AsyncStream::PrependReadData(std::span<const uint8_t> data) {
 }
 
 transport::CancellationSource& AsyncStream::Cancellation() noexcept {
+    if (LogicalPhaseDeadline()) return cancellation_;
     if (auto* tcp = BaseTcpStream(); tcp && static_cast<AsyncStream*>(tcp) != this)
         return tcp->Cancellation();
     return cancellation_;
@@ -147,6 +151,9 @@ bool AsyncStream::ConsumeWriteTimeout() noexcept {
 }
 
 PhaseDeadlineHandle AsyncStream::StartPhaseDeadline(std::chrono::seconds timeout) {
+    if (auto* deadline = LogicalPhaseDeadline()) {
+        return deadline->Start(timeout);
+    }
     if (auto* tcp = BaseTcpStream()) {
         return tcp->StartPhaseDeadline(timeout);
     }
@@ -154,12 +161,19 @@ PhaseDeadlineHandle AsyncStream::StartPhaseDeadline(std::chrono::seconds timeout
 }
 
 void AsyncStream::ClearPhaseDeadline() {
+    if (auto* deadline = LogicalPhaseDeadline()) {
+        deadline->Clear();
+        return;
+    }
     if (auto* tcp = BaseTcpStream()) {
         tcp->ClearPhaseDeadline();
     }
 }
 
 bool AsyncStream::ConsumePhaseDeadline() noexcept {
+    if (auto* deadline = LogicalPhaseDeadline()) {
+        return deadline->Consume();
+    }
     auto* tcp = BaseTcpStream();
     return tcp && tcp->ConsumePhaseDeadline();
 }
@@ -178,4 +192,3 @@ std::optional<tcp::endpoint> AsyncStream::RemoteEndpoint() const {
     return std::nullopt;
 }
 
-}  // namespace acpp

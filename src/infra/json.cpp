@@ -1,11 +1,13 @@
-#include "acppnode/infra/json.hpp"
+#include "infra/json.hpp"
+#include "common/binary_text_codec.hpp"
 
 #include <charconv>
 #include <cmath>
 #include <format>
 #include <limits>
+#include <stdexcept>
 
-namespace acpp::json {
+namespace json {
 
 void object_deleter::operator()(object* ptr) const noexcept {
     delete ptr;
@@ -15,13 +17,63 @@ void array_deleter::operator()(array* ptr) const noexcept {
     delete ptr;
 }
 
+namespace {
+
+unsigned char LowerAscii(unsigned char c) noexcept {
+    return c >= 'A' && c <= 'Z' ? static_cast<unsigned char>(c + ('a' - 'A')) : c;
+}
+
+void NormalizeKey(std::string& key, KeyComparison comparison) noexcept {
+    if (comparison != KeyComparison::AsciiCaseInsensitive) return;
+    for (char& c : key) {
+        c = static_cast<char>(LowerAscii(static_cast<unsigned char>(c)));
+    }
+}
+
+}  // namespace
+
+bool object::key_compare::operator()(std::string_view lhs,
+                                     std::string_view rhs) const noexcept {
+    if (comparison == KeyComparison::CaseSensitive) return lhs < rhs;
+
+    const size_t length = lhs.size() < rhs.size() ? lhs.size() : rhs.size();
+    for (size_t i = 0; i < length; ++i) {
+        const auto left = LowerAscii(static_cast<unsigned char>(lhs[i]));
+        const auto right = LowerAscii(static_cast<unsigned char>(rhs[i]));
+        if (left != right) return left < right;
+    }
+    return lhs.size() < rhs.size();
+}
+
 object::object() = default;
+object::object(KeyComparison comparison) : values_(key_compare{comparison}) {}
 
 object::object(std::initializer_list<std::pair<std::string, value>> init) {
     for (auto& [key, val] : init) {
         values_.emplace(key, val);
     }
 }
+
+object::object(const object& other) = default;
+object::object(object&& other) noexcept = default;
+
+object& object::operator=(const object& other) {
+    if (this != &other) {
+        object temp(other);
+        values_.swap(temp.values_);
+    }
+    return *this;
+}
+
+object& object::operator=(object&& other) noexcept {
+    if (this != &other) {
+        object temp(std::move(other));
+        values_.swap(temp.values_);
+    }
+    return *this;
+}
+
+object::~object() = default;
 
 bool object::contains(std::string_view key) const {
     return values_.find(key) != values_.end();
@@ -50,11 +102,41 @@ const value& object::at(std::string_view key) const {
 }
 
 value& object::operator[](std::string key) {
+    NormalizeKey(key, values_.key_comp().comparison);
     return values_[std::move(key)];
+}
+
+std::pair<object::iterator, bool> object::insert_or_assign(std::string key, value item) {
+    NormalizeKey(key, values_.key_comp().comparison);
+    return values_.insert_or_assign(std::move(key), std::move(item));
+}
+
+bool object::operator==(const object& other) const noexcept {
+    return values_ == other.values_;
 }
 
 array::array() = default;
 array::array(std::initializer_list<value> init) : values_(init) {}
+array::array(const array& other) = default;
+array::array(array&& other) noexcept = default;
+
+array& array::operator=(const array& other) {
+    if (this != &other) {
+        array temp(other);
+        values_.swap(temp.values_);
+    }
+    return *this;
+}
+
+array& array::operator=(array&& other) noexcept {
+    if (this != &other) {
+        array temp(std::move(other));
+        values_.swap(temp.values_);
+    }
+    return *this;
+}
+
+array::~array() = default;
 
 void array::push_back(value v) {
     values_.push_back(std::move(v));
@@ -66,6 +148,10 @@ value& array::operator[](size_t index) {
 
 const value& array::operator[](size_t index) const {
     return values_[index];
+}
+
+bool array::operator==(const array& other) const noexcept {
+    return values_ == other.values_;
 }
 
 value::value() noexcept : data_(nullptr) {}
@@ -104,7 +190,13 @@ value& value::operator=(const value& other) {
     }
     return *this;
 }
-value& value::operator=(value&& other) noexcept = default;
+value& value::operator=(value&& other) noexcept {
+    if (this != &other) {
+        value temp(std::move(other));
+        data_.swap(temp.data_);
+    }
+    return *this;
+}
 value::~value() = default;
 value::value(double v) noexcept : data_(v) {}
 
@@ -133,11 +225,44 @@ const object& value::as_object() const { return *std::get<object_ptr>(data_); }
 array& value::as_array() { return *std::get<array_ptr>(data_); }
 const array& value::as_array() const { return *std::get<array_ptr>(data_); }
 
+bool value::operator==(const value& other) const noexcept {
+    if (is_null()) return other.is_null();
+    if (is_bool()) return other.is_bool() && as_bool() == other.as_bool();
+    if (is_string()) return other.is_string() && as_string() == other.as_string();
+    if (is_int64()) {
+        if (other.is_int64()) return as_int64() == other.as_int64();
+        if (other.is_uint64()) {
+            return as_int64() >= 0 &&
+                   static_cast<uint64_t>(as_int64()) == other.as_uint64();
+        }
+        return false;
+    }
+    if (is_uint64()) {
+        if (other.is_uint64()) return as_uint64() == other.as_uint64();
+        if (other.is_int64()) {
+            return other.as_int64() >= 0 &&
+                   as_uint64() == static_cast<uint64_t>(other.as_int64());
+        }
+        return false;
+    }
+    if (is_double()) return other.is_double() && as_double() == other.as_double();
+    if (is_object()) return other.is_object() && as_object() == other.as_object();
+    if (is_array()) return other.is_array() && as_array() == other.as_array();
+    return false;
+}
+
 namespace {
+
+// RFC 8259 §9 lets a parser bound nesting depth. Parsing recurses per level on
+// the caller's stack, and panel responses are remote input, so the bound keeps
+// a hostile body from exhausting the control-plane thread stack. 128 levels
+// (serde_json's default) far exceed every configuration or panel schema.
+constexpr size_t kMaxNestingDepth = 128;
 
 class Parser {
 public:
-    explicit Parser(std::string_view text) : text_(text) {}
+    Parser(std::string_view text, KeyComparison comparison)
+        : text_(text), comparison_(comparison) {}
 
     value Parse() {
         SkipWs();
@@ -205,21 +330,40 @@ private:
         return v;
     }
 
+    void EnterNesting() {
+        if (++depth_ > kMaxNestingDepth) Fail("nesting too deep");
+    }
+
     object ParseObject() {
-        object obj;
+        object obj(comparison_);
         Expect('{');
+        EnterNesting();
         SkipWs();
-        if (Consume('}')) return obj;
+        if (Consume('}')) {
+            --depth_;
+            return obj;
+        }
 
         while (true) {
             SkipWs();
             if (Peek() != '"') Fail("expected object key");
-            std::string key = ParseString().as_string();
+            const size_t key_position = pos_;
+            std::string key = ParseString();
             SkipWs();
             Expect(':');
-            obj[std::move(key)] = ParseValue();
+            // RFC 8259 §4 leaves duplicate names unpredictable across parsers;
+            // last-wins would let one field silently shadow another, so any
+            // repeat under the active key comparison rejects the document.
+            auto [entry, inserted] = obj.insert_or_assign(std::move(key), ParseValue());
+            if (!inserted) {
+                throw parse_error(std::format(
+                    "duplicate object key '{}' at byte {}", entry->first, key_position));
+            }
             SkipWs();
-            if (Consume('}')) return obj;
+            if (Consume('}')) {
+                --depth_;
+                return obj;
+            }
             Expect(',');
         }
     }
@@ -227,24 +371,31 @@ private:
     array ParseArray() {
         array arr;
         Expect('[');
+        EnterNesting();
         SkipWs();
-        if (Consume(']')) return arr;
+        if (Consume(']')) {
+            --depth_;
+            return arr;
+        }
 
         while (true) {
             arr.push_back(ParseValue());
             SkipWs();
-            if (Consume(']')) return arr;
+            if (Consume(']')) {
+                --depth_;
+                return arr;
+            }
             Expect(',');
         }
     }
 
-    value ParseString() {
+    std::string ParseString() {
         Expect('"');
         std::string out;
 
         while (true) {
             const char c = Take();
-            if (c == '"') return value(std::move(out));
+            if (c == '"') return out;
             if (static_cast<unsigned char>(c) < 0x20) Fail("control character in string");
             if (c != '\\') {
                 out.push_back(c);
@@ -287,12 +438,9 @@ private:
     uint32_t ReadHex4() {
         uint32_t cp = 0;
         for (int i = 0; i < 4; ++i) {
-            const char c = Take();
-            cp <<= 4;
-            if (c >= '0' && c <= '9') cp |= static_cast<uint32_t>(c - '0');
-            else if (c >= 'a' && c <= 'f') cp |= static_cast<uint32_t>(c - 'a' + 10);
-            else if (c >= 'A' && c <= 'F') cp |= static_cast<uint32_t>(c - 'A' + 10);
-            else Fail("invalid unicode escape");
+            const int digit = HexDigitValue(Take());
+            if (digit < 0) Fail("invalid unicode escape");
+            cp = (cp << 4) | static_cast<uint32_t>(digit);
         }
         return cp;
     }
@@ -363,7 +511,9 @@ private:
     }
 
     std::string_view text_;
+    KeyComparison comparison_;
     size_t pos_ = 0;
+    size_t depth_ = 0;
 };
 
 void SerializeString(const std::string& s, std::string& out) {
@@ -398,6 +548,9 @@ void SerializeValue(const value& v, std::string& out) {
     } else if (v.is_uint64()) {
         out += std::to_string(v.as_uint64());
     } else if (v.is_double()) {
+        if (!std::isfinite(v.as_double())) {
+            throw std::invalid_argument("json number must be finite");
+        }
         out += std::format("{}", v.as_double());
     } else if (v.is_string()) {
         SerializeString(v.as_string(), out);
@@ -426,8 +579,8 @@ void SerializeValue(const value& v, std::string& out) {
 
 }  // namespace
 
-value parse(std::string_view text) {
-    return Parser(text).Parse();
+value parse(std::string_view text, KeyComparison comparison) {
+    return Parser(text, comparison).Parse();
 }
 
 std::string serialize(const value& v) {
@@ -436,4 +589,4 @@ std::string serialize(const value& v) {
     return out;
 }
 
-}  // namespace acpp::json
+}  // namespace json

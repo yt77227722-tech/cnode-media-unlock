@@ -2,23 +2,66 @@
 #include "../../common/monitor_loop.hpp"
 #include "node_transaction.hpp"
 #include "node_runtime.hpp"
+#include "panel_inbound.hpp"
 #include "panel_schedule.hpp"
+#include "../../proxy/freedom/freedom_outbound.hpp"
 
-#include "acppnode/core/naming.hpp"
-#include "acppnode/infra/log.hpp"
+#include "app/prepared_inbound.hpp"
+#include "core/constants.hpp"
+#include "core/naming.hpp"
+#include "infra/log.hpp"
 
 #include <algorithm>
 #include <chrono>
 #include <exception>
 #include <format>
 #include <stdexcept>
+#include <utility>
+#include <variant>
 
-namespace acpp {
 
+namespace {
+
+[[nodiscard]] proxyman::outbound::PreparedOutboundConfig BuildPanelAutoOutbound(
+    const std::string& tag,
+    const PanelConfig& panel_config) {
+    proxy::freedom::outbound::FreedomSettings settings;
+    settings.domain_strategy = panel_config.EnableDNS
+        ? panel_config.DNSType : proxy::freedom::outbound::DomainStrategy::AsIs;
+    return proxyman::outbound::PreparedOutboundConfig{
+        .tag = tag,
+        .protocol = std::string(constants::protocol::kFreedom),
+        // The panel sendIP is the auto outbound Handler's sendThrough.
+        .sender = OutboundSenderSettings{
+            .stream_settings = {},
+            .send_through = panel_config.SendIP,
+        },
+        .create = proxy::freedom::outbound::PrepareOutbound(std::move(settings)),
+    };
+}
+
+std::unique_ptr<api::API> ValidatePanelRuntimeArgs(
+    std::unique_ptr<api::API> api, const PanelConfig& source) {
+    if (!api || source.Name.empty() || source.NodeIDs.Values().size() != 1) {
+        throw std::invalid_argument("panel runtime requires a client, a name and one node ID");
+    }
+    return api;
+}
+
+[[nodiscard]] std::string_view ResolvedNodeNetwork(
+    const controller::NodeSnapshot& state) noexcept {
+    if (state.inbound) {
+        return state.inbound->receiver.stream_settings.network;
+    }
+    return state.config.TransportProtocol.empty()
+        ? constants::protocol::kTcp
+        : std::string_view(state.config.TransportProtocol);
+}
+
+}  // namespace
 Controller::Controller(net::io_context& io_context,
-                       const std::vector<std::unique_ptr<Worker>>& workers,
-                       const std::vector<std::unique_ptr<ConnectionLimiter>>& limiters)
-    : impl_(std::make_shared<Impl>(io_context, workers, limiters)) {}
+                       const std::vector<std::unique_ptr<Worker>>& workers)
+    : impl_(std::make_shared<Impl>(io_context, workers)) {}
 
 Controller::~Controller() = default;
 
@@ -31,32 +74,58 @@ void Controller::Start() {
     impl_->Start();
 }
 
+void Controller::RequestStop() noexcept {
+    impl_->RequestStop();
+}
+
+net::awaitable<void> Controller::AsyncJoin() {
+    co_await impl_->AsyncJoin();
+}
+
+net::awaitable<void> Controller::FlushTraffic() {
+    co_await impl_->FlushTraffic();
+}
+
 std::vector<Controller::NodeStatsInfo> Controller::GetNodeStats() const {
     return impl_->GetNodeStats();
 }
 
 Controller::Impl::Impl(net::io_context& io_context,
-                       const std::vector<std::unique_ptr<Worker>>& workers,
-                       const std::vector<std::unique_ptr<ConnectionLimiter>>& limiters)
+                       const std::vector<std::unique_ptr<Worker>>& workers)
     : io_context_(io_context)
-    , workers_(workers)
-    , limiters_(limiters) {}
+    , workers_(workers) {}
 
 Controller::Impl::PanelRuntime::PanelRuntime(
-    std::unique_ptr<api::API> api, const PanelConfig& source)
-    : client(std::move(api)), config(source) {
-    if (!client || config.Name.empty() || config.NodeIDs.Values().size() != 1) {
-        throw std::invalid_argument("panel runtime requires a client, a name and one node ID");
+    std::unique_ptr<api::API> api, const PanelConfig& source,
+    controller::NodeMutationGate& gate, net::any_io_executor executor)
+    : client(ValidatePanelRuntimeArgs(std::move(api), source))
+    , config(source)
+    , accounting_key(naming::BuildPanelNodeAccountingKey(config.Name, config.NodeIDs.Front()))
+    , mutation(gate, std::move(executor), node) {
+    traffic_journal = std::make_unique<controller::TrafficJournal>(config);
+    const auto unknown = traffic_journal->UnknownCount();
+    if (unknown != 0) {
+        const PanelLogContext log_context{config.Name, config.APIHost, config.NodeIDs.Front(), config.NodeType};
+        LOG_PANEL_ERROR(log_context, "Traffic accounting requires reconciliation: unknown_records={} directory={}",
+                        unknown, traffic_journal->Directory().string());
     }
 }
 
 void Controller::Impl::AddPanel(std::unique_ptr<api::API> panel,
                                 const PanelConfig& panel_config) {
+    ThrowIfStopping();
     // Construct the complete entity before publishing it to the owner.
-    panels_.push_back(std::make_unique<PanelRuntime>(std::move(panel), panel_config));
+    auto runtime = std::make_unique<PanelRuntime>(
+        std::move(panel), panel_config, node_mutations_, io_context_.get_executor());
+    if (!journal_executor_) {
+        journal_executor_ = std::make_unique<controller::JournalExecutor>();
+    }
+    panels_.push_back(std::move(runtime));
 }
 
 void Controller::Impl::Start() {
+    if (stopping_) return;
+    node_mutations_.Seal();
     enum class LoopKind { Sync, Status };
     for (auto& entry : panels_) {
         auto* panel = entry.get();
@@ -74,19 +143,22 @@ void Controller::Impl::Start() {
                         ? self->panelSyncLoop(*panel) : self->panelStatusLoop(*panel);
                 },
                 [self, panel, kind](std::string_view loop_name, std::exception_ptr failure) {
+                    if (self->stopping_ && !failure) return;
+                    const PanelLogContext log_context{panel->config.Name, panel->config.APIHost,
+                        panel->config.NodeIDs.Front(), panel->config.NodeType};
                     if (kind == LoopKind::Sync) {
                         panel->state = PanelState::Unavailable;
                     }
                     if (!failure) {
-                        LOG_WARN("Panel {} monitor: stopped", loop_name);
+                        LOG_PANEL_WARN(log_context, "Panel monitor stopped unexpectedly: loop={}", loop_name);
                         return;
                     }
                     try {
                         std::rethrow_exception(failure);
                     } catch (const std::exception& error) {
-                        LOG_ERROR("Panel {} monitor: failed | {}", loop_name, error.what());
+                        LOG_PANEL_ERROR(log_context, "Panel monitor failed: loop={} reason={}", loop_name, error.what());
                     } catch (...) {
-                        LOG_ERROR("Panel {} monitor: failed | unknown exception", loop_name);
+                        LOG_PANEL_ERROR(log_context, "Panel monitor failed: loop={} reason=unknown exception", loop_name);
                     }
                 });
             slot = loop;
@@ -95,17 +167,44 @@ void Controller::Impl::Start() {
     }
 }
 
+void Controller::Impl::RequestStop() noexcept {
+    if (stopping_) return;
+    stopping_ = true;
+    node_mutations_.Close();
+    for (const auto& panel : panels_) {
+        if (auto loop = panel->sync_loop.lock()) loop->RequestStop();
+        if (auto loop = panel->status_loop.lock()) loop->RequestStop();
+    }
+}
+
+net::awaitable<void> Controller::Impl::AsyncJoin() {
+    co_await net::this_coro::reset_cancellation_state(net::disable_cancellation());
+    for (const auto& panel : panels_) {
+        if (auto loop = panel->sync_loop.lock()) co_await loop->AsyncJoin();
+        if (auto loop = panel->status_loop.lock()) co_await loop->AsyncJoin();
+    }
+}
+
+void Controller::Impl::ThrowIfStopping() const {
+    if (stopping_) throw IoSystemError(net::error::operation_aborted);
+}
+
 std::vector<Controller::NodeStatsInfo> Controller::Impl::GetNodeStats() const {
     std::vector<NodeStatsInfo> result;
     result.reserve(panels_.size());
     for (const auto& panel : panels_) {
-        if (!panel->node.committed) continue;
+        if (!panel->node.committed ||
+            panel->node.phase != controller::NodeRuntimePhase::Ready) {
+            continue;
+        }
         const auto& state = *panel->node.committed;
 
         NodeStatsInfo info;
         info.panel_name  = panel->config.Name;
+        info.panel_host  = panel->config.APIHost;
+        info.node_type   = panel->config.NodeType;
         info.node_id     = panel->config.NodeIDs.Front();
-        info.network    = state.config.TransportProtocol;
+        info.network      = std::string(ResolvedNodeNetwork(state));
         info.port       = state.config.Port;
         info.total_users  = state.users.size();
         info.online_users = panel->stats.online_count;
@@ -119,8 +218,8 @@ std::vector<Controller::NodeStatsInfo> Controller::Impl::GetNodeStats() const {
 net::awaitable<void> Controller::Impl::panelSyncLoop(
     PanelRuntime& panel) {
     using Clock = std::chrono::steady_clock;
-    const int node_id = panel.config.NodeIDs.Front();
-    const auto& panel_name = panel.config.Name;
+    const PanelLogContext log_context{panel.config.Name, panel.config.APIHost,
+        panel.config.NodeIDs.Front(), panel.config.NodeType};
     auto next_pull = Clock::now();
     // Match v2node reporting semantics: the first traffic/online snapshot
     // needs one complete push interval to accumulate meaningful activity.
@@ -143,24 +242,31 @@ net::awaitable<void> Controller::Impl::panelSyncLoop(
     };
 
     for (;;) {
+        if (stopping_) co_return;
         auto now = Clock::now();
         if (now >= next_pull) {
             try {
                 co_await nodeInfoMonitor(panel);
             } catch (const std::exception& e) {
+                if (stopping_) throw;
                 panel.state = PanelState::Unavailable;
-                LOG_WARN("Panel {}/{} sync: unavailable | pull | {}",
-                         panel_name,
-                         node_id,
-                         e.what());
+                LOG_PANEL_ERROR(log_context, "Panel sync unavailable: operation=pull reason={}", e.what());
+                if (panel.node.HasPendingCleanup()) {
+                    LOG_PANEL_ERROR(log_context, "Panel sync requires recovery: pending runtime cleanup");
+                }
             } catch (...) {
+                if (stopping_) throw;
                 panel.state = PanelState::Unavailable;
-                LOG_WARN("Panel {}/{} sync: unavailable | pull | unknown error",
-                         panel_name,
-                         node_id);
+                LOG_PANEL_ERROR(log_context, "Panel sync unavailable: operation=pull reason=unknown error");
+                if (panel.node.HasPendingCleanup()) {
+                    LOG_PANEL_ERROR(log_context, "Panel sync requires recovery: pending runtime cleanup");
+                }
             }
             now = Clock::now();
-            next_pull = now + interval(true);
+            const auto pull_delay = panel.node.HasPendingCleanup()
+                ? std::min(interval(true), std::chrono::seconds(1))
+                : interval(true);
+            next_pull = now + pull_delay;
             if (panel.node.committed && panel.node.phase == controller::NodeRuntimePhase::Ready) {
                 const auto scheduled_push = now + interval(false);
                 if (next_push == Clock::time_point::max()) {
@@ -173,21 +279,18 @@ net::awaitable<void> Controller::Impl::panelSyncLoop(
             }
         }
 
+        if (stopping_) co_return;
         now = Clock::now();
         if (now >= next_push) {
             if (panel.node.committed && panel.node.phase == controller::NodeRuntimePhase::Ready) {
-                const std::string& tag = panel.node.committed->tag;
                 try {
-                    co_await userInfoMonitor(panel, tag);
+                    co_await userInfoMonitor(panel, panel.node.committed->tag);
                 } catch (const std::exception& e) {
-                    LOG_WARN("Panel {}/{} report: unavailable | {}",
-                             panel_name,
-                             node_id,
-                             e.what());
+                    if (stopping_) throw;
+                    LOG_PANEL_WARN(log_context, "Panel report unavailable: operation=push reason={}", e.what());
                 } catch (...) {
-                    LOG_WARN("Panel {}/{} report: unavailable | unknown error",
-                             panel_name,
-                             node_id);
+                    if (stopping_) throw;
+                    LOG_PANEL_WARN(log_context, "Panel report unavailable: operation=push reason=unknown error");
                 }
             }
             next_push = Clock::now() + interval(false);
@@ -204,6 +307,7 @@ net::awaitable<void> Controller::Impl::panelStatusLoop(const PanelRuntime& panel
     auto next_status = Clock::now();
     net::steady_timer timer(io_context_);
     for (;;) {
+        if (stopping_) co_return;
         // Read the last committed state on the controller executor. No snapshot
         // reference crosses the wait, and no network request delays this loop.
         logPanelStatus(panel);
@@ -221,161 +325,144 @@ net::awaitable<void> Controller::Impl::panelStatusLoop(const PanelRuntime& panel
 net::awaitable<void> Controller::Impl::nodeInfoMonitor(PanelRuntime& panel) {
     const int node_id = panel.config.NodeIDs.Front();
     const auto& panel_name = panel.config.Name;
+    const PanelLogContext log_context{panel_name, panel.config.APIHost, node_id, panel.config.NodeType};
 
-    controller::NodeRuntime runtime(io_context_, workers_, limiters_, panel.config);
+    controller::NodeRuntime runtime(io_context_, workers_, panel.config, panel.node, stopping_);
 
     // One pull attempt is made for each scheduler invocation.
-    {
-        try {
-            // Cleanup depends only on retained local snapshots, so a failing or
-            // unavailable panel cannot indefinitely retain orphan resources.
-            co_await controller::CleanPendingNodeRuntime(runtime, panel.node);
-            auto config_result = co_await panel.client->GetNodeInfo();
-            if (!config_result.Ok()) {
-                throw std::runtime_error(ErrorMessage(config_result.error, config_result.error_msg));
-            }
+    // Cleanup depends only on retained local snapshots, so a failing or
+    // unavailable panel cannot indefinitely retain orphan resources.
+    if (panel.node.HasPendingCleanup()) {
+        auto lease = co_await node_mutations_.Acquire(panel.mutation);
+        ThrowIfStopping();
+        co_await controller::CleanPendingNodeRuntime(runtime, panel.node);
+    }
+    ThrowIfStopping();
+    const auto old_state = panel.node.committed;
+    auto config_result = co_await panel.client->GetNodeInfo(
+        old_state ? old_state->config_etag : std::string{});
+    ThrowIfStopping();
+    if (!config_result.Ok()) {
+        throw std::runtime_error(ErrorMessage(config_result.error, config_result.error_msg));
+    }
 
-            const api::NodeInfo& fetched_config = *config_result.node_info;
+    if (config_result.not_modified && !old_state) {
+        throw std::runtime_error("node not modified without a committed snapshot");
+    }
+    const api::NodeInfo& fetched_config = config_result.not_modified
+        ? old_state->config : *config_result.node_info;
+    const std::string& protocol = fetched_config.NodeType;
+    const std::string tag = naming::BuildPanelNodeTag(
+        panel_name, node_id, protocol, fetched_config.Port);
 
-            const std::string protocol =
-                naming::ResolveProtocolOrDefault(fetched_config.NodeType);
-            const std::string tag = naming::BuildPanelNodeTag(
-                panel_name, node_id, protocol, fetched_config.Port);
+    const api::NodeInfo* old_config =
+        old_state ? &old_state->config : nullptr;
+    const bool old_started = panel.node.phase == controller::NodeRuntimePhase::Ready;
+    const auto transition = controller::PlanNodeTransition(
+        old_config,
+        old_started,
+        fetched_config);
+    const bool transitioning = transition.Transitioning();
 
-            const auto old_state = panel.node.committed;
-            const api::NodeInfo* old_config =
-                old_state ? &old_state->config : nullptr;
-            const bool old_started = panel.node.phase == controller::NodeRuntimePhase::Ready;
-            const auto transition = controller::PlanNodeTransition(
-                old_config,
-                old_started,
-                fetched_config);
-            const bool transitioning = transition.Transitioning();
+    if (transition.mode == controller::NodeTransitionMode::StageNewEndpoint
+        || transition.mode == controller::NodeTransitionMode::ReplaceInPlace
+        || transition.mode == controller::NodeTransitionMode::SwapSameEndpoint) {
+        LOG_PANEL_INFO(log_context, "Panel configuration changed; recreating inbound");
+    }
 
-            if (transition.mode == controller::NodeTransitionMode::StageNewEndpoint
-                || transition.mode == controller::NodeTransitionMode::ReplaceInPlace
-                || transition.mode == controller::NodeTransitionMode::SwapSameEndpoint) {
-                LOG_CONSOLE("Panel {}/{} config: changed | recreate",
-                            panel_name, node_id);
-            }
+    const bool replace_rules = !config_result.not_modified || transitioning;
 
-            auto rules_result = co_await panel.client->GetNodeRule();
-            std::optional<std::vector<api::DetectRule>> next_rules;
-            if (!rules_result.Ok()) {
-                if (transitioning) {
-                    throw std::runtime_error(ErrorMessage(
-                        rules_result.error, rules_result.error_msg));
-                }
-                LOG_WARN("Panel {}/{} sync: degraded | rules | {}",
-                         panel_name, node_id,
-                         rules_result.error_msg.empty()
-                            ? ErrorCodeToString(rules_result.error)
-                            : rules_result.error_msg);
-            } else if (rules_result.not_modified) {
-                if (transitioning) {
-                    if (!old_state) {
-                        throw std::runtime_error(
-                            "panel returned rules not modified without a committed rule snapshot");
-                    }
-                    next_rules = old_state->rules;
-                }
-            } else {
-                next_rules = std::move(rules_result.rules);
-            }
+    auto users_result = co_await panel.client->GetUserList(
+        old_state ? old_state->users_etag : std::string{});
+    ThrowIfStopping();
+    std::optional<std::vector<api::UserInfo>> next_users;
+    if (!users_result.Ok()) {
+        if (transitioning) {
+            throw std::runtime_error(ErrorMessage(
+                users_result.error, users_result.error_msg));
+        }
+        LOG_PANEL_WARN(log_context, "Panel sync degraded: operation=pull resource=users reason={}",
+                 users_result.error_msg.empty()
+                    ? ErrorCodeToString(users_result.error)
+                    : users_result.error_msg);
+    } else if (users_result.not_modified) {
+        if (!old_state) {
+            throw std::runtime_error(
+                "panel returned users not modified without a committed user snapshot");
+        }
+    } else {
+        next_users = std::move(users_result.users);
+    }
 
-            auto users_result = co_await panel.client->GetUserList(
-                old_state ? old_state->users_etag : std::string{});
-            std::optional<std::vector<api::UserInfo>> next_users;
-            if (!users_result.Ok()) {
-                if (transitioning) {
-                    throw std::runtime_error(ErrorMessage(
-                        users_result.error, users_result.error_msg));
-                }
-                LOG_WARN("Panel {}/{} sync: degraded | users | {}",
-                         panel_name, node_id,
-                         users_result.error_msg.empty()
-                            ? ErrorCodeToString(users_result.error)
-                            : users_result.error_msg);
-            } else if (users_result.not_modified) {
-                if (transitioning) {
-                    if (!old_state) {
-                        throw std::runtime_error(
-                            "panel returned users not modified without a committed user snapshot");
-                    }
-                    next_users = old_state->users;
-                }
-            } else {
-                next_users = std::move(users_result.users);
-            }
-
-            if (transitioning && (!next_users || !next_rules)) {
-                throw std::runtime_error("candidate node has no complete user and rule snapshot");
-            }
-            auto candidate = std::make_shared<controller::NodeSnapshot>();
-            candidate->config = fetched_config;
-            candidate->protocol = protocol;
-            candidate->tag = tag;
-            candidate->users = next_users ? std::move(*next_users) : old_state->users;
-            candidate->users_etag = next_users
-                ? std::move(users_result.etag) : old_state->users_etag;
-            candidate->rules = next_rules ? std::move(*next_rules) : old_state->rules;
-
-            controller::PreparedNodeChange change;
-            change.next = std::move(candidate);
-            change.replace_users = next_users.has_value();
-            change.replace_rules = next_rules.has_value();
-            if (change.replace_users) {
-                auto users = BuildUsersForInbound(protocol, tag, change.next->config, change.next->users);
-                if (!users) throw std::runtime_error("failed to build candidate user snapshot");
-                change.users = std::move(*users);
-            }
-            if (old_state && (transitioning || change.replace_users)) {
-                change.previous_users = BuildUsersForInbound(
-                    old_state->protocol, old_state->tag, old_state->config, old_state->users);
-                if (!change.previous_users) {
-                    throw std::runtime_error("failed to build rollback user snapshot");
-                }
-            }
-            // Candidate data and authentication payloads are complete before
-            // entering the transaction's first runtime mutation.
-            // The initial local cleanup finished before this panel pull. With
-            // no pending cleanup, ApplyNodeChange records {old, next} before
-            // its first suspension. Admission and reservation are therefore
-            // one uninterrupted step on the controller executor, covering all
-            // Workers without sharing their live listener state.
-            if (panel.node.HasPendingCleanup()) {
-                throw std::logic_error("node admission requires completed local cleanup");
-            }
-            for (const auto& other : panels_) {
-                if (other.get() != &panel && other->node.ReservesPort(fetched_config.Port) &&
-                    other->config.ListenIP.Overlaps(panel.config.ListenIP)) {
-                    throw std::runtime_error(std::format(
-                        "panel listener endpoint conflict owner={}/{} port={}",
-                        other->config.Name, other->config.NodeIDs.Front(), fetched_config.Port));
-                }
-            }
-            co_await controller::ApplyNodeChange(runtime, panel.node, std::move(change));
-            if (transitioning) {
-                LOG_CONSOLE("Panel {}/{} config: ready | {} | replaced {}",
-                    panel_name, node_id, tag, old_state ? "yes" : "no");
-            }
-            panel.state = rules_result.Ok() && users_result.Ok()
-                ? PanelState::Ready : PanelState::Degraded;
-        } catch (const std::exception& e) {
-            panel.state = PanelState::Unavailable;
-            LOG_ERROR("Panel {}/{} sync: unavailable | pull | {}",
-                panel_name, node_id, e.what());
-            if (panel.node.HasPendingCleanup()) {
-                LOG_ERROR("Panel {}/{} sync: recovery required | pending runtime cleanup",
-                    panel_name, node_id);
-            }
+    if (!transitioning && config_result.not_modified && !next_users) {
+        panel.state = users_result.Ok() ? PanelState::Ready : PanelState::Degraded;
+        co_return;
+    }
+    auto candidate = std::make_shared<controller::NodeSnapshot>();
+    candidate->config = fetched_config;
+    candidate->config_etag = config_result.not_modified
+        ? old_state->config_etag : std::move(config_result.etag);
+    candidate->protocol = protocol;
+    candidate->tag = tag;
+    candidate->users = next_users ? std::move(*next_users) : old_state->users;
+    candidate->users_etag = next_users
+        ? std::move(users_result.etag) : old_state->users_etag;
+    candidate->rules = config_result.not_modified
+        ? old_state->rules : std::move(config_result.rules);
+    const bool rebuild_settings = !old_state ||
+        controller::NodeConfigChanged(old_state->config, candidate->config);
+    if (rebuild_settings) {
+        candidate->inbound = std::make_shared<const PreparedInbound>(PrepareInbound(
+            controller::MapPanelInbound(panel.config, candidate->config, candidate->users)));
+        candidate->outbound =
+            std::make_shared<const proxyman::outbound::PreparedOutboundConfig>(
+                BuildPanelAutoOutbound(tag, panel.config));
+    } else if (next_users) {
+        // Only the users changed: keep every prepared setting and rebuild the
+        // authentication payload through the same per-protocol builder.
+        auto inbound = std::make_shared<PreparedInbound>(*old_state->inbound);
+        inbound->users = PrepareInboundUsers(
+            inbound->build_request,
+            controller::MapPanelUsers(candidate->config, candidate->users));
+        candidate->inbound = std::move(inbound);
+        candidate->outbound = old_state->outbound;
+    } else {
+        candidate->inbound = old_state->inbound;
+        candidate->outbound = old_state->outbound;
+    }
+    controller::PreparedNodeChange change;
+    change.replace_users = next_users.has_value() || transitioning;
+    change.replace_rules = replace_rules;
+    change.next = std::move(candidate);
+    // Candidate data and authentication payloads are complete before
+    // entering the transaction's first runtime mutation.
+    // Hold fair admission before checking endpoints: another panel may
+    // commit or retain recovery reservations while this one waits.
+    auto lease = co_await node_mutations_.Acquire(panel.mutation);
+    ThrowIfStopping();
+    if (panel.node.HasPendingCleanup()) {
+        throw std::logic_error("node admission requires completed local cleanup");
+    }
+    for (const auto& other : panels_) {
+        if (other.get() != &panel && other->node.ReservesPort(fetched_config.Port) &&
+            other->config.ListenIP.Overlaps(panel.config.ListenIP)) {
+            throw std::runtime_error(std::format(
+                "panel listener endpoint conflict owner={}/{} port={}",
+                other->config.Name, other->config.NodeIDs.Front(), fetched_config.Port));
         }
     }
+    co_await controller::ApplyNodeChange(runtime, panel.node, std::move(change));
+    ThrowIfStopping();
+    if (transitioning) {
+        LOG_PANEL_INFO(log_context, "Panel configuration ready: tag={} replaced={}",
+            tag, old_state ? "yes" : "no");
+    }
+    panel.state = users_result.Ok() ? PanelState::Ready : PanelState::Degraded;
 }
 
 void Controller::Impl::logPanelStatus(const PanelRuntime& panel) const {
-    const int node_id = panel.config.NodeIDs.Front();
-    const auto& panel_name = panel.config.Name;
+    const PanelLogContext log_context{panel.config.Name, panel.config.APIHost,
+        panel.config.NodeIDs.Front(), panel.config.NodeType};
     const std::string_view state_text = [&]() -> std::string_view {
         switch (panel.state) {
             case PanelState::Connecting: return "connecting";
@@ -396,39 +483,29 @@ void Controller::Impl::logPanelStatus(const PanelRuntime& panel) const {
     }();
 
     if (!panel.node.committed) {
-        LOG_CONSOLE(
-            "Panel {}/{} status: {} | inbound {} | {} | {}",
-            panel_name,
-            node_id,
-            state_text,
-            runtime_text,
-            panel.config.NodeType,
-            panel.config.APIHost);
+        LOG_PANEL_INFO(log_context, "Panel status: state={} inbound={} protocol={}",
+            state_text, runtime_text, panel.config.NodeType);
         return;
     }
 
     const auto& committed_state = *panel.node.committed;
-    const std::string protocol =
-        naming::ResolveProtocolOrDefault(committed_state.config.NodeType);
+    const auto& protocol = committed_state.protocol;
     const auto pull_interval = controller::PanelInterval(
         committed_state.config.PullInterval,
         defaults::kPanelPullInterval);
     const auto push_interval = controller::PanelInterval(
         committed_state.config.PushInterval,
         defaults::kPanelPushInterval);
-    LOG_CONSOLE(
-        "Panel {}/{} status: {} | inbound {} | {}:{} | users {} | rules {} | "
-        "pull/push {}s/{}s",
-        panel_name,
-        node_id,
+    LOG_PANEL_INFO(log_context,
+        "Panel status: state={} inbound={} protocol={} port={} network={} users={} rules={} pull={}s push={}s",
         state_text,
         runtime_text,
         protocol,
         committed_state.config.Port,
+        ResolvedNodeNetwork(committed_state),
         committed_state.users.size(),
         committed_state.rules.size(),
         pull_interval.count(),
         push_interval.count());
 }
 
-}  // namespace acpp

@@ -1,3 +1,5 @@
+#include <gtest/gtest.h>
+
 #include "trojan_codec.hpp"
 #include "credentials.hpp"
 
@@ -36,16 +38,16 @@ void TestHashes() {
         Case{std::string_view("abc\0def", 7), "9b3030a75bfb2320856e6771506932143aa261104c0eaa982f0f6d12"},
     };
     for (const auto& item : cases) {
-        const auto hash = acpp::trojan::HashPassword(item.password);
+        const auto hash = ::trojan::HashPassword(item.password);
         Check(std::string_view(hash.data(), hash.size()) == item.expected, "SHA224 credential vector mismatch");
     }
 }
 
-void TestRequest(acpp::trojan::TrojanCommand command, const acpp::TargetAddress& target,
+void TestRequest(::trojan::TrojanCommand command, const ::TargetAddress& target,
                  std::span<const uint8_t> encoded_address) {
     constexpr std::string_view expected_hash = "95c7fbca92ac5083afda62a564a3d014fc3b72c9140e3cb99ea6bf12";
     std::string password = "secret";
-    const auto hash = acpp::trojan::HashPassword(password);
+    const auto hash = ::trojan::HashPassword(password);
     password.assign("different password after preparation");
     constexpr std::array<uint8_t, 3> payload{0, 0xff, 0x31};
     std::vector<uint8_t> expected(expected_hash.begin(), expected_hash.end());
@@ -57,22 +59,38 @@ void TestRequest(acpp::trojan::TrojanCommand command, const acpp::TargetAddress&
     expected.insert(expected.end(), payload.begin(), payload.end());
     std::array<uint8_t, 512> output{};
     reject_allocation = true;
-    const auto length = acpp::trojan::TrojanCodec::EncodeRequestTo(
+    const auto length = ::trojan::EncodeRequestTo(
         hash, command, target, output.data(), output.size(), payload.data(), payload.size());
     reject_allocation = false;
     Check(length == expected.size(), "request size mismatch");
     Check(std::equal(expected.begin(), expected.end(), output.begin()), "Trojan wire bytes changed");
 
-    size_t consumed = 0;
-    const auto parsed = acpp::trojan::TrojanCodec::ParseRequest(output.data(), length, consumed);
-    Check(parsed && consumed == header_size, "request parser did not preserve trailing payload");
-    Check(parsed->command == command && parsed->target.ToString() == target.ToString(), "request metadata changed");
-    Check(std::string_view(parsed->password_hash.data(), parsed->password_hash.size()) == expected_hash,
-          "authentication digest changed");
+    using ::trojan::RequestDecodeStatus;
+    const auto decoded = ::trojan::DecodeRequest(std::span<const uint8_t>(output.data(), length));
+    Check(decoded.status == RequestDecodeStatus::Complete && decoded.consumed == header_size,
+          "request parser did not preserve trailing payload");
+    Check(decoded.request.command == command && decoded.request.target.SameEndpoint(target),
+          "request metadata changed");
+    Check(decoded.request.PasswordHashView() == expected_hash, "authentication digest changed");
+
+    // Each Incomplete result names the next boundary and never asks past the
+    // header, so a reader driven by it cannot consume payload bytes.
+    size_t available = 0;
+    for (;;) {
+        const auto step = ::trojan::DecodeRequest(std::span<const uint8_t>(output.data(), available));
+        if (step.status == RequestDecodeStatus::Complete) {
+            Check(step.consumed == header_size, "incremental Trojan decode consumed a different header");
+            break;
+        }
+        Check(step.status == RequestDecodeStatus::Incomplete && step.required > available &&
+                  step.required <= header_size,
+              "incremental Trojan decode asked beyond the request header");
+        available = step.required;
+    }
 
     output.fill(0x5a);
     reject_allocation = true;
-    const auto short_length = acpp::trojan::TrojanCodec::EncodeRequestTo(
+    const auto short_length = ::trojan::EncodeRequestTo(
         hash, command, target, output.data(), expected.size() - 1, payload.data(), payload.size());
     reject_allocation = false;
     Check(short_length == 0 && std::all_of(output.begin(), output.end(), [](auto b) { return b == 0x5a; }),
@@ -80,21 +98,21 @@ void TestRequest(acpp::trojan::TrojanCommand command, const acpp::TargetAddress&
 }
 }  // namespace
 
-int main() {
+TEST(TrojanRequest, Contract) {
     try {
         TestHashes();
         constexpr std::array<uint8_t, 5> ipv4{1, 127, 0, 0, 1};
         constexpr std::array<uint8_t, 17> ipv6{4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1};
         constexpr std::array<uint8_t, 13> domain{3, 11, 'e','x','a','m','p','l','e','.','c','o','m'};
-        for (const auto command : {acpp::trojan::TrojanCommand::CONNECT, acpp::trojan::TrojanCommand::UDP_ASSOCIATE}) {
-            TestRequest(command, acpp::TargetAddress(acpp::net::ip::make_address("127.0.0.1"), 443), ipv4);
-            TestRequest(command, acpp::TargetAddress(acpp::net::ip::make_address("::1"), 53), ipv6);
-            TestRequest(command, acpp::TargetAddress(std::string_view("example.com"), 443), domain);
+        for (const auto command : {::trojan::TrojanCommand::CONNECT, ::trojan::TrojanCommand::UDP_ASSOCIATE}) {
+            TestRequest(command, ::TargetAddress(::net::ip::make_address("127.0.0.1"), 443), ipv4);
+            TestRequest(command, ::TargetAddress(::net::ip::make_address("::1"), 53), ipv6);
+            TestRequest(command, ::TargetAddress(std::string_view("example.com"), 443), domain);
         }
         std::cout << "Trojan SHA224 vectors and TCP/UDP IPv4/IPv6/domain wire bytes passed without C++ encoding allocations\n";
     } catch (const std::exception& error) {
         reject_allocation = false;
         std::cerr << "Trojan request encoding failed with C++ allocations disabled: " << error.what() << '\n';
-        return 1;
+        FAIL() << error.what();
     }
 }

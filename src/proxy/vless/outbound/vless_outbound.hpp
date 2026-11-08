@@ -1,76 +1,66 @@
 #pragma once
 
-#include "acppnode/proxy/outbound.hpp"
-#include "acppnode/transport/internet/stream_settings.hpp"
-#include "acppnode/transport/internet/outbound_bind.hpp"
+#include "proxy/outbound.hpp"
+#include "transport/internet/outbound_sender.hpp"
 
 #include <array>
+#include "common/unsafe.hpp"
 #include <chrono>
 #include <cstdint>
 #include <memory>
-#include <optional>
-#include <span>
 #include <string>
-#include <string_view>
 
-namespace acpp {
-
-namespace app::dns {
-class DNS;
-}  // namespace app::dns
+class ExecutionDomain;
 
 namespace vless {
 struct VlessEncryptionConfig;
 struct VlessEncryptionClientTicketCache;
 }  // namespace vless
 
+// 传输层与 sendThrough 属于 Handler 的 sender settings。
 struct VlessOutboundConfig {
-    std::string address;
-    std::optional<net::ip::address> literal_address;
-    uint16_t port = 443;
+    OutboundServer server;
     std::array<uint8_t, 16> uuid_bytes{};
     std::shared_ptr<const vless::VlessEncryptionConfig> encryption;
     std::string flow;
     bool packet_xudp = true;
     bool packet_addr = false;
 
-    StreamSettings stream_settings;
-    OutboundBind send_through;
-    std::chrono::seconds timeout{10};
+    VlessOutboundConfig() = default;
+    VlessOutboundConfig(const VlessOutboundConfig&) = default;
+    VlessOutboundConfig& operator=(const VlessOutboundConfig&) = default;
+    VlessOutboundConfig(VlessOutboundConfig&&) noexcept = default;
+    VlessOutboundConfig& operator=(VlessOutboundConfig&&) noexcept = default;
+    ~VlessOutboundConfig() noexcept {
+        ::SecureZeroMemory(uuid_bytes.data(), uuid_bytes.size());
+    }
 };
 
 namespace proxy::vless::outbound {
 
-class Handler final : public ::acpp::Outbound {
+class Handler final : public ::Outbound {
 public:
-    Handler(std::string tag,
-            const ::acpp::VlessOutboundConfig& config,
-            ::acpp::app::dns::DNS& dns_service);
+    explicit Handler(std::shared_ptr<const ::VlessOutboundConfig> config);
 
     ~Handler() override;
 
-    ::acpp::net::awaitable<::acpp::OutboundProcessResult> Process(
-        ::acpp::net::io_context& io_context,
-        const ::acpp::tcp::endpoint* inbound_local_addr,
-        ::acpp::session::Context& ctx,
-        const ::acpp::TimeoutsConfig& timeouts,
-        ::acpp::transport::Link inbound,
-        ::acpp::StatsShard& stats,
-        const ::acpp::RelayConfig& relay_config,
-        ::acpp::buf::MultiBuffer first_payload,
+    ::net::awaitable<::OutboundProcessResult> Process(
+        ::session::Context& ctx,
+        ::transport::Link inbound,
+        ::OutboundDialer& dialer,
+        const ::TimeoutsConfig& timeouts,
+        ::StatsShard& stats,
+        const ::RelayConfig& relay_config,
+        ::buf::MultiBufferBatch first_payload,
         std::chrono::seconds relay_idle_timeout,
         std::chrono::seconds relay_write_timeout) override;
 
-    std::string_view Tag() const noexcept override { return tag_; }
-
 private:
-    std::string tag_;
-    const ::acpp::VlessOutboundConfig config_;
-    ::acpp::app::dns::DNS& dns_service_;
-    std::unique_ptr<::acpp::vless::VlessEncryptionClientTicketCache>
-        encryption_tickets_;
+    std::shared_ptr<const ::VlessOutboundConfig> config_;
+    std::shared_ptr<::vless::VlessEncryptionClientTicketCache> encryption_tickets_;
+    std::weak_ptr<ExecutionDomain> ticket_domain_;
+    bool has_ticket_domain_ = false;
 };
 
 }  // namespace proxy::vless::outbound
 
-}  // namespace acpp

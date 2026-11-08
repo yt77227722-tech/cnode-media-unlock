@@ -1,6 +1,6 @@
 #include "ss_outbound_credentials.hpp"
 
-namespace acpp::proxy::shadowsocks::outbound {
+namespace proxy::shadowsocks::outbound {
 
 std::optional<Credentials> Credentials::Prepare(
     std::string_view method, std::string_view password) {
@@ -8,8 +8,8 @@ std::optional<Credentials> Credentials::Prepare(
     if (!cipher || password.empty()) {
         return std::nullopt;
     }
-    if (!ss::Is2022Cipher(*cipher)) {
-        auto key = ss::DeriveKey(std::string(password), cipher->key_size);
+    if (!ss::Is2022Cipher(cipher->type)) {
+        auto key = ss::DeriveKey(password, cipher->key_size);
         if (key.size != cipher->key_size) {
             return std::nullopt;
         }
@@ -37,4 +37,4 @@ std::optional<Credentials> Credentials::Prepare(
     return Credentials(*cipher, master_key, std::move(chain));
 }
 
-}  // namespace acpp::proxy::shadowsocks::outbound
+}  // namespace proxy::shadowsocks::outbound

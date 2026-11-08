@@ -1,141 +1,114 @@
-#include "acppnode/common/rule.hpp"
+#include "common/rule.hpp"
 
-#include "acppnode/common/allocator.hpp"
-#include "acppnode/common/session.hpp"
-#include "acppnode/common/string_hash.hpp"
+#include "common/ip_utils.hpp"
+#include "common/session.hpp"
 
-#include <iterator>
+#include <algorithm>
+#include <charconv>
+#include <cstring>
+#include <optional>
 #include <regex>
-#include <string>
 
-namespace acpp::rule {
-namespace {
+namespace rule {
 
-using RuleList = memory::ThreadLocalVector<DetectRule>;
-using DetectResultList = memory::ThreadLocalVector<DetectResult>;
-using InboundRule =
-    memory::ThreadLocalUnorderedMap<memory::ThreadLocalString,
-                                    RuleList,
-                                    TransparentStringHash,
-                                    TransparentStringEq>;
-using InboundDetectResult =
-    memory::ThreadLocalUnorderedMap<memory::ThreadLocalString,
-                                    DetectResultList,
-                                    TransparentStringHash,
-                                    TransparentStringEq>;
+DetectRulePolicy::DetectRulePolicy()
+    : rules_(std::make_shared<const InboundRule>()) {}
+DetectRulePolicy::~DetectRulePolicy() = default;
 
-[[nodiscard]] bool ContainsResult(const memory::ThreadLocalVector<DetectResult>& results,
-                                  int64_t uid,
-                                  int rule_id) noexcept {
-    for (const auto& result : results) {
-        if (result.UID == uid && result.RuleID == rule_id) {
-            return true;
-        }
-    }
-    return false;
-}
-
-}  // namespace
-
-struct Manager::Impl {
-    InboundRule rules;
-    InboundDetectResult inbound_detect_result;
-};
-
-Manager::Manager()
-    : impl_(std::make_unique<Impl>()) {
-}
-
-Manager::~Manager() = default;
-Manager::Manager(Manager&&) noexcept = default;
-Manager& Manager::operator=(Manager&&) noexcept = default;
-
-void Manager::UpdateRule(std::string_view tag,
-                         const std::vector<DetectRule>& new_rule_list) {
-    if (tag.empty()) {
-        return;
-    }
-
+void DetectRulePolicy::UpdateRule(std::string_view tag,
+                                  std::vector<DetectRule> new_rule_list) {
+    if (tag.empty()) return;
+    const std::lock_guard lock(update_mutex_);
+    auto next = std::make_shared<InboundRule>(*rules_.load(std::memory_order_acquire));
     if (new_rule_list.empty()) {
-        if (auto it = impl_->rules.find(tag); it != impl_->rules.end()) {
-            impl_->rules.erase(it);
-        }
-        if (auto it = impl_->inbound_detect_result.find(tag);
-            it != impl_->inbound_detect_result.end()) {
-            impl_->inbound_detect_result.erase(it);
-        }
-        return;
+        if (auto it = next->find(tag); it != next->end()) next->erase(it);
+    } else {
+        next->insert_or_assign(std::string(tag), std::move(new_rule_list));
     }
-
-    auto it = impl_->rules.find(tag);
-    if (it == impl_->rules.end()) {
-        it = impl_->rules.try_emplace(memory::ThreadLocalString(tag)).first;
-    }
-    auto& rules = it->second;
-    rules.clear();
-    rules.reserve(new_rule_list.size());
-    for (const auto& rule : new_rule_list) {
-        rules.push_back(rule);
-    }
+    rules_.store(std::move(next), std::memory_order_release);
 }
 
-bool Manager::HasRule(std::string_view tag) const noexcept {
-    return impl_->rules.find(tag) != impl_->rules.end();
-}
-
-std::vector<DetectResult> Manager::GetDetectResult(std::string_view tag) {
-    std::vector<DetectResult> result;
-    auto it = impl_->inbound_detect_result.find(tag);
-    if (it == impl_->inbound_detect_result.end()) {
-        return result;
-    }
-
-    result.assign(std::make_move_iterator(it->second.begin()),
-                  std::make_move_iterator(it->second.end()));
-    impl_->inbound_detect_result.erase(it);
-    return result;
-}
-
-bool Manager::Blocked(const session::Context& ctx) {
+bool DetectRulePolicy::Blocked(const session::Context& ctx) {
     if (ctx.inbound.user_id <= 0) {
         return false;
     }
 
-    const auto rules_it = impl_->rules.find(ctx.inbound.tag);
-    if (rules_it == impl_->rules.end()) {
+    const auto rules = rules_.load(std::memory_order_acquire);
+    const auto rules_it = rules->find(ctx.inbound.tag);
+    if (rules_it == rules->end()) {
         return false;
     }
 
-    // Worker-local scratch avoids a per-request destination string allocation.
-    thread_local std::string destination;
-    ctx.outbound.target.ToStringInto(destination);
-
-    int hit_rule_id = -1;
-    for (const auto& rule : rules_it->second) {
-        if (std::regex_search(destination.begin(), destination.end(), rule.Pattern)) {
-            hit_rule_id = rule.ID;
-            break;
+    auto matches_host_port = [&](std::string_view host, uint16_t port) {
+        if (host.empty()) {
+            return false;
         }
-    }
 
-    if (hit_rule_id < 0) {
+        char buf[280];
+        char* out = buf;
+        const bool bracket_ipv6 = iputil::NeedsIpv6Brackets(host);
+        const std::size_t max_host_len = sizeof(buf) - (bracket_ipv6 ? 2 : 0) - 6;
+        const std::size_t host_len = std::min(host.size(), max_host_len);
+        if (bracket_ipv6) {
+            *out++ = '[';
+        }
+        if (host_len > 0) {
+            std::memcpy(out, host.data(), host_len);
+            out += host_len;
+        }
+        if (bracket_ipv6) {
+            *out++ = ']';
+        }
+        *out++ = ':';
+        auto [end, ec] = std::to_chars(out, buf + sizeof(buf), port);
+        (void)ec;
+
+        for (const auto& rule : rules_it->second) {
+            if (std::regex_search(buf, end, rule.Pattern)) {
+                return true;
+            }
+        }
         return false;
-    }
+    };
 
-    auto results_it = impl_->inbound_detect_result.find(ctx.inbound.tag);
-    if (results_it == impl_->inbound_detect_result.end()) {
-        results_it = impl_->inbound_detect_result
-                         .try_emplace(memory::ThreadLocalString(ctx.inbound.tag))
-                         .first;
+    auto matches_target = [&](const TargetAddress& target) {
+        if (!target.IsValid()) {
+            return false;
+        }
+        const std::string_view host(target.host.data(), target.host.size());
+        if (!host.empty() && matches_host_port(host, target.port)) {
+            return true;
+        }
+        if (target.resolved_addr) {
+            const iputil::AddressText addr_text(*target.resolved_addr);
+            if (addr_text.View() != host &&
+                matches_host_port(addr_text.View(), target.port)) {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    auto same_target = [](const TargetAddress& a, const TargetAddress& b) {
+        return a.SameEndpoint(b) && a.resolved_addr == b.resolved_addr;
+    };
+
+    if (matches_target(ctx.outbound.target)) {
+        return true;
     }
-    auto& results = results_it->second;
-    if (!ContainsResult(results, ctx.inbound.user_id, hit_rule_id)) {
-        results.push_back(DetectResult{
-            .UID = ctx.inbound.user_id,
-            .RuleID = hit_rule_id,
-        });
+    if (ctx.outbound.route_target.IsValid() &&
+        !same_target(ctx.outbound.route_target, ctx.outbound.target) &&
+        matches_target(ctx.outbound.route_target)) {
+        return true;
     }
-    return true;
+    if (ctx.outbound.original_target.IsValid() &&
+        !same_target(ctx.outbound.original_target, ctx.outbound.target) &&
+        (!ctx.outbound.route_target.IsValid() ||
+         !same_target(ctx.outbound.original_target, ctx.outbound.route_target)) &&
+        matches_target(ctx.outbound.original_target)) {
+        return true;
+    }
+    return false;
 }
 
-}  // namespace acpp::rule
+}  // namespace rule

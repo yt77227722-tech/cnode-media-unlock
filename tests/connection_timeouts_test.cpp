@@ -1,3 +1,5 @@
+#include <gtest/gtest.h>
+
 #include "../src/transport/internet/connection_timeouts.hpp"
 
 #include <chrono>
@@ -6,16 +8,16 @@
 
 namespace {
 using namespace std::chrono_literals;
-using Timeouts = acpp::transport::internet::detail::ConnectionTimeouts<struct Owner>;
+using Timeouts = ::transport::internet::detail::ConnectionTimeouts<struct Owner>;
 
 struct Owner {
     int calls = 0;
-    acpp::ErrorCode reason = acpp::ErrorCode::OK;
-    void OnTimeout(acpp::ErrorCode error) noexcept { ++calls; reason = error; }
+    ::ErrorCode reason = ::ErrorCode::OK;
+    void OnTimeout(::ErrorCode error) noexcept { ++calls; reason = error; }
 };
 
 bool TestIdleAndOperations() {
-    acpp::net::io_context io;
+    ::net::io_context io;
     Owner owner;
     Timeouts timeouts(io, owner);
     timeouts.SetIdleTimeout(1s);
@@ -23,12 +25,12 @@ bool TestIdleAndOperations() {
     timeouts.EndWrite();
     timeouts.TouchActivity();
     io.run_for(1100ms);
-    return owner.calls == 1 && owner.reason == acpp::ErrorCode::CANCELLED &&
+    return owner.calls == 1 && owner.reason == ::ErrorCode::CANCELLED &&
            timeouts.ConsumeIdleTimeout() && !timeouts.ConsumeWriteTimeout();
 }
 
 bool TestPhaseReplacementAndClear() {
-    acpp::net::io_context io;
+    ::net::io_context io;
     Owner owner;
     Timeouts timeouts(io, owner);
     auto old = timeouts.StartPhaseDeadline(1s);
@@ -45,7 +47,7 @@ bool TestPhaseReplacementAndClear() {
 }
 
 bool TestExpiredPhaseAndStopFlag() {
-    acpp::net::io_context io;
+    ::net::io_context io;
     Owner owner;
     Timeouts timeouts(io, owner);
     auto phase = timeouts.StartPhaseDeadline(1s);
@@ -57,7 +59,7 @@ bool TestExpiredPhaseAndStopFlag() {
 }
 
 bool TestDestroyOwnerAndMaximumTimeout() {
-    acpp::net::io_context io;
+    ::net::io_context io;
     auto owner = std::make_unique<Owner>();
     {
         auto timeouts = std::make_unique<Timeouts>(io, *owner);
@@ -69,14 +71,30 @@ bool TestDestroyOwnerAndMaximumTimeout() {
     io.run_for(10ms);
     return true;
 }
+
+bool TestActivityDoesNotExtendPhase() {
+    ::net::io_context io;
+    Owner owner;
+    Timeouts timeouts(io, owner);
+    timeouts.SetIdleTimeout(1s);
+    auto phase = timeouts.StartPhaseDeadline(1s);
+    io.run_for(600ms);
+    if (owner.calls) return false;
+    timeouts.TouchActivity();
+    io.restart();
+    io.run_for(600ms);
+    return owner.calls == 1 && phase.Expired() && timeouts.ConsumePhaseDeadline() &&
+        !timeouts.ConsumeIdleTimeout();
+}
 }  // namespace
 
-int main() {
+TEST(ConnectionTimeouts, Contract) {
     const bool idle = TestIdleAndOperations();
     const bool phase = TestPhaseReplacementAndClear();
     const bool expired = TestExpiredPhaseAndStopFlag();
     const bool destruction = TestDestroyOwnerAndMaximumTimeout();
-    std::printf("connection timeouts: idle=%d phase=%d expired=%d destruction=%d\n",
-                idle, phase, expired, destruction);
-    return idle && phase && expired && destruction ? 0 : 1;
+    const bool dual = TestActivityDoesNotExtendPhase();
+    std::printf("connection timeouts: idle=%d phase=%d expired=%d destruction=%d dual=%d\n",
+                idle, phase, expired, destruction, dual);
+    { ASSERT_TRUE(idle && phase && expired && destruction && dual); return; }
 }

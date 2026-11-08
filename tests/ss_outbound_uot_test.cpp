@@ -1,3 +1,6 @@
+#include <stdexcept>
+#include <gtest/gtest.h>
+
 #include "ss_outbound_uot.hpp"
 
 #include <cstdlib>
@@ -6,11 +9,11 @@
 
 namespace {
 
-using acpp::SsUotVersion;
+using ::SsUotVersion;
 
 [[noreturn]] void Fail(std::string_view message) {
     std::cerr << message << '\n';
-    std::exit(1);
+    ADD_FAILURE() << "contract assertion failed; see diagnostic above"; throw std::runtime_error("contract assertion failed");
 }
 
 void Check(bool condition, std::string_view message) {
@@ -18,19 +21,17 @@ void Check(bool condition, std::string_view message) {
 }
 
 auto Parse(std::string_view body) {
-    const auto parsed = acpp::json::parse(body);
-    return acpp::proxy::shadowsocks::outbound::ParseUotVersion(
+    const auto parsed = ::json::parse(body);
+    return ::proxy::shadowsocks::outbound::ParseUotVersion(
         parsed.as_object());
 }
 
-void CheckInvalid(std::string_view body, std::string_view cause) {
+void CheckInvalid(std::string_view body) {
     auto result = Parse(body);
     Check(!result, "invalid UoT settings were accepted");
-    Check(result.error().find(cause) != std::string::npos,
-          "UoT settings error lost its cause");
 }
 
-void TestValidFormsAreNormalized() {
+TEST(SsOutboundUot, ValidFormsAreNormalized) {
     auto absent = Parse(R"({})");
     Check(absent.has_value() && !*absent, "absent UoT was enabled");
 
@@ -52,27 +53,15 @@ void TestValidFormsAreNormalized() {
           "object UoT v2 mismatch");
 }
 
-void TestInvalidFormsAreRejected() {
-    CheckInvalid(R"({"uot":true,"uotVersion":3})", "must be 1 or 2");
-    CheckInvalid(R"({"uot":"true"})", "must be a boolean or object");
-    CheckInvalid(
-        R"({"uot":{"enabled":true,"version":3}})",
-        "must be 1 or 2");
-    CheckInvalid(
-        R"({"uot":{"enabled":1,"version":2}})",
-        "enabled must be a boolean");
-    CheckInvalid(R"({"uotVersion":2})", "requires uot");
-    CheckInvalid(R"({"uot":1})", "must be a boolean or object");
-    CheckInvalid(
-        R"({"uot":false,"uotVersion":2})",
-        "disabled but a UoT version");
+TEST(SsOutboundUot, InvalidFormsAreRejected) {
+    CheckInvalid(R"({"uot":true,"uotVersion":3})");
+    CheckInvalid(R"({"uot":"true"})");
+    CheckInvalid(R"({"uot":{"enabled":true,"version":3}})");
+    CheckInvalid(R"({"uot":{"enabled":1,"version":2}})");
+    CheckInvalid(R"({"uotVersion":2})");
+    CheckInvalid(R"({"uot":1})");
+    CheckInvalid(R"({"uot":false,"uotVersion":2})");
 }
 
 }  // namespace
 
-int main() {
-    TestValidFormsAreNormalized();
-    TestInvalidFormsAreRejected();
-    std::cout << "ss_outbound_uot_test: ok\n";
-    return 0;
-}

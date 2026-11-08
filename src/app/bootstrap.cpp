@@ -1,18 +1,19 @@
-#include "acppnode/common/allocator.hpp"
-#include "acppnode/app/bootstrap_cli.hpp"
-#include "acppnode/infra/config.hpp"
-#include "acppnode/infra/log.hpp"
-#include "acppnode/app/bootstrap_setup.hpp"
-#include "acppnode/app/bootstrap_runtime.hpp"
-#include "acppnode/service/controller/controller.hpp"
-#include "acppnode/app/stats.hpp"
-#include "acppnode/app/worker.hpp"
-#include "acppnode/geo/geodata.hpp"
-#include "acppnode/app/bootstrap.hpp"
+#include "common/allocator.hpp"
+#include "app/bootstrap_cli.hpp"
+#include "infra/config.hpp"
+#include "infra/log.hpp"
+#include "app/bootstrap_setup.hpp"
+#include "app/bootstrap_runtime.hpp"
+#include "service/controller/controller.hpp"
+#include "app/stats.hpp"
+#include "app/worker.hpp"
+#include "geo/geodata.hpp"
+#include "app/bootstrap.hpp"
 
 #include <iostream>
 #include <exception>
 #include <filesystem>
+#include <format>
 #include <optional>
 #include <string_view>
 #include <system_error>
@@ -25,46 +26,39 @@
 #define BUILD_ID "unknown"
 #endif
 
-namespace acpp {
 
 namespace {
 
 std::optional<Config> LoadConfigFromCli(
     const CommandLineOptions& cli,
-    std::ostream& err,
     bool& error_reported) {
     const std::filesystem::path config_path(cli.config_path);
 
     if (cli.config_mode == ConfigPathMode::Directory) {
         std::error_code ec;
         if (!std::filesystem::is_directory(config_path, ec)) {
-            err << "--config-dir expects an existing directory: "
-                << cli.config_path << "\n";
+            Log::WriteConsole(LogLevel::ERROR, std::format(
+                "--config-dir expects an existing directory: {}", cli.config_path));
             error_reported = true;
             return std::nullopt;
         }
-        return Config::LoadFromDirectory(config_path);
     }
 
     if (cli.config_mode == ConfigPathMode::File) {
         std::error_code ec;
         if (std::filesystem::is_directory(config_path, ec)) {
-            err << "--config-file expects a file, got directory: "
-                << cli.config_path << "\n";
+            Log::WriteConsole(LogLevel::ERROR, std::format(
+                "--config-file expects a file, got directory: {}", cli.config_path));
             error_reported = true;
             return std::nullopt;
         }
     }
 
-    return Config::LoadFromFile(config_path);
+    return LoadConfig(config_path);
 }
 
 constexpr std::string_view IoBackendName() noexcept {
-#if defined(__APPLE__)
-    return "kqueue";
-#elif defined(_WIN32)
-    return "IOCP";
-#elif defined(CNODE_IO_URING_ENABLED)
+#if defined(CNODE_IO_URING_ENABLED)
     return "io_uring";
 #else
     return "epoll";
@@ -95,49 +89,50 @@ int RunFromCommandLine(int argc, char* argv[]) {
     }
 
     bool config_error_reported = false;
-    auto config_opt = LoadConfigFromCli(cli, std::cerr, config_error_reported);
+    auto config_opt = LoadConfigFromCli(cli, config_error_reported);
     if (!config_opt) {
         if (!config_error_reported) {
-            std::cerr << "Failed to load config from: " << cli.config_path << "\n";
+            Log::WriteConsole(LogLevel::ERROR, std::format("Failed to load config from: {}", cli.config_path));
         }
         return 1;
     }
     const Config& config = *config_opt;
 
-    if (!Log::Init(config.GetLog().level,
-                   config.GetLog().log_dir,
-                   config.GetLog().max_days,
-                   config.GetLog().access_path,
-                   config.GetLog().error_path,
-                   config.GetLog().rotate_daily,
-                   config.GetLog().gzip)) {
-        std::cerr << "Failed to initialize logging\n";
+    if (!Log::Init(config.log.level,
+                   config.log.log_dir,
+                   config.log.max_days,
+                   config.log.access_path,
+                   config.log.error_path,
+                   config.log.rotate_daily,
+                   config.log.gzip)) {
+        Log::WriteConsole(LogLevel::ERROR, "Failed to initialize logging");
         return 1;
     }
-
-    LOG_CONSOLE("cnode v1.0.0 starting channel={} build={}", BUILD_CHANNEL, BUILD_ID);
-#ifdef _WIN32
-    LOG_CONSOLE("runtime workers={} io={} accept=SO_REUSEADDR allocator=thread-local",
-                config.GetWorkers(), IoBackendName());
-#else
-    LOG_CONSOLE("runtime workers={} io={} accept=SO_REUSEPORT allocator=thread-local",
-                config.GetWorkers(), IoBackendName());
-#endif
-
-    if (!config.Validate()) {
-        std::cerr << "Invalid configuration\n";
+    LOG_CONSOLE("Configuration loaded: workers={} inbounds={} outbounds={} rules={} panels={}",
+                config.workers,
+                config.static_inbounds.size(),
+                config.outbounds.size(),
+                config.routing.rules.size(),
+                config.panels.size());
+    LOG_CONSOLE("Starting cnode v1.0.0: channel={} build={}", BUILD_CHANNEL, BUILD_ID);
+    LOG_CONSOLE("Runtime configured: workers={} io={} accept=SO_REUSEPORT allocator=thread-local",
+                config.workers, IoBackendName());
+    if (!ValidateConfig(config)) {
+        Log::WriteConsole(LogLevel::ERROR, "Invalid configuration");
         Log::Shutdown();
         return 1;
     }
 
+    int result = 1;
     try {
         auto env = CreateBootstrapEnvironment(config, cli.test_mode);
-        RunApplicationRuntime(MakeRuntimeContext(env));
+        result = RunApplicationRuntime(MakeRuntimeContext(env));
     } catch (const std::exception& e) {
+        Log::WriteConsole(LogLevel::ERROR, std::format("Failed to initialize runtime: {}", e.what()));
         Log::Shutdown();
-        std::cerr << "Failed to initialize runtime: " << e.what() << "\n";
         return 1;
     }
+    Log::Shutdown();
+    return result;
 }
 
-}  // namespace acpp

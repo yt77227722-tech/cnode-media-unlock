@@ -1,5 +1,8 @@
-#include "acppnode/transport/internet/timeout_scheduler.hpp"
-#include "acppnode/transport/internet/async_delay.hpp"
+#include <gtest/gtest.h>
+
+#include "transport/internet/timeout_scheduler.hpp"
+#include "transport/internet/async_delay.hpp"
+#include "app/session_group_executor.hpp"
 #include "../src/app/worker_memory_reclaimer.hpp"
 
 #include <asio/co_spawn.hpp>
@@ -7,824 +10,983 @@
 #include <asio/cancellation_signal.hpp>
 #include <asio/post.hpp>
 #include <asio/use_future.hpp>
+#include <asio/steady_timer.hpp>
+#include <asio/posix/stream_descriptor.hpp>
 
 #include <chrono>
 #include <cstdio>
-#include <cstdlib>
+#include <deque>
 #include <future>
+#include <functional>
+#include <memory>
 #include <optional>
 #include <stdexcept>
 #include <thread>
-#include <type_traits>
+#include <utility>
 #include <vector>
+#include <sys/eventfd.h>
+#include <unistd.h>
 
 namespace {
-
+using namespace std::chrono_literals;
 using timeout_allocation_test::reject_allocations;
 using timeout_allocation_test::rejected_allocations;
 
-static_assert(noexcept(std::declval<acpp::TimeoutScheduler&>().Cancel(
-    std::declval<acpp::TimeoutToken&>())));
-static_assert(std::is_nothrow_move_assignable_v<acpp::TimeoutToken>);
+template<class F>
+struct Event final : TimeoutEvent {
+    explicit Event(F callback) : callback(std::move(callback)) {}
+    void OnTimeout() override { callback(); }
+    F callback;
+};
 
-}  // namespace
+struct CounterEvent final : TimeoutEvent {
+    std::size_t* counter = nullptr;
+    void OnTimeout() override { if (counter) ++*counter; }
+};
 
-namespace {
+struct ResourceScope {
+    memory::ThreadMemoryResource resource;
+    std::pmr::memory_resource* previous = std::pmr::set_default_resource(&resource);
+    ~ResourceScope() { std::pmr::set_default_resource(previous); }
+};
 
-bool TestCancellationAllocation() {
-    using namespace std::chrono_literals;
-    acpp::net::io_context io;
-    auto& scheduler = acpp::TimeoutScheduler::ForIoContext(io);
-    bool cancelled_ran = false;
-    bool survivor_ran = false;
-    bool cancel_threw = false;
-    auto cancelled = scheduler.ScheduleAfter(1ms, [&] { cancelled_ran = true; });
-    auto survivor = scheduler.ScheduleAfter(10ms, [&] { survivor_ran = true; });
-    const auto before = timeout_allocation_test::rejected_asio_allocations;
-    timeout_allocation_test::reject_asio_allocations = true;
-    try {
-        scheduler.Cancel(cancelled);
-    } catch (const std::bad_alloc&) {
-        cancel_threw = true;
-    }
-    timeout_allocation_test::reject_asio_allocations = false;
-    io.run_for(100ms);
-    const auto allocations = timeout_allocation_test::rejected_asio_allocations - before;
-    std::printf("cancel: threw=%d allocations=%zu cancelled=%d survivor=%d\n",
-        cancel_threw, allocations, cancelled_ran, survivor_ran);
-    return !cancel_threw && allocations == 0 && !cancelled_ran && survivor_ran;
-}
-
-bool TestDestructionAllocation() {
-    using namespace std::chrono_literals;
-    acpp::net::io_context io;
-    auto& scheduler = acpp::TimeoutScheduler::ForIoContext(io);
-    bool survivor_ran = false;
-    auto abandoned = scheduler.ScheduleAfter(1ms, [] {});
-    auto survivor = scheduler.ScheduleAfter(10ms, [&] { survivor_ran = true; });
-    const auto before = timeout_allocation_test::rejected_asio_allocations;
-    timeout_allocation_test::reject_asio_allocations = true;
-    { auto retiring = std::move(abandoned); }
-    timeout_allocation_test::reject_asio_allocations = false;
-    io.run_for(100ms);
-    const auto allocations = timeout_allocation_test::rejected_asio_allocations - before;
-    std::printf("destruction: allocations=%zu survivor=%d\n", allocations, survivor_ran);
-    return allocations == 0 && survivor_ran;
-}
-
-bool TestEarlierDeadlineAllocation() {
-    using namespace std::chrono_literals;
-    acpp::net::io_context io;
-    auto& scheduler = acpp::TimeoutScheduler::ForIoContext(io);
-    bool survivor_ran = false;
-    bool earlier_ran = false;
-    bool schedule_threw = false;
-    auto survivor = scheduler.ScheduleAfter(20ms, [&] { survivor_ran = true; });
-    acpp::TimeoutToken earlier;
-    const auto before = timeout_allocation_test::rejected_asio_allocations;
-    timeout_allocation_test::reject_asio_allocations = true;
-    try {
-        earlier = scheduler.ScheduleAfter(1ms, [&] { earlier_ran = true; });
-    } catch (const std::bad_alloc&) {
-        schedule_threw = true;
-    }
-    timeout_allocation_test::reject_asio_allocations = false;
-    io.run_for(100ms);
-    const auto allocations = timeout_allocation_test::rejected_asio_allocations - before;
-    std::printf("earlier: threw=%d allocations=%zu earlier=%d survivor=%d\n",
-        schedule_threw, allocations, earlier_ran, survivor_ran);
-    return !schedule_threw && allocations == 0 && earlier_ran && survivor_ran;
-}
-
-bool TestFailedInitialWait() {
-    using namespace std::chrono_literals;
-    acpp::net::io_context io;
-    auto& scheduler = acpp::TimeoutScheduler::ForIoContext(io);
-    bool failed_ran = false;
-    bool recovery_ran = false;
-    bool failed = false;
-    const auto before = timeout_allocation_test::rejected_asio_allocations;
-    timeout_allocation_test::reject_asio_allocations = true;
-    try {
-        auto token = scheduler.ScheduleAfter(1ms, [&] { failed_ran = true; });
-    } catch (const std::bad_alloc&) {
-        failed = true;
-    }
-    timeout_allocation_test::reject_asio_allocations = false;
-    auto recovery = scheduler.ScheduleAfter(1ms, [&] { recovery_ran = true; });
-    io.run_for(100ms);
-    const auto allocations = timeout_allocation_test::rejected_asio_allocations - before;
-    std::printf("initial wait: failed=%d allocations=%zu failed_callback=%d recovery=%d\n",
-        failed, allocations, failed_ran, recovery_ran);
-    return failed && allocations > 0 && !failed_ran && recovery_ran;
-}
-
-bool TestCancellationStormWithoutAllocation() {
-    using namespace std::chrono_literals;
-    acpp::net::io_context io;
-    auto& scheduler = acpp::TimeoutScheduler::ForIoContext(io);
-    bool cancelled_ran = false;
-    bool survivor_ran = false;
-    auto keeper = scheduler.ScheduleAfter(1ms, [&] { survivor_ran = true; });
-    std::vector<acpp::TimeoutToken> tokens;
-    tokens.reserve(4096);
-    for (std::size_t i = 0; i < 4096; ++i) {
-        tokens.push_back(scheduler.ScheduleAfter(1h, [&] { cancelled_ran = true; }));
-    }
-    const auto before = rejected_allocations;
-    const auto asio_before = timeout_allocation_test::rejected_asio_allocations;
-    reject_allocations = true;
-    timeout_allocation_test::reject_asio_allocations = true;
-    for (auto& token : tokens) scheduler.Cancel(token);
-    timeout_allocation_test::reject_asio_allocations = false;
-    reject_allocations = false;
-    io.run_for(100ms);
-    const auto allocations = rejected_allocations - before;
-    const auto asio_allocations = timeout_allocation_test::rejected_asio_allocations - asio_before;
-    std::printf("cancellation storm: allocations=%zu asio_allocations=%zu cancelled=%d survivor=%d\n",
-        allocations, asio_allocations, cancelled_ran, survivor_ran);
-    return allocations == 0 && asio_allocations == 0 && !cancelled_ran && survivor_ran;
-}
-
-bool TestPreemptAndReplacePendingWait() {
-    using namespace std::chrono_literals;
-    acpp::net::io_context io;
-    auto& scheduler = acpp::TimeoutScheduler::ForIoContext(io);
-    auto initial = scheduler.ScheduleAfter(1h, [] {});
-    const auto before = timeout_allocation_test::rejected_asio_allocations;
-    bool replacement_ran = false;
-    // Repeatedly cancel the last event and replace it before the cancelled
-    // operation is delivered. No second underlying wait may be allocated.
-    timeout_allocation_test::reject_asio_allocations = true;
-    for (std::size_t i = 0; i < 200; ++i) {
-        scheduler.Cancel(initial);
-        initial = scheduler.ScheduleAfter(1h, [] {});
-    }
-    auto replacement = scheduler.ScheduleAfter(1ms, [&] { replacement_ran = true; });
-    timeout_allocation_test::reject_asio_allocations = false;
-    io.run_for(30ms);
-    scheduler.Cancel(initial);
-    io.restart();
-    io.run_for(100ms);
-    const auto allocations = timeout_allocation_test::rejected_asio_allocations - before;
-    std::printf("pending replacement: allocations=%zu callback=%d\n", allocations, replacement_ran);
-    return allocations == 0 && replacement_ran && io.stopped();
-}
-
-bool TestSleepCancellationAllocation() {
-    using namespace std::chrono_literals;
-    acpp::net::io_context io;
-    auto& scheduler = acpp::TimeoutScheduler::ForIoContext(io);
-    acpp::AsyncDelay sleep(io);
-    bool survivor_ran = false;
-    auto future = acpp::net::co_spawn(io, sleep.WaitFor(1h), acpp::net::use_future);
-    io.poll();
-    auto survivor = scheduler.ScheduleAfter(1ms, [&] { survivor_ran = true; });
-    const auto before = timeout_allocation_test::rejected_asio_allocations;
+bool TestCancellationAndRearm() {
+    net::io_context io;
+    auto& scheduler = TimeoutScheduler::ForIoContext(io);
+    std::size_t calls = 0, abandoned_calls = 0;
+    CounterEvent event;
+    event.counter = &calls;
+    (void)scheduler.ScheduleAfter(1h, event);
     const auto ordinary_before = rejected_allocations;
-    reject_allocations = true;
-    timeout_allocation_test::reject_asio_allocations = true;
-    sleep.Cancel();
-    timeout_allocation_test::reject_asio_allocations = false;
-    reject_allocations = false;
-    io.run_for(100ms);
-    const bool completed = future.wait_for(0ms) == std::future_status::ready;
-    if (completed) future.get();
-    scheduler.Cancel(survivor);
-    io.restart();
-    io.run_for(100ms);
-    const auto allocations = timeout_allocation_test::rejected_asio_allocations - before;
-    std::printf("sleep cancellation: asio_allocations=%zu allocations=%zu completed=%d survivor=%d\n",
-        allocations, rejected_allocations - ordinary_before, completed, survivor_ran);
-    return allocations == 0 && rejected_allocations == ordinary_before && completed && survivor_ran;
-}
-
-bool TestDelayParentCancellationAndReuse() {
-    using namespace std::chrono_literals;
-    acpp::net::io_context io;
-    acpp::AsyncDelay delay(io);
-    acpp::net::cancellation_signal cancellation;
-    auto future = acpp::net::co_spawn(io, delay.WaitFor(1h),
-        acpp::net::bind_cancellation_slot(cancellation.slot(), acpp::net::use_future));
-    io.poll();
-    cancellation.emit(acpp::net::cancellation_type::terminal);
-    io.run_for(100ms);
-    if (future.wait_for(0ms) != std::future_status::ready) return false;
-    try {
-        future.get();
-    } catch (const acpp::IoSystemError& error) {
-        if (error.code() != acpp::io_error::operation_aborted) return false;
+    const auto asio_before = timeout_allocation_test::rejected_asio_allocations;
+    reject_allocations = timeout_allocation_test::reject_asio_allocations = true;
+    for (int i = 0; i != 4096; ++i) {
+        scheduler.Cancel(event);
+        if (event.Valid()) return false;
+        (void)scheduler.ScheduleAfter(1h, event);
     }
-    io.restart();
-    auto reused = acpp::net::co_spawn(io, delay.WaitFor(1ms), acpp::net::use_future);
-    io.run_for(100ms);
-    if (reused.wait_for(0ms) != std::future_status::ready) return false;
-    reused.get();
-    std::printf("parent cancellation: completed=1 reused=1\n");
-    return true;
+    (void)scheduler.ScheduleAfter(0ms, event);
+    {
+        CounterEvent abandoned;
+        abandoned.counter = &abandoned_calls;
+        (void)scheduler.ScheduleAfter(0ms, abandoned);
+    }
+    timeout_allocation_test::reject_asio_allocations = reject_allocations = false;
+    io.run();
+    return calls == 1 && abandoned_calls == 0 && !event.Valid() &&
+        rejected_allocations == ordinary_before &&
+        timeout_allocation_test::rejected_asio_allocations == asio_before;
 }
 
-bool TestMaximumDelayWait() {
-    using namespace std::chrono_literals;
-    acpp::net::io_context io;
-    acpp::AsyncDelay delay(io);
-    auto future = acpp::net::co_spawn(io,
-        delay.WaitFor(std::chrono::milliseconds::max()), acpp::net::use_future);
-    io.run_for(10ms);
-    const bool pending = future.wait_for(0ms) != std::future_status::ready;
-    delay.Cancel();
+bool TestReentrantDestructionAndExceptions() {
+    net::io_context io;
+    auto& scheduler = TimeoutScheduler::ForIoContext(io);
+    std::size_t cancelled_calls = 0, survivor_calls = 0;
+    auto owner = std::make_unique<CounterEvent>();
+    owner->counter = &cancelled_calls;
+    Event first([&] { owner.reset(); });
+    Event failure([] { throw std::runtime_error("timeout owner failed"); });
+    CounterEvent survivor;
+    survivor.counter = &survivor_calls;
+    (void)scheduler.ScheduleAfter(0ms, first);
+    (void)scheduler.ScheduleAfter(0ms, *owner);
+    (void)scheduler.ScheduleAfter(0ms, failure);
+    (void)scheduler.ScheduleAfter(0ms, survivor);
+    bool failure_reported = false;
+    try { io.run(); }
+    catch (const std::runtime_error&) { failure_reported = true; }
+    io.run();
+    if (!failure_reported || owner || cancelled_calls || survivor_calls != 1) return false;
+
+    struct Self final : TimeoutEvent {
+        Self(TimeoutScheduler& scheduler, std::unique_ptr<Self>& owner, bool& fired)
+            : scheduler(scheduler), owner(owner), fired(fired) {}
+        void OnTimeout() override {
+            scheduler.Cancel(*this); // Already detached, safe even inside expiry.
+            fired = true;
+            owner.reset(); // No access to this event after destruction.
+        }
+        TimeoutScheduler& scheduler;
+        std::unique_ptr<Self>& owner;
+        bool& fired;
+    };
+    bool fired = false;
+    std::unique_ptr<Self> self;
+    self = std::make_unique<Self>(scheduler, self, fired);
     io.restart();
-    io.run_for(100ms);
-    if (future.wait_for(0ms) != std::future_status::ready) return false;
-    future.get();
-    std::printf("maximum delay wait: pending_before_cancel=%d\n", pending);
-    return pending;
+    (void)scheduler.ScheduleAfter(0ms, *self);
+    io.run();
+    return fired && !self && scheduler.GetResourceStats().active_events == 0;
+}
+
+bool TestSelfRearmAndFairness() {
+    net::io_context io;
+    auto& scheduler = TimeoutScheduler::ForIoContext(io);
+    struct Repeating final : TimeoutEvent {
+        explicit Repeating(TimeoutScheduler& scheduler) : scheduler(scheduler) {}
+        void OnTimeout() override {
+            if (++calls < 5) (void)scheduler.ScheduleAfter(0ms, *this);
+        }
+        TimeoutScheduler& scheduler;
+        int calls = 0;
+    } repeating(scheduler);
+    (void)scheduler.ScheduleAfter(0ms, repeating);
+    io.run();
+    if (repeating.calls != 5 || repeating.Valid()) return false;
+
+    io.restart();
+    std::size_t calls = 0, observed = 0;
+    const auto callback = [&] {
+        if (++calls == 1) net::post(io, [&] { observed = calls; });
+    };
+    std::deque<Event<decltype(callback)>> storm;
+    for (int i = 0; i != 256; ++i) {
+        storm.emplace_back(callback);
+        (void)scheduler.ScheduleAfter(0ms, storm.back());
+    }
+    io.run();
+    // Timers must yield to queued I/O, not process the entire storm first.
+    return calls == 256 && observed > 0 && observed < calls;
+}
+
+bool TestWaitInitiationFailureAndRecovery() {
+    net::io_context io;
+    auto& scheduler = TimeoutScheduler::ForIoContext(io);
+    std::size_t failed_calls = 0, recovered_calls = 0;
+    CounterEvent failed, recovered;
+    failed.counter = &failed_calls;
+    recovered.counter = &recovered_calls;
+    bool rejected = false;
+    const auto before = memory::rejected_process_allocations;
+    memory::reject_next_process_allocation = true;
+    try { (void)scheduler.ScheduleAfter(1ms, failed); }
+    catch (const std::bad_alloc&) { rejected = true; }
+    memory::reject_next_process_allocation = false;
+    if (!rejected || failed.Valid() ||
+        memory::rejected_process_allocations != before + 1) return false;
+    (void)scheduler.ScheduleAfter(1ms, recovered);
+    io.run();
+    return failed_calls == 0 && recovered_calls == 1;
+}
+
+bool TestHeapGrowthAndReentrantMaintenance() {
+    ResourceScope resource;
+    auto& pool = memory::ThreadMemoryPool();
+    pool.PurgeIdle();
+    bool passed = false;
+    {
+        net::io_context io;
+        auto& scheduler = TimeoutScheduler::ForIoContext(io);
+        WorkerMemoryReclaimer reclaimer;
+        reclaimer.Start(scheduler);
+        std::size_t fired = 0;
+        std::deque<CounterEvent> events(12000);
+        for (std::size_t i = 0; i != events.size(); ++i) {
+            events[i].counter = &fired;
+            pool.PurgeIdle();
+            (void)scheduler.ScheduleAfter(48h - std::chrono::seconds(i), events[i]);
+        }
+        const auto before = rejected_allocations;
+        const auto asio_before = timeout_allocation_test::rejected_asio_allocations;
+        reject_allocations = timeout_allocation_test::reject_asio_allocations = true;
+        // Remove both interior and root slots; no borrowed stale entry remains.
+        for (std::size_t i = 0; i < events.size(); i += 2) scheduler.Cancel(events[i]);
+        for (std::size_t i = 1; i < events.size(); i += 2)
+            (void)scheduler.ScheduleAfter(0ms, events[i]);
+        timeout_allocation_test::reject_asio_allocations = reject_allocations = false;
+        io.run();
+        passed = fired == events.size() / 2 && rejected_allocations == before &&
+            timeout_allocation_test::rejected_asio_allocations == asio_before &&
+            scheduler.GetResourceStats().active_events == 0;
+        // Release invalidates borrowed events before their owners are destroyed.
+        for (auto& event : events) (void)scheduler.ScheduleAfter(1h, event);
+        TimeoutScheduler::ReleaseForIoContext(io);
+        for (auto& event : events) passed = passed && !event.Valid();
+        passed = passed && !scheduler.ScheduleAfter(0ms, events.front());
+        io.restart();
+        io.run();
+    }
+    pool.PurgeIdle();
+    return passed && pool.GetFootprint().mapped_bytes == 0;
+}
+
+bool TestShardAndRecycledContextOwnership() {
+    net::io_context left, right;
+    auto& lhs = TimeoutScheduler::ForIoContext(left);
+    auto& rhs = TimeoutScheduler::ForIoContext(right);
+    std::size_t calls = 0;
+    CounterEvent event;
+    event.counter = &calls;
+    (void)lhs.ScheduleAfter(0ms, event);
+    rhs.Cancel(event);
+    bool wrong_owner_rejected = false;
+    try { (void)rhs.ScheduleAfter(0ms, event); }
+    catch (const std::logic_error&) { wrong_owner_rejected = true; }
+    left.run();
+    if (!wrong_owner_rejected || calls != 1) return false;
+    std::optional<net::io_context> recycled;
+    for (int i = 0; i != 4; ++i) {
+        recycled.emplace();
+        CounterEvent next;
+        next.counter = &calls;
+        auto& scheduler = TimeoutScheduler::ForIoContext(*recycled);
+        (void)scheduler.ScheduleAfter(0ms, next);
+        recycled->run();
+        recycled.reset();
+    }
+    return calls == 5;
 }
 
 bool TestMaximumDelay() {
-    using namespace std::chrono_literals;
-    acpp::net::io_context io;
-    auto& scheduler = acpp::TimeoutScheduler::ForIoContext(io);
-    bool maximum_ran = false;
-    bool immediate_ran = false;
-    auto maximum = scheduler.ScheduleAfter(std::chrono::milliseconds::max(),
-        [&] { maximum_ran = true; });
-    auto immediate = scheduler.ScheduleAfter(-1ms, [&] { immediate_ran = true; });
-    io.run_for(10ms);
-    scheduler.Cancel(maximum);
+    net::io_context io;
+    auto& scheduler = TimeoutScheduler::ForIoContext(io);
+    std::size_t far_calls = 0, immediate_calls = 0;
+    CounterEvent maximum, immediate;
+    maximum.counter = &far_calls;
+    immediate.counter = &immediate_calls;
+    (void)scheduler.ScheduleAfter(std::chrono::milliseconds::max(), maximum);
+    io.poll();
+    if (far_calls != 0) return false;
+    const auto ordinary_before = rejected_allocations;
+    const auto asio_before = timeout_allocation_test::rejected_asio_allocations;
+    bool expedited = false;
+    reject_allocations = timeout_allocation_test::reject_asio_allocations = true;
+    try { expedited = scheduler.ScheduleAfter(0ms, maximum); }
+    catch (const std::bad_alloc&) {}
+    timeout_allocation_test::reject_asio_allocations = reject_allocations = false;
+    if (!expedited) return false;
+    (void)scheduler.ScheduleAfter(-1ms, immediate);
     io.restart();
-    io.run_for(100ms);
-    std::printf("maximum delay: maximum=%d immediate=%d\n", maximum_ran, immediate_ran);
-    return !maximum_ran && immediate_ran;
+    io.run();
+    return far_calls == 1 && immediate_calls == 1 &&
+        rejected_allocations == ordinary_before &&
+        timeout_allocation_test::rejected_asio_allocations == asio_before;
 }
 
 bool TestPoolMaintenance() {
-    using namespace std::chrono_literals;
-    acpp::net::io_context io;
-    auto& scheduler = acpp::TimeoutScheduler::ForIoContext(io);
-    auto& pool = acpp::memory::ThreadPool();
+    net::io_context io;
+    auto& scheduler = TimeoutScheduler::ForIoContext(io);
+    auto& pool = memory::ThreadMemoryPool();
     pool.PurgeIdle();
-    acpp::WorkerMemoryReclaimer reclaimer;
+    WorkerMemoryReclaimer reclaimer;
     reclaimer.Start(scheduler);
     std::vector<void*> buffers;
     for (int i = 0; i < 12; ++i) {
-        auto* p = acpp::memory::AllocatePmr(8192, 16);
+        auto* p = memory::AllocatePmr(8192, 16);
         if (!p) return false;
         buffers.push_back(p);
     }
     auto* held = buffers.back();
-    for (auto* p : buffers) if (p != held) acpp::memory::DeallocatePmr(p);
+    *static_cast<unsigned char*>(held) = 0xA5;
+    for (auto* p : buffers) if (p != held) memory::DeallocatePmr(p);
     bool idle_returned = false;
-    auto probe = scheduler.ScheduleAfter(50ms, [&] {
-        idle_returned = pool.GetFootprint().idle_bytes == 0 && pool.GetFootprint().mapped_bytes > 0;
-        acpp::memory::DeallocatePmr(held);
+    Event probe([&] {
+        idle_returned = pool.GetFootprint().idle_bytes == 0 &&
+            *static_cast<unsigned char*>(held) == 0xA5;
+        memory::DeallocatePmr(held);
     });
-    // No allocations or explicit collection calls after entering the loop.
-    // The final empty mapping must return without waiting for a monitor sweep.
+    (void)scheduler.ScheduleAfter(50ms, probe);
     io.run();
-    if (!idle_returned || pool.GetFootprint().mapped_bytes != 0) return false;
+    if (!idle_returned || pool.GetFootprint().idle_bytes != 0) return false;
 
     io.restart();
-    auto* p = acpp::memory::AllocatePmr(128, 8);
-    acpp::memory::DeallocatePmr(p);
-    p = acpp::memory::AllocatePmr(128, 16);
+    auto* p = memory::AllocatePmr(8192, 8);
+    memory::DeallocatePmr(p);
+    p = memory::AllocatePmr(8192, 16);
+    *static_cast<unsigned char*>(p) = 0x5A;
     bool reused_survived = false;
-    auto reuse_probe = scheduler.ScheduleAfter(30ms, [&] {
-        reused_survived = pool.GetFootprint().mapped_bytes > 0 && pool.GetFootprint().idle_bytes == 0;
-        acpp::memory::DeallocatePmr(p);
+    Event reuse_probe([&] {
+        reused_survived = pool.GetFootprint().idle_bytes == 0 &&
+            *static_cast<unsigned char*>(p) == 0x5A;
+        memory::DeallocatePmr(p);
     });
+    (void)scheduler.ScheduleAfter(30ms, reuse_probe);
     io.run();
-    if (!reused_survived || pool.GetFootprint().mapped_bytes != 0) return false;
+    if (!reused_survived || pool.GetFootprint().idle_bytes != 0) return false;
 
-    // Timer-initiation OOM on a free must not escape, leak a wakeup, or retain
-    // an empty mapping. The subsequent successful cycle must still work.
     io.restart();
-    p = acpp::memory::AllocatePmr(128, 16);
-    const auto before = timeout_allocation_test::rejected_asio_allocations;
-    timeout_allocation_test::reject_asio_allocations = true;
-    acpp::memory::DeallocatePmr(p);
-    timeout_allocation_test::reject_asio_allocations = false;
-    if (timeout_allocation_test::rejected_asio_allocations == before || pool.GetFootprint().mapped_bytes) return false;
-    p = acpp::memory::AllocatePmr(128, 16);
-    acpp::memory::DeallocatePmr(p);
+    p = memory::AllocatePmr(8192, 16);
+    const auto before = memory::rejected_process_allocations;
+    memory::reject_next_process_allocation = true;
+    memory::DeallocatePmr(p);
+    memory::reject_next_process_allocation = false;
+    if (memory::rejected_process_allocations != before + 1 ||
+        pool.GetFootprint().idle_bytes) return false;
+    p = memory::AllocatePmr(8192, 16);
+    memory::DeallocatePmr(p);
     io.run();
-    if (pool.GetFootprint().mapped_bytes) return false;
-    acpp::TimeoutScheduler::ReleaseForIoContext(io);
-    p = acpp::memory::AllocatePmr(128, 16);
-    acpp::memory::DeallocatePmr(p);
-    return pool.GetFootprint().mapped_bytes == 0;
-}
-
-bool TestPmrSchedulerReentrancy() {
-    using namespace std::chrono_literals;
-    struct DefaultResourceScope {
-        acpp::memory::ThreadPoolFacade resource;
-        std::pmr::memory_resource* previous = std::pmr::set_default_resource(&resource);
-        ~DefaultResourceScope() { std::pmr::set_default_resource(previous); }
-    } resource_scope;
-    auto& pool = acpp::memory::ThreadPool();
-    pool.PurgeIdle();
-    bool survivor_ran = false;
-    {
-        acpp::net::io_context io;
-        auto& scheduler = acpp::TimeoutScheduler::ForIoContext(io);
-        acpp::WorkerMemoryReclaimer reclaimer;
-        reclaimer.Start(scheduler);
-        std::vector<acpp::TimeoutToken> tokens;
-        tokens.reserve(12000);
-        // Real Worker resource, beyond the initial map/heap reserves. Rehash
-        // releases the old bucket array before publishing its replacement.
-        // Descending deadlines force stale-top queries to traverse many IDs.
-        for (int i = 0; i < 12000; ++i) {
-            pool.PurgeIdle();
-            tokens.push_back(scheduler.ScheduleAfter(48h - std::chrono::seconds(i), [] {}));
-        }
-        for (auto& token : tokens) {
-            pool.PurgeIdle();
-            scheduler.Cancel(token);
-        }
-        auto survivor = scheduler.ScheduleAfter(20ms, [&] { survivor_ran = true; });
-        io.run();
-        if (!survivor_ran || pool.GetFootprint().idle_bytes) return false;
-        // Also exercise service teardown while the allocator observer is bound.
-        for (int i = 0; i < 2048; ++i)
-            tokens.push_back(scheduler.ScheduleAfter(1h, [] {}));
-        acpp::TimeoutScheduler::ReleaseForIoContext(io);
-    }
-    pool.PurgeIdle();
-    return pool.GetFootprint().mapped_bytes == 0;
-}
-
-bool TestResourceReuseAndPeakRetention() {
-    using namespace std::chrono_literals;
-    struct DefaultResourceScope {
-        acpp::memory::ThreadPoolFacade resource;
-        std::pmr::memory_resource* previous = std::pmr::set_default_resource(&resource);
-        ~DefaultResourceScope() { std::pmr::set_default_resource(previous); }
-    } resource_scope;
-    constexpr std::size_t kRounds = 1000;
-    constexpr std::size_t kEventsPerRound = 32;
-    acpp::net::io_context io;
-    auto& scheduler = acpp::TimeoutScheduler::ForIoContext(io);
-    auto& pool = acpp::memory::ThreadPool();
-    acpp::WorkerMemoryReclaimer reclaimer;
-    reclaimer.Start(scheduler);
-
-    acpp::TimeoutScheduler::ResourceStats plateau{};
-    for (std::size_t round = 0; round < kRounds; ++round) {
-        if (round != 0) io.restart();
-        std::size_t expired = 0;
-        std::vector<acpp::TimeoutToken> tokens;
-        tokens.reserve(kEventsPerRound);
-        for (std::size_t i = 0; i < kEventsPerRound; ++i) {
-            const auto delay = (i % 2 == 0) ? 0ms : 1h;
-            tokens.push_back(scheduler.ScheduleAfter(delay, [&] { ++expired; }));
-        }
-        for (std::size_t i = 1; i < tokens.size(); i += 2) {
-            scheduler.Cancel(tokens[i]);
-        }
-        // Let the same reclaimer return empty PMR blocks with no subsequent
-        // traffic or explicit collection; do not cancel its maintenance wake.
-        io.run();
-
-        const auto stats = scheduler.GetResourceStats();
-        if (expired != kEventsPerRound / 2 || stats.active_events != 0 ||
-            stats.heap_entries != 0 || stats.ready_events != 0 || stats.wait_pending ||
-            pool.GetFootprint().idle_bytes != 0) {
-            return false;
-        }
-        if (round == 0) {
-            plateau = stats;
-        } else if (stats.heap_capacity != plateau.heap_capacity ||
-            stats.event_buckets != plateau.event_buckets) {
-            std::printf("resource reuse grew at round %zu: heap=%zu/%zu buckets=%zu/%zu\n",
-                round, stats.heap_capacity, plateau.heap_capacity,
-                stats.event_buckets, plateau.event_buckets);
-            return false;
-        }
-    }
-
-    // A separate one-off peak records retained container capacity without
-    // treating it as a leak or imposing a reclamation policy.
-    io.restart();
-    constexpr std::size_t kPeakEvents = 8192;
-    std::vector<acpp::TimeoutToken> peak_tokens;
-    peak_tokens.reserve(kPeakEvents);
-    for (std::size_t i = 0; i < kPeakEvents; ++i) {
-        peak_tokens.push_back(scheduler.ScheduleAfter(1h, [] {}));
-    }
-    const auto peak = scheduler.GetResourceStats();
-    for (auto& token : peak_tokens) scheduler.Cancel(token);
-    io.run();
-    const auto retained = scheduler.GetResourceStats();
-    std::printf("scheduler peak retention: peak=%zu heap_capacity=%zu buckets=%zu; "
-                "after_cancel active=%zu heap=%zu capacity=%zu buckets=%zu\n",
-        peak.active_events, peak.heap_capacity, peak.event_buckets,
-        retained.active_events, retained.heap_entries, retained.heap_capacity,
-        retained.event_buckets);
-    if (peak.active_events != kPeakEvents || retained.active_events != 0 ||
-        retained.heap_entries != 0 || retained.ready_events != 0 ||
-        retained.wait_pending || pool.GetFootprint().idle_bytes != 0) {
-        return false;
-    }
-
-    reclaimer.Stop();
-    acpp::TimeoutScheduler::ReleaseForIoContext(io);
-    pool.PurgeIdle();
+    if (pool.GetFootprint().idle_bytes) return false;
+    TimeoutScheduler::ReleaseForIoContext(io);
+    p = memory::AllocatePmr(8192, 16);
+    memory::DeallocatePmr(p);
     return pool.GetFootprint().idle_bytes == 0;
 }
 
-bool TestMaintenanceCancellation() {
-    using namespace std::chrono_literals;
-    acpp::net::io_context io;
-    auto& scheduler = acpp::TimeoutScheduler::ForIoContext(io);
-    bool fired = false;
-    const auto callback = [](void* p) noexcept { *static_cast<bool*>(p) = true; };
-    if (!scheduler.SetMaintenanceDeadline(&fired, callback, std::chrono::steady_clock::now() + 5ms)) return false;
-    bool other = false;
+bool TestMaintenanceIsolation() {
+    struct Maintenance final : TimeoutMaintenance {
+        void OnMaintenance() noexcept override { ++calls; }
+        int calls = 0;
+    } first, other;
+    net::io_context io;
+    auto& scheduler = TimeoutScheduler::ForIoContext(io);
+    (void)scheduler.SetMaintenanceDeadline(first, std::chrono::steady_clock::now() + 5ms);
     bool conflict = false;
-    try {
-        (void)scheduler.SetMaintenanceDeadline(&other, callback, std::chrono::steady_clock::now());
-    } catch (const std::logic_error&) { conflict = true; }
-    scheduler.CancelMaintenance(&other);
-    auto cancelled = scheduler.ScheduleAfter(1ms, [] {});
-    scheduler.Cancel(cancelled); // Must not cancel the maintenance wakeup.
+    try { (void)scheduler.SetMaintenanceDeadline(other, std::chrono::steady_clock::now()); }
+    catch (const std::logic_error&) { conflict = true; }
+    scheduler.CancelMaintenance(other);
+    CounterEvent cancelled;
+    (void)scheduler.ScheduleAfter(1ms, cancelled);
+    scheduler.Cancel(cancelled);
     io.run();
-    if (!conflict || !fired || other) return false;
+    if (!conflict || first.calls != 1 || other.calls != 0) return false;
     io.restart();
-    fired = false;
-    if (!scheduler.SetMaintenanceDeadline(&fired, callback, std::chrono::steady_clock::now() + 1h)) return false;
+    (void)scheduler.SetMaintenanceDeadline(first, std::chrono::steady_clock::now() + 1h);
     const auto before = timeout_allocation_test::rejected_asio_allocations;
-    timeout_allocation_test::reject_asio_allocations = true;
-    reject_allocations = true;
-    scheduler.CancelMaintenance(&fired);
-    reject_allocations = false;
-    timeout_allocation_test::reject_asio_allocations = false;
+    timeout_allocation_test::reject_asio_allocations = reject_allocations = true;
+    scheduler.CancelMaintenance(first);
+    timeout_allocation_test::reject_asio_allocations = reject_allocations = false;
     io.run();
-    return !fired && timeout_allocation_test::rejected_asio_allocations == before;
+    return first.calls == 1 && timeout_allocation_test::rejected_asio_allocations == before;
+}
+
+bool TestOwnerThreadServiceDestruction() {
+    ResourceScope resource;
+    std::promise<bool> finished;
+    auto result = finished.get_future();
+    std::thread owner([&] {
+        try {
+            auto io = std::make_unique<net::io_context>();
+            auto& scheduler = TimeoutScheduler::ForIoContext(*io);
+            {
+                std::deque<CounterEvent> events(4096);
+                for (auto& event : events) (void)scheduler.ScheduleAfter(1h, event);
+            }
+            TimeoutScheduler::ReleaseForIoContext(*io);
+            io->run();
+            const bool drained = !scheduler.GetResourceStats().wait_pending;
+            io.reset();
+            auto& pool = memory::ThreadMemoryPool();
+            pool.PurgeIdle();
+            const auto footprint = pool.GetFootprint();
+            finished.set_value(drained && footprint.mapped_bytes == 0 && footprint.direct_bytes == 0);
+        } catch (...) { finished.set_value(false); }
+    });
+    owner.join();
+    return result.get();
+}
+
+bool TestDelayCancellationAndReuse() {
+    net::io_context io;
+    AsyncDelay delay(io);
+    bool second_started = false, second_finished = false, early_completion = false;
+    auto future = net::co_spawn(io, [&]() -> net::awaitable<void> {
+        co_await delay.WaitFor(1h);
+        second_started = true;
+        co_await delay.WaitFor(1h);
+        second_finished = true;
+    }, net::use_future);
+    net::post(io, [&] { delay.Cancel(); delay.Cancel(); });
+    auto& scheduler = TimeoutScheduler::ForIoContext(io);
+    Event probe([&] { early_completion = second_finished; delay.Cancel(); });
+    (void)scheduler.ScheduleAfter(10ms, probe);
+    io.run();
+    future.get();
+    if (!second_started || !second_finished || early_completion) return false;
+
+    io.restart();
+    net::cancellation_signal cancellation;
+    bool parent_observed = false;
+    auto cancelled = net::co_spawn(io, [&]() -> net::awaitable<void> {
+        co_await delay.WaitFor(1h);
+        parent_observed = (co_await net::this_coro::cancellation_state).cancelled() !=
+            net::cancellation_type::none;
+    }, net::bind_cancellation_slot(cancellation.slot(), net::use_future));
+    io.poll();
+    cancellation.emit(net::cancellation_type::terminal);
+    io.run();
+    bool aborted = false;
+    try { cancelled.get(); }
+    catch (const IoSystemError& error) { aborted = error.code() == io_error::operation_aborted; }
+    io.restart();
+    auto reused = net::co_spawn(io, delay.WaitFor(1ms), net::use_future);
+    io.run();
+    reused.get();
+    return aborted || parent_observed;
+}
+
+bool TestDelayConcurrentWaitAndMaximum() {
+    net::io_context io;
+    AsyncDelay delay(io);
+    auto first = net::co_spawn(io, delay.WaitFor(std::chrono::milliseconds::max()), net::use_future);
+    auto second = net::co_spawn(io, delay.WaitFor(1h), net::use_future);
+    io.poll();
+    bool rejected = false;
+    try { second.get(); } catch (const std::logic_error&) { rejected = true; }
+    const auto before = timeout_allocation_test::rejected_asio_allocations;
+    const auto ordinary_before = rejected_allocations;
+    reject_allocations = timeout_allocation_test::reject_asio_allocations = true;
+    delay.Cancel();
+    timeout_allocation_test::reject_asio_allocations = reject_allocations = false;
+    io.run();
+    first.get();
+    return rejected && timeout_allocation_test::rejected_asio_allocations == before &&
+        rejected_allocations == ordinary_before;
+}
+
+bool TestDelayCancellationAfterRelease() {
+    net::io_context io;
+    AsyncDelay delay(io);
+    auto waiting = net::co_spawn(io, delay.WaitFor(1h), net::use_future);
+    io.poll();
+    TimeoutScheduler::ReleaseForIoContext(io);
+    delay.Cancel();
+    io.restart();
+    io.run_for(100ms);
+    if (waiting.wait_for(0ms) != std::future_status::ready) return false;
+    waiting.get();
+    return true;
+}
+
+bool TestDomainSchedulerIsolationAndJoin() {
+    struct Hooks final : ExecutionDomain::Hooks {
+        memory::AllocationDomain allocation;
+        std::optional<memory::ScopedAllocationDomain> lease;
+        std::exception_ptr failure;
+        void Enter() noexcept override { lease.emplace(allocation); }
+        void Leave() noexcept override { lease.reset(); }
+        void OnFailure(std::exception_ptr error) noexcept override { failure = error; }
+    };
+    net::io_context io;
+    auto coordinator = std::make_shared<GroupCoordinator>(io);
+    coordinator->RegisterWorker(0, io, io.get_executor());
+    auto first_hooks = std::make_shared<Hooks>();
+    auto second_hooks = std::make_shared<Hooks>();
+    auto first = ExecutionDomain::Create(io, 0, io.get_executor(), first_hooks, coordinator);
+    auto second = ExecutionDomain::Create(io, 0, io.get_executor(), second_hooks, coordinator);
+    first_hooks->allocation.SetLeaseGroup(first->LeaseIdentity(), ExecutionDomain::SharesLeaseIdentity);
+    second_hooks->allocation.SetLeaseGroup(second->LeaseIdentity(), ExecutionDomain::SharesLeaseIdentity);
+    TimeoutScheduler* first_scheduler = nullptr;
+    TimeoutScheduler* second_scheduler = nullptr;
+    bool first_owner = false, second_owner = false;
+    bool first_joined = false, second_joined = false;
+    struct WorkerEvent final : TimeoutEvent {
+        WorkerEvent() : TimeoutEvent(WorkerLocal{}) {}
+        bool fired_on_worker = false;
+        void OnTimeout() override { fired_on_worker = !ExecutionDomain::Current(); }
+    } worker_event;
+    SignalChannel scheduler_joins(io, 2);
+    CounterEvent first_pending, second_pending;
+    Event first_event([&] {
+        first_owner = ExecutionDomain::Current() == first &&
+            memory::CurrentAllocationDomain() == &first_hooks->allocation;
+        net::co_spawn(first->Executor(), TimeoutScheduler::AsyncReleaseForIoContext(io),
+            [&](std::exception_ptr error) {
+                first_joined = !error;
+                (void)scheduler_joins.try_send(IoErrorCode{});
+            });
+        throw std::runtime_error("domain timeout callback failed");
+    });
+    Event second_event([&] {
+        second_owner = ExecutionDomain::Current() == second &&
+            memory::CurrentAllocationDomain() == &second_hooks->allocation;
+        net::co_spawn(second->Executor(), TimeoutScheduler::AsyncReleaseForIoContext(io),
+            [&](std::exception_ptr error) {
+                second_joined = !error;
+                (void)scheduler_joins.try_send(IoErrorCode{});
+            });
+    });
+    first->Execute([&] {
+        first_scheduler = &TimeoutScheduler::ForIoContext(io);
+        (void)first_scheduler->ScheduleAfter(0ms, first_event);
+        (void)first_scheduler->ScheduleAfter(1h, first_pending);
+        (void)first_scheduler->ScheduleAfter(2ms, worker_event);
+    });
+    second->Execute([&] {
+        second_scheduler = &TimeoutScheduler::ForIoContext(io);
+        (void)second_scheduler->ScheduleAfter(0ms, second_event);
+        (void)second_scheduler->ScheduleAfter(1h, second_pending);
+    });
+    bool passed = false, finalized = false;
+    auto finalize = [&](std::shared_ptr<GroupCoordinator> owner) -> net::awaitable<void> {
+        co_await scheduler_joins.async_receive(net::use_awaitable);
+        co_await scheduler_joins.async_receive(net::use_awaitable);
+        passed = first_scheduler && second_scheduler &&
+            first_scheduler == second_scheduler && first_owner && second_owner &&
+            first_joined && second_joined && !first_pending.Valid() &&
+            !second_pending.Valid() && first_hooks->failure && !second_hooks->failure;
+        first.reset();
+        second.reset();
+        owner->CloseAdmission();
+        co_await owner->AsyncJoin();
+        owner->ReleaseServices();
+        co_await owner->Finalize();
+    };
+    net::co_spawn(io, finalize(coordinator),
+        [&](std::exception_ptr error) { finalized = !error; });
+    io.run_for(1s);
+    return passed && finalized && worker_event.fired_on_worker;
+}
+
+bool TestDomainTimeoutHandoff() {
+    struct Hooks final : ExecutionDomain::Hooks {
+        memory::AllocationDomain allocation;
+        std::optional<memory::ScopedAllocationDomain> lease;
+        std::exception_ptr failure;
+        void Enter() noexcept override { lease.emplace(allocation); }
+        void Leave() noexcept override { lease.reset(); }
+        void OnFailure(std::exception_ptr error) noexcept override { failure = error; }
+    };
+    // Let the Worker's native timer expire while domain business is frozen,
+    // before the timeout participant removes the remaining active heap slots.
+    struct Pause final : ExecutionDomain::NativeResource {
+        std::function<void()> on_prepare;
+        net::awaitable<void> PrepareHandoff(const ExecutionDomain::HandoffTarget&) override {
+            on_prepare();
+            net::steady_timer timer(co_await net::this_coro::executor);
+            timer.expires_after(40ms);
+            co_await timer.async_wait(net::use_awaitable);
+        }
+        void CommitHandoff(const ExecutionDomain::HandoffTarget&) noexcept override {}
+        net::awaitable<void> CancelHandoff(const ExecutionDomain::HandoffTarget&) override { co_return; }
+    } pause;
+    net::io_context old_io, new_io;
+    auto coordinator = std::make_shared<GroupCoordinator>(old_io);
+    coordinator->RegisterWorker(0, old_io, old_io.get_executor());
+    coordinator->RegisterWorker(1, new_io, new_io.get_executor());
+    auto hooks = std::make_shared<Hooks>();
+    auto domain = ExecutionDomain::Create(old_io, 0, old_io.get_executor(), hooks, coordinator);
+    hooks->allocation.SetLeaseGroup(domain->LeaseIdentity(), ExecutionDomain::SharesLeaseIdentity);
+    auto pump = [&] {
+        old_io.restart(); old_io.poll();
+        new_io.restart(); new_io.poll();
+    };
+    auto finish = [&](auto& future) {
+        const auto limit = std::chrono::steady_clock::now() + 2s;
+        while (future.wait_for(0ms) != std::future_status::ready &&
+               std::chrono::steady_clock::now() < limit) {
+            pump();
+            std::this_thread::sleep_for(1ms);
+        }
+        if (future.wait_for(0ms) != std::future_status::ready)
+            throw std::runtime_error("timeout handoff test did not complete");
+        return future.get();
+    };
+    auto wait_until = [&](auto predicate) {
+        const auto limit = std::chrono::steady_clock::now() + 2s;
+        while (!predicate() && std::chrono::steady_clock::now() < limit) {
+            pump();
+            std::this_thread::sleep_for(1ms);
+        }
+        if (!predicate()) throw std::runtime_error("timeout handoff notification missing");
+    };
+    std::size_t destroyed_calls = 0, rearmed_calls = 0, ready_calls = 0, active_calls = 0;
+    bool owner_correct = true;
+    auto destroyed = std::make_unique<CounterEvent>();
+    destroyed->counter = &destroyed_calls;
+    std::size_t cleared_calls = 0;
+    CounterEvent cleared;
+    cleared.counter = &cleared_calls;
+    auto check_owner = [&] {
+        owner_correct = owner_correct && ExecutionDomain::Current() == domain &&
+            memory::CurrentAllocationDomain() == &hooks->allocation;
+    };
+    Event rearmed([&] { check_owner(); ++rearmed_calls; });
+    Event ready([&] { check_owner(); ++ready_calls; });
+    Event active([&] { check_owner(); ++active_calls; });
+    std::unique_ptr<AsyncDelay> delay;
+    std::future<void> delayed;
+    bool delay_on_target = false;
+    auto wait_delay = [&]() -> net::awaitable<void> {
+        co_await delay->WaitFor(1h);
+        check_owner();
+        delay_on_target = domain->OwnerId() == 1;
+    };
+    bool first_preparation = true;
+    pause.on_prepare = [&] {
+        if (!first_preparation) {
+            (void)active.ScheduleAfter(0ms);
+            return;
+        }
+        first_preparation = false;
+        // Queue business edits before the native expiry notification, without
+        // depending on how quickly the test's control loop obtains its turn.
+        domain->Execute([&] {
+            destroyed.reset();
+            (void)rearmed.ScheduleAfter(2ms);
+        });
+        (void)destroyed->ScheduleAfter(0ms);
+        (void)rearmed.ScheduleAfter(0ms);
+        (void)ready.ScheduleAfter(0ms);
+        (void)active.ScheduleAfter(90ms);
+    };
+    auto setup = net::co_spawn(domain->Executor(), [&]() -> net::awaitable<void> {
+        auto& scheduler = TimeoutScheduler::ForIoContext(old_io);
+        (void)scheduler.ScheduleAfter(1h, *destroyed);
+        (void)scheduler.ScheduleAfter(1h, rearmed);
+        (void)scheduler.ScheduleAfter(1h, ready);
+        (void)scheduler.ScheduleAfter(1h, active);
+        (void)scheduler.ScheduleAfter(1h, cleared);
+        delay = std::make_unique<AsyncDelay>(old_io);
+        delayed = net::co_spawn(domain->Executor(), wait_delay(), net::use_future);
+        domain->RegisterResource(pause);
+        co_return;
+    }, net::use_future);
+    finish(setup);
+    auto preparation = net::co_spawn(new_io,
+        domain->PreparePassiveHandoff({1, &new_io, new_io.get_executor()}), net::use_future);
+    auto handoff = finish(preparation);
+    bool passed = ready_calls == 0 && rearmed_calls == 0 && active_calls == 0;
+    auto validation = net::co_spawn(new_io, handoff->Validate([&] {
+        cleared.Cancel(); // Target validation must not touch the old heap.
+        passed = passed && !cleared.Valid();
+    }), net::use_future);
+    finish(validation);
+    // The active absolute deadline elapses while prepared. Commit must not
+    // restart its duration or wait for a callback on the retired reactor.
+    const auto deadline = std::chrono::steady_clock::now() + 70ms;
+    while (std::chrono::steady_clock::now() < deadline) {
+        pump();
+        std::this_thread::sleep_for(1ms);
+    }
+    auto commit = net::co_spawn(new_io, handoff->Commit(), net::use_future);
+    finish(commit);
+    handoff.reset();
+    const auto delivery_limit = std::chrono::steady_clock::now() + 30ms;
+    while ((active_calls == 0 || rearmed_calls == 0) &&
+           std::chrono::steady_clock::now() < delivery_limit) {
+        // After commit no old reactor polling is needed for expiry delivery.
+        new_io.restart(); new_io.poll();
+        std::this_thread::sleep_for(1ms);
+    }
+    passed = passed && domain->OwnerId() == 1 && destroyed_calls == 0 &&
+        rearmed_calls == 1 && ready_calls == 1 && active_calls == 1 && owner_correct;
+    domain->Execute([&] { delay->Cancel(); });
+    finish(delayed);
+    passed = passed && delay_on_target;
+
+    // Rollback retains the original absolute deadline and owner. A pending
+    // timer must not need a fresh duration, and stop must remove migrated slots.
+    auto arm = net::co_spawn(domain->Executor(), [&]() -> net::awaitable<void> {
+        (void)active.ScheduleAfter(10ms);
+        (void)rearmed.ScheduleAfter(1h);
+        co_return;
+    }, net::use_future);
+    finish(arm);
+    preparation = net::co_spawn(old_io,
+        domain->PreparePassiveHandoff({0, &old_io, old_io.get_executor()}), net::use_future);
+    handoff = finish(preparation);
+    passed = passed && active_calls == 1;
+    auto rollback = net::co_spawn(old_io, handoff->Cancel(), net::use_future);
+    finish(rollback);
+    handoff.reset();
+    wait_until([&] { return active_calls == 2; });
+    passed = passed && domain->OwnerId() == 1 && owner_correct && rearmed.Valid();
+    auto shutdown = net::co_spawn(domain->Executor(), [&]() -> net::awaitable<void> {
+        domain->UnregisterResource(pause);
+        delay.reset();
+        co_await TimeoutScheduler::AsyncReleaseForIoContext(new_io);
+        passed = passed && !rearmed.Valid() && !active.Valid() &&
+            !rearmed.ScheduleAfter(0ms);
+    }, net::use_future);
+    finish(shutdown);
+    passed = passed && !hooks->failure;
+    domain.reset();
+    auto finalize = net::co_spawn(old_io, [coordinator]() -> net::awaitable<void> {
+        coordinator->CloseAdmission();
+        co_await coordinator->AsyncJoin();
+        coordinator->ReleaseServices();
+        co_await coordinator->Finalize();
+    }, net::use_future);
+    finish(finalize);
+    TimeoutScheduler::ReleaseForIoContext(old_io);
+    TimeoutScheduler::ReleaseForIoContext(new_io);
+    pump();
+    return passed && destroyed_calls == 0 && cleared_calls == 0 &&
+        rearmed_calls == 1 && active_calls == 2;
 }
 
 }  // namespace
 
-int main() {
-    using namespace std::chrono_literals;
+TEST(TimeoutScheduler, Contract) {
+    const struct { const char* name; bool (*run)(); } cases[] = {
+        {"cancel/rearm/destruction without allocation", TestCancellationAndRearm},
+        {"reentrant owner destruction and exception isolation", TestReentrantDestructionAndExceptions},
+        {"self rearm and I/O fairness", TestSelfRearmAndFairness},
+        {"failed wait initiation and recovery", TestWaitInitiationFailureAndRecovery},
+        {"heap growth with PMR maintenance reentrancy", TestHeapGrowthAndReentrantMaintenance},
+        {"scheduler shard and recycled context ownership", TestShardAndRecycledContextOwnership},
+        {"maximum and negative delay", TestMaximumDelay},
+        {"pool idle wakeup and OOM recovery", TestPoolMaintenance},
+        {"maintenance isolation", TestMaintenanceIsolation},
+        {"owner-thread service destruction", TestOwnerThreadServiceDestruction},
+        {"delay cancellation and reuse", TestDelayCancellationAndReuse},
+        {"delay concurrent wait and maximum", TestDelayConcurrentWaitAndMaximum},
+        {"delay cancellation after scheduler release", TestDelayCancellationAfterRelease},
+        {"shared Worker scheduler and domain-only release", TestDomainSchedulerIsolationAndJoin},
+        {"domain pending expiry, cancellation, rearm and handoff rollback", TestDomainTimeoutHandoff},
+    };
     std::setvbuf(stdout, nullptr, _IONBF, 0);
-
-    bool allocation_checks_passed = TestResourceReuseAndPeakRetention();
-    std::printf("scheduler resource reuse: %s\n", allocation_checks_passed ? "PASS" : "FAIL");
-    allocation_checks_passed = TestPmrSchedulerReentrancy() && allocation_checks_passed;
-    std::printf("PMR scheduler reentrancy: %s\n", allocation_checks_passed ? "PASS" : "FAIL");
-    allocation_checks_passed = TestPoolMaintenance() && allocation_checks_passed;
-    std::printf("pool maintenance: %s\n", allocation_checks_passed ? "PASS" : "FAIL");
-    allocation_checks_passed = TestMaintenanceCancellation() && allocation_checks_passed;
-    allocation_checks_passed = TestCancellationAllocation() && allocation_checks_passed;
-    allocation_checks_passed = TestDestructionAllocation() && allocation_checks_passed;
-    allocation_checks_passed = TestEarlierDeadlineAllocation() && allocation_checks_passed;
-    allocation_checks_passed = TestFailedInitialWait() && allocation_checks_passed;
-    allocation_checks_passed = TestCancellationStormWithoutAllocation() && allocation_checks_passed;
-    allocation_checks_passed = TestPreemptAndReplacePendingWait() && allocation_checks_passed;
-    allocation_checks_passed = TestSleepCancellationAllocation() && allocation_checks_passed;
-    allocation_checks_passed = TestDelayParentCancellationAndReuse() && allocation_checks_passed;
-    allocation_checks_passed = TestMaximumDelayWait() && allocation_checks_passed;
-    allocation_checks_passed = TestMaximumDelay() && allocation_checks_passed;
-    if (!allocation_checks_passed) return 110;
-
-    std::optional<acpp::net::io_context> recycled_io_context;
-    for (size_t iteration = 0; iteration < 4; ++iteration) {
-        recycled_io_context.emplace();
-        bool recycled_callback_ran = false;
-        {
-            auto& recycled_scheduler =
-                acpp::TimeoutScheduler::ForIoContext(*recycled_io_context);
-            auto recycled_token = recycled_scheduler.ScheduleAfter(
-                1ms, [&]() { recycled_callback_ran = true; });
-            std::this_thread::sleep_for(10ms);
-            recycled_io_context->run();
-            recycled_scheduler.Cancel(recycled_token);
-        }
-        if (!recycled_callback_ran) {
-            return 100;
-        }
-        recycled_io_context.reset();
+    bool passed = true;
+    for (const auto& test : cases) {
+        bool result = false;
+        try { result = test.run(); }
+        catch (const std::exception& error) { std::printf("%s: %s\n", test.name, error.what()); }
+        timeout_allocation_test::reject_asio_allocations = reject_allocations = false;
+        memory::reject_next_process_allocation = false;
+        std::printf("%s: %s\n", test.name, result ? "PASS" : "FAIL");
+        passed = passed && result;
     }
+    { ASSERT_TRUE(passed); return; }
+}
 
-    acpp::net::io_context io_context;
-    auto& scheduler = acpp::TimeoutScheduler::ForIoContext(io_context);
-
-    bool abandoned_ran = false;
-    {
-        auto abandoned = scheduler.ScheduleAfter(1ms, [&]() {
-            abandoned_ran = true;
-        });
-        if (!abandoned.Valid()) {
-            return 101;
-        }
-    }
-    std::this_thread::sleep_for(10ms);
-    io_context.run();
-    if (abandoned_ran) {
-        return 102;
-    }
-    io_context.restart();
-
-    bool first_ran = false;
-    bool cancelled_ran = false;
-    acpp::TimeoutToken cancelled;
-
-    auto first = scheduler.ScheduleAfter(1ms, [&]() {
-        first_ran = true;
-        scheduler.Cancel(cancelled);
-    });
-    cancelled = scheduler.ScheduleAfter(1ms, [&]() {
-        cancelled_ran = true;
-    });
-
-    // Make both deadlines ready before the first timer handler collects its
-    // batch. The first callback must still be able to cancel the second one.
-    std::this_thread::sleep_for(10ms);
-    io_context.run();
-
-    if (!first_ran) {
-        return 1;
-    }
-    if (cancelled_ran) {
-        return 2;
-    }
-    if (cancelled.Valid()) {
-        return 3;
-    }
-
-    scheduler.Cancel(first);
-
-    bool after_throw_ran = false;
-    auto throwing = scheduler.ScheduleAfter(1ms, []() {
-        throw std::runtime_error("timeout callback failure");
-    });
-    auto after_throw = scheduler.ScheduleAfter(1ms, [&]() {
-        after_throw_ran = true;
-    });
-
-    std::this_thread::sleep_for(10ms);
-    io_context.restart();
-    try {
-        io_context.run();
-    } catch (...) {
-        return 4;
-    }
-    if (!after_throw_ran) {
-        return 5;
-    }
-
-    scheduler.Cancel(throwing);
-    scheduler.Cancel(after_throw);
-
-    auto long_lived = scheduler.ScheduleAfter(1h, []() {});
-    scheduler.Cancel(long_lived);
-
-    io_context.restart();
-    std::promise<void> run_finished;
-    auto run_finished_future = run_finished.get_future();
-    std::thread runner([&]() {
-        io_context.run();
-        run_finished.set_value();
-    });
-    if (run_finished_future.wait_for(1s) != std::future_status::ready) {
-        io_context.stop();
-        runner.join();
-        acpp::TimeoutScheduler::ReleaseForIoContext(io_context);
-        return 6;
-    }
-    runner.join();
-
-    acpp::net::io_context left_io_context;
-    acpp::net::io_context right_io_context;
-    auto& left_scheduler =
-        acpp::TimeoutScheduler::ForIoContext(left_io_context);
-    auto& right_scheduler =
-        acpp::TimeoutScheduler::ForIoContext(right_io_context);
-    bool left_ran = false;
-    bool right_ran = false;
-    auto left_token = left_scheduler.ScheduleAfter(1ms, [&]() {
-        left_ran = true;
-    });
-    auto right_token = right_scheduler.ScheduleAfter(1ms, [&]() {
-        right_ran = true;
-    });
-
-    // Both scheduler shards start at event ID 1. Passing the other shard's
-    // token must neither invalidate it nor cancel this shard's same-ID event.
-    left_scheduler.Cancel(right_token);
-    if (!right_token.Valid()) {
-        acpp::TimeoutScheduler::ReleaseForIoContext(right_io_context);
-        acpp::TimeoutScheduler::ReleaseForIoContext(left_io_context);
-        acpp::TimeoutScheduler::ReleaseForIoContext(io_context);
-        return 7;
-    }
-
-    std::this_thread::sleep_for(10ms);
-    left_io_context.run();
-    right_io_context.run();
-    if (!left_ran || !right_ran) {
-        acpp::TimeoutScheduler::ReleaseForIoContext(right_io_context);
-        acpp::TimeoutScheduler::ReleaseForIoContext(left_io_context);
-        acpp::TimeoutScheduler::ReleaseForIoContext(io_context);
-        return 8;
-    }
-
-    left_scheduler.Cancel(left_token);
-    right_scheduler.Cancel(right_token);
-    acpp::TimeoutScheduler::ReleaseForIoContext(right_io_context);
-    acpp::TimeoutScheduler::ReleaseForIoContext(left_io_context);
-
-    acpp::net::io_context fairness_io_context;
-    auto& fairness_scheduler =
-        acpp::TimeoutScheduler::ForIoContext(fairness_io_context);
-    constexpr size_t kTimeoutStormSize = 256;
-    constexpr size_t kExpectedMaxReadyBatch = 64;
-    size_t timeout_callbacks = 0;
-    size_t callbacks_seen_by_post = 0;
-    std::vector<acpp::TimeoutToken> storm_tokens;
-    storm_tokens.reserve(kTimeoutStormSize);
-    for (size_t i = 0; i < kTimeoutStormSize; ++i) {
-        storm_tokens.push_back(fairness_scheduler.ScheduleAfter(1ms, [&]() {
-            ++timeout_callbacks;
-            if (timeout_callbacks == 1) {
-                acpp::net::post(fairness_io_context, [&]() {
-                    callbacks_seen_by_post = timeout_callbacks;
-                });
-            }
-        }));
-    }
-
-    std::this_thread::sleep_for(10ms);
-    fairness_io_context.run();
-    if (timeout_callbacks != kTimeoutStormSize) {
-        acpp::TimeoutScheduler::ReleaseForIoContext(fairness_io_context);
-        acpp::TimeoutScheduler::ReleaseForIoContext(io_context);
-        return 9;
-    }
-    if (callbacks_seen_by_post == 0 ||
-        callbacks_seen_by_post > kExpectedMaxReadyBatch) {
-        acpp::TimeoutScheduler::ReleaseForIoContext(fairness_io_context);
-        acpp::TimeoutScheduler::ReleaseForIoContext(io_context);
-        return 10;
-    }
-    for (auto& token : storm_tokens) {
-        fairness_scheduler.Cancel(token);
-    }
-    acpp::TimeoutScheduler::ReleaseForIoContext(fairness_io_context);
-
-    acpp::net::io_context cancellation_io_context;
-    auto& cancellation_scheduler =
-        acpp::TimeoutScheduler::ForIoContext(cancellation_io_context);
-    auto keeper = cancellation_scheduler.ScheduleAfter(1h, []() {});
-    constexpr size_t kCancellationStormSize = 4096;
-    for (size_t i = 0; i < kCancellationStormSize; ++i) {
-        auto token = cancellation_scheduler.ScheduleAfter(2h, []() {});
-        cancellation_scheduler.Cancel(token);
-        if (token.Valid()) {
-            acpp::TimeoutScheduler::ReleaseForIoContext(
-                cancellation_io_context);
-            acpp::TimeoutScheduler::ReleaseForIoContext(io_context);
-            return 11;
-        }
-    }
-
-    bool after_cancellation_storm_ran = false;
-    auto after_cancellation_storm =
-        cancellation_scheduler.ScheduleAfter(1ms, [&]() {
-            after_cancellation_storm_ran = true;
-        });
-    std::this_thread::sleep_for(10ms);
-    cancellation_io_context.run_for(100ms);
-    if (!after_cancellation_storm_ran) {
-        acpp::TimeoutScheduler::ReleaseForIoContext(cancellation_io_context);
-        acpp::TimeoutScheduler::ReleaseForIoContext(io_context);
-        return 12;
-    }
-    cancellation_scheduler.Cancel(after_cancellation_storm);
-    cancellation_scheduler.Cancel(keeper);
-    acpp::TimeoutScheduler::ReleaseForIoContext(cancellation_io_context);
-
-    acpp::net::io_context sleep_io_context;
-    auto& sleep_scheduler =
-        acpp::TimeoutScheduler::ForIoContext(sleep_io_context);
-    acpp::AsyncDelay repeated_cancel_sleep(sleep_io_context);
-    bool second_wait_started = false;
-    bool second_wait_completed = false;
-    bool second_wait_completed_before_probe = false;
-    auto sleep_future = acpp::net::co_spawn(
-        sleep_io_context,
-        [&]() -> acpp::net::awaitable<void> {
-            co_await repeated_cancel_sleep.WaitFor(1h);
-            second_wait_started = true;
-            co_await repeated_cancel_sleep.WaitFor(1h);
-            second_wait_completed = true;
-        },
-        acpp::net::use_future);
-    acpp::net::post(sleep_io_context, [&]() {
-        repeated_cancel_sleep.Cancel();
-        repeated_cancel_sleep.Cancel();
-    });
-    auto sleep_probe = sleep_scheduler.ScheduleAfter(50ms, [&]() {
-        second_wait_completed_before_probe = second_wait_completed;
-        repeated_cancel_sleep.Cancel();
-    });
-
-    sleep_io_context.run();
-    try {
-        sleep_future.get();
-    } catch (...) {
-        acpp::TimeoutScheduler::ReleaseForIoContext(sleep_io_context);
-        acpp::TimeoutScheduler::ReleaseForIoContext(io_context);
-        return 13;
-    }
-    if (!second_wait_started || !second_wait_completed ||
-        second_wait_completed_before_probe) {
-        acpp::TimeoutScheduler::ReleaseForIoContext(sleep_io_context);
-        acpp::TimeoutScheduler::ReleaseForIoContext(io_context);
-        return 14;
-    }
-    sleep_scheduler.Cancel(sleep_probe);
-    acpp::TimeoutScheduler::ReleaseForIoContext(sleep_io_context);
-
-    acpp::net::io_context assignment_io_context;
-    auto& assignment_scheduler =
-        acpp::TimeoutScheduler::ForIoContext(assignment_io_context);
-    bool displaced_token_ran = false;
-    bool replacement_token_ran = false;
-    auto assigned_token = assignment_scheduler.ScheduleAfter(1ms, [&]() {
-        displaced_token_ran = true;
-    });
-    assigned_token = assignment_scheduler.ScheduleAfter(1ms, [&]() {
-        replacement_token_ran = true;
-    });
-    std::this_thread::sleep_for(10ms);
-    assignment_io_context.run();
-    if (displaced_token_ran) {
-        acpp::TimeoutScheduler::ReleaseForIoContext(assignment_io_context);
-        acpp::TimeoutScheduler::ReleaseForIoContext(io_context);
-        return 15;
-    }
-    if (!replacement_token_ran) {
-        acpp::TimeoutScheduler::ReleaseForIoContext(assignment_io_context);
-        acpp::TimeoutScheduler::ReleaseForIoContext(io_context);
-        return 16;
-    }
-    assignment_scheduler.Cancel(assigned_token);
-    acpp::TimeoutScheduler::ReleaseForIoContext(assignment_io_context);
-
-    acpp::net::io_context concurrent_sleep_io_context;
-    auto& concurrent_sleep_scheduler =
-        acpp::TimeoutScheduler::ForIoContext(concurrent_sleep_io_context);
-    bool concurrent_wait_rejected = false;
-    {
-        acpp::AsyncDelay single_wait_sleep(concurrent_sleep_io_context);
-        auto first_wait = acpp::net::co_spawn(
-            concurrent_sleep_io_context,
-            [&]() -> acpp::net::awaitable<void> {
-                co_await single_wait_sleep.WaitFor(1h);
-            },
-            acpp::net::use_future);
-        auto second_wait = acpp::net::co_spawn(
-            concurrent_sleep_io_context,
-            [&]() -> acpp::net::awaitable<void> {
-                co_await single_wait_sleep.WaitFor(1h);
-            },
-            acpp::net::use_future);
-        auto concurrent_sleep_probe =
-            concurrent_sleep_scheduler.ScheduleAfter(20ms, [&]() {
-                single_wait_sleep.Cancel();
+TEST(SessionGroupExecutor, AllocationFailureRollsBackBeforeWorkerStarts) {
+    struct Hooks final : ExecutionDomain::Hooks {
+        bool entered = false;
+        void Enter() noexcept override { entered = true; }
+        void Leave() noexcept override { entered = false; }
+        void OnFailure(std::exception_ptr) noexcept override { std::terminate(); }
+    };
+    net::io_context control, worker;
+    auto coordinator = std::make_shared<GroupCoordinator>(control);
+    coordinator->RegisterWorker(0, worker, worker.get_executor());
+    coordinator->Start();
+    control.poll();
+    bool recovered = false;
+    for (std::ptrdiff_t fail_at = 0; fail_at != 64; ++fail_at) {
+        auto hooks = std::make_shared<Hooks>();
+        const std::weak_ptr<Hooks> released = hooks;
+        std::shared_ptr<ExecutionDomain> domain;
+        bool failed = false;
+        timeout_allocation_test::fail_after = fail_at;
+        try {
+            domain = ExecutionDomain::Create(
+                worker, 0, worker.get_executor(), std::move(hooks), coordinator);
+        } catch (const std::bad_alloc&) { failed = true; }
+        timeout_allocation_test::fail_after = -1;
+        if (failed) {
+            EXPECT_TRUE(released.expired())
+                << "construction failure retained its host at allocation " << fail_at;
+        } else {
+            bool entered = false;
+            domain->Execute([&] {
+                auto owner = released.lock();
+                entered = ExecutionDomain::Current() == domain && owner && owner->entered;
             });
-
-        concurrent_sleep_io_context.run_for(100ms);
-        if (first_wait.wait_for(0ms) == std::future_status::ready) {
-            try {
-                first_wait.get();
-            } catch (...) {
-                acpp::TimeoutScheduler::ReleaseForIoContext(io_context);
-                return 17;
-            }
+            worker.restart();
+            worker.poll();
+            EXPECT_TRUE(entered) << "recovered domain did not execute under its host lease";
+            domain.reset();
+            recovered = true;
         }
-        if (second_wait.wait_for(0ms) == std::future_status::ready) {
-            try {
-                second_wait.get();
-            } catch (const std::logic_error&) {
-                concurrent_wait_rejected = true;
-            } catch (...) {
-                acpp::TimeoutScheduler::ReleaseForIoContext(io_context);
-                return 18;
-            }
-        }
-        concurrent_sleep_scheduler.Cancel(concurrent_sleep_probe);
-        concurrent_sleep_io_context.stop();
+        // Drain only after checking rollback: a failed candidate must not need
+        // a Worker which may never start after construction has thrown.
+        worker.restart();
+        worker.poll();
+        EXPECT_TRUE(released.expired()) << "host survived owner cleanup";
+        control.poll();
+        if (recovered) break;
     }
-    acpp::TimeoutScheduler::ReleaseForIoContext(concurrent_sleep_io_context);
-    if (!concurrent_wait_rejected) {
-        acpp::TimeoutScheduler::ReleaseForIoContext(io_context);
-        return 19;
-    }
+    EXPECT_TRUE(recovered) << "allocation sweep never reached a healthy domain";
+    bool finalized = false;
+    net::co_spawn(control, [coordinator]() -> net::awaitable<void> {
+        coordinator->CloseAdmission();
+        co_await coordinator->AsyncJoin();
+        coordinator->ReleaseServices();
+        co_await coordinator->Finalize();
+    }, [&](std::exception_ptr error) { finalized = !error; });
+    control.restart();
+    control.run_for(1s);
+    EXPECT_TRUE(finalized) << "construction rollback left coordinator ownership";
+}
 
-    acpp::TimeoutScheduler::ReleaseForIoContext(io_context);
-    return 0;
+namespace {
+void FailedStartupDoesNotStrandRetirement(bool fail_arm) {
+    struct Hooks final : ExecutionDomain::Hooks {
+        void Enter() noexcept override {}
+        void Leave() noexcept override {}
+        void OnFailure(std::exception_ptr) noexcept override { std::terminate(); }
+    };
+    net::io_context control, worker;
+    auto coordinator = std::make_shared<GroupCoordinator>(control);
+    coordinator->RegisterWorker(0, worker, worker.get_executor());
+    bool failed = false;
+    if (fail_arm) coordinator->Start();
+    timeout_allocation_test::reject_asio_allocations = true;
+    try {
+        if (fail_arm) control.poll();
+        else coordinator->Start();
+    }
+    catch (const std::bad_alloc&) { failed = true; }
+    timeout_allocation_test::reject_asio_allocations = false;
+    EXPECT_TRUE(failed) << "startup allocation fault was not exercised";
+    coordinator->Start();
+    control.restart();
+    control.poll();
+    auto hooks = std::make_shared<Hooks>();
+    const std::weak_ptr<Hooks> released = hooks;
+    auto domain = ExecutionDomain::Create(
+        worker, 0, worker.get_executor(), std::move(hooks), coordinator);
+    bool finalized = false;
+    std::exception_ptr failure;
+    net::co_spawn(control, [coordinator]() -> net::awaitable<void> {
+        coordinator->CloseAdmission();
+        co_await coordinator->AsyncJoin();
+        coordinator->ReleaseServices();
+        co_await coordinator->Finalize();
+    }, [&](std::exception_ptr error) {
+        failure = error;
+        finalized = true;
+    });
+    control.restart();
+    control.poll();
+    EXPECT_FALSE(finalized) << "finalization failed to wait for the live domain";
+    domain.reset();
+    worker.poll();
+    EXPECT_TRUE(released.expired()) << "owner Worker retained the retired host";
+    control.restart();
+    control.run_for(1s);
+    EXPECT_TRUE(finalized)
+        << "startup retry did not restore native retirement notifications";
+    // Preserve the observation above, then drain a broken implementation so
+    // this failure does not leave the fixture's pending Finalize coroutine.
+    if (!finalized) {
+        net::co_spawn(control, coordinator->AsyncJoin(),
+            [&](std::exception_ptr error) { if (error) failure = error; });
+        control.restart();
+        control.run_for(1s);
+    }
+    EXPECT_TRUE(finalized) << "manual fixture cleanup did not join finalization";
+    EXPECT_FALSE(failure);
+}
+}  // namespace
+
+TEST(SessionGroupExecutor, FailedStartDoesNotStrandNativeRetirement) {
+    FailedStartupDoesNotStrandRetirement(false);
+}
+
+TEST(SessionGroupExecutor, FailedNativeArmDoesNotStrandRetirement) {
+    FailedStartupDoesNotStrandRetirement(true);
+}
+
+namespace {
+enum class RearmResolution { Restart, StopRetired, StopLive };
+
+void FailedRearmDoesNotStrandShutdown(RearmResolution resolution) {
+    struct Hooks final : ExecutionDomain::Hooks {
+        void Enter() noexcept override {}
+        void Leave() noexcept override {}
+        void OnFailure(std::exception_ptr) noexcept override { std::terminate(); }
+    };
+    net::io_context control, worker;
+    net::posix::stream_descriptor spare(control);
+    const int fd = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    if (fd < 0) throw std::runtime_error("cannot create spare native notification");
+    try { spare.assign(fd); }
+    catch (...) { ::close(fd); throw; }
+    auto coordinator = std::make_shared<GroupCoordinator>(control);
+    coordinator->RegisterWorker(0, worker, worker.get_executor());
+    coordinator->Start();
+    control.poll();
+    auto hooks = std::make_shared<Hooks>();
+    const std::weak_ptr<Hooks> released = hooks;
+    auto domain = ExecutionDomain::Create(
+        worker, 0, worker.get_executor(), std::move(hooks), coordinator);
+    bool spare_completed = false;
+    struct ConsumeWaitStorage final : GroupCoordinator::ReservedOperation {
+        net::posix::stream_descriptor& spare;
+        bool& completed;
+        ConsumeWaitStorage(net::posix::stream_descriptor& spare, bool& completed)
+            : spare(spare), completed(completed) {}
+        void Invoke() noexcept override {
+            // Consume the just-completed descriptor wait's recycled block.
+            // Rearming the real collector must then cross the fault seam.
+            spare.async_wait(net::posix::stream_descriptor::wait_read,
+                [flag = &completed](IoErrorCode) { *flag = true; });
+            timeout_allocation_test::reject_asio_allocations = true;
+        }
+    };
+    coordinator->PostReserved(
+        std::make_unique<ConsumeWaitStorage>(spare, spare_completed));
+    bool failed = false;
+    try { control.poll(); }
+    catch (const std::bad_alloc&) { failed = true; }
+    timeout_allocation_test::reject_asio_allocations = false;
+    if (!failed) {
+        std::fprintf(stderr, "native rearm allocation fault was not exercised\n");
+        std::_Exit(2);
+    }
+    spare.cancel();
+    control.restart();
+    control.poll();
+    if (!spare_completed) {
+        std::fprintf(stderr, "spare native wait did not join\n");
+        std::_Exit(2);
+    }
+    if (resolution == RearmResolution::Restart) {
+        coordinator->Start();
+        control.restart();
+        control.poll();
+    }
+    if (resolution == RearmResolution::StopRetired) {
+        domain.reset();
+        worker.poll();
+    }
+    bool finalized = false;
+    std::exception_ptr failure;
+    net::co_spawn(control, [coordinator]() -> net::awaitable<void> {
+        coordinator->CloseAdmission();
+        co_await coordinator->AsyncJoin();
+        coordinator->ReleaseServices();
+        co_await coordinator->Finalize();
+    }, [&](std::exception_ptr error) {
+        failure = error;
+        finalized = true;
+    });
+    control.restart();
+    control.poll();
+    if (domain) {
+        if (finalized) {
+            std::fprintf(stderr, "finalization did not retain the live domain\n");
+            std::_Exit(2);
+        }
+        domain.reset();
+        worker.poll();
+    }
+    control.restart();
+    control.run_for(1s);
+    if (!finalized || failure || !released.expired()) {
+        std::fprintf(stderr, "native rearm failure stranded domain retirement or shutdown\n");
+        std::_Exit(1);
+    }
+    const std::weak_ptr<GroupCoordinator> retired = coordinator;
+    coordinator.reset();
+    if (!retired.expired()) {
+        std::fprintf(stderr, "finalization retained the coordinator\n");
+        std::_Exit(2);
+    }
+}
+}  // namespace
+
+TEST(SessionGroupExecutorDeathTest, FailedRearmCanRestart) {
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    EXPECT_EXIT({
+        FailedRearmDoesNotStrandShutdown(RearmResolution::Restart);
+        std::_Exit(0);
+    }, ::testing::ExitedWithCode(0), "");
+}
+
+TEST(SessionGroupExecutorDeathTest, FailedRearmCanStopWithRetiredDomains) {
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    EXPECT_EXIT({
+        FailedRearmDoesNotStrandShutdown(RearmResolution::StopRetired);
+        std::_Exit(0);
+    }, ::testing::ExitedWithCode(0), "");
+}
+
+TEST(SessionGroupExecutorDeathTest, FailedRearmCanJoinLiveDomains) {
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    EXPECT_EXIT({
+        FailedRearmDoesNotStrandShutdown(RearmResolution::StopLive);
+        std::_Exit(0);
+    }, ::testing::ExitedWithCode(0), "");
 }

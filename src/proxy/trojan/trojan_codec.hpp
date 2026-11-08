@@ -6,15 +6,17 @@
 // 职责：协议常量、请求结构体、握手结果、编解码逻辑（TCP + UDP）
 // ============================================================================
 
-#include "acppnode/common.hpp"
-#include "acppnode/common/target_address.hpp"
+#include "credentials.hpp"
+#include "common.hpp"
+#include "common/target_address.hpp"
+#include "common/address_codec.hpp"
 
 #include <array>
 #include <optional>
 #include <span>
 #include <string_view>
 
-namespace acpp::trojan {
+namespace trojan {
 
 // ============================================================================
 // Trojan 命令类型
@@ -28,68 +30,51 @@ enum class TrojanCommand : uint8_t {
 // Trojan 请求
 // ============================================================================
 struct TrojanRequest {
-    std::array<char, 56> password_hash{};  // SHA224 密码哈希（十六进制，56字节）
+    PasswordHash         password_hash{};  // SHA224 密码哈希（十六进制，56字节）
     TrojanCommand        command = TrojanCommand::CONNECT;
     TargetAddress        target;
+    std::optional<ForwardedMetadata> forwarded;
 
     [[nodiscard]] std::string_view PasswordHashView() const noexcept {
         return {password_hash.data(), password_hash.size()};
     }
 };
-// ============================================================================
-// Trojan 协议编解码
-// ============================================================================
-class TrojanCodec {
-public:
-    // 解析请求
-    // 返回解析结果，如果数据不足返回 nullopt
-    static std::optional<TrojanRequest> ParseRequest(
-        const uint8_t* data,
-        size_t len,
-        size_t& consumed);
 
-    // in-place 编码请求，避免热路径分配
-    static size_t EncodeRequestTo(
-        std::span<const char, 56> password_hash,
-        TrojanCommand cmd,
-        const TargetAddress& target,
-        uint8_t* output,
-        size_t output_size,
-        const uint8_t* payload = nullptr,
-        size_t payload_len = 0);
+inline constexpr size_t kPasswordHashSize = std::tuple_size_v<PasswordHash>;
+// hash + CRLF + command; the SOCKS5 address and a final CRLF follow.
+inline constexpr size_t kRequestPrefixSize = kPasswordHashSize + 3;
 
-    // UDP 包格式
-    struct UdpPacket {
-        TargetAddress target;
-        std::span<const uint8_t> payload;
-    };
+enum class RequestDecodeStatus : uint8_t { Complete, Incomplete, InvalidHeader, InvalidAddress };
 
-    // UDP 解析结果类型
-    enum class UdpParseResult {
-        SUCCESS,      // 解析成功
-        INCOMPLETE,   // 数据不完整，需要更多数据
-        INVALID       // 格式错误（atype 非法、CRLF 不匹配等）
-    };
-
-    // UDP 解析输出
-    struct UdpParseOutput {
-        UdpParseResult result = UdpParseResult::INCOMPLETE;
-        std::optional<UdpPacket> packet;
-        size_t consumed = 0;
-    };
-
-    // 解析单个 UDP 包。SUCCESS 时 consumed 表示完整 frame 长度；
-    // INCOMPLETE 时保留输入等待更多字节；INVALID 时调用方可丢弃/同步。
-    static UdpParseOutput ParseUdpPacket(
-        const uint8_t* data,
-        size_t len);
-
-    // 编码 UDP 包头部（in-place 版本，避免内存分配）
-    // 返回实际写入字节数，0 表示失败（缓冲区太小）
-    static size_t EncodeUdpPacketHeaderTo(
-        const TargetAddress& target,
-        size_t payload_len,
-        uint8_t* output,
-        size_t output_size);
+struct RequestDecodeResult {
+    RequestDecodeStatus status = RequestDecodeStatus::Incomplete;
+    TrojanRequest request;
+    size_t consumed = 0;
+    // Incomplete only: minimum total request bytes for the next stage; never
+    // beyond the end of a valid request header.
+    size_t required = 0;
 };
-}  // namespace acpp::trojan
+
+// Single-pass incremental decode of the buffered request prefix: each call
+// reports the next required length until the header is complete.
+[[nodiscard]] RequestDecodeResult DecodeRequest(std::span<const uint8_t> data);
+
+// 返回写入字节数，0 表示目标非法或缓冲区不足。
+[[nodiscard]] size_t EncodeRequestTo(
+    std::span<const char, 56> password_hash,
+    TrojanCommand cmd,
+    const TargetAddress& target,
+    uint8_t* output,
+    size_t output_size,
+    const uint8_t* payload = nullptr,
+    size_t payload_len = 0,
+    ForwardedMetadataView forwarded = {});
+
+// 返回写入字节数，0 表示目标非法、负载超过 uint16 或缓冲区不足。
+[[nodiscard]] size_t EncodeUdpPacketHeaderTo(
+    const TargetAddress& target,
+    size_t payload_len,
+    uint8_t* output,
+    size_t output_size);
+
+}  // namespace trojan

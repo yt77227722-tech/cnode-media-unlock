@@ -1,7 +1,6 @@
 #pragma once
 
-#include "acppnode/core/constants.hpp"
-#include "acppnode/proxy/outbound.hpp"
+#include "proxy/outbound.hpp"
 
 #include <chrono>
 #include <cstdint>
@@ -9,13 +8,13 @@
 #include <string>
 #include <string_view>
 
-namespace acpp::proxy::blackhole::outbound {
+namespace proxy::blackhole::outbound {
 
 // ============================================================================
 // Blackhole 出站设置
 // ============================================================================
 struct BlackholeSettings {
-    std::string response = std::string(constants::protocol::kNone);  // none / http
+    bool http_response = false;  // response.type == "http"
 };
 
 // ============================================================================
@@ -23,25 +22,21 @@ struct BlackholeSettings {
 // ============================================================================
 class Handler final : public Outbound {
 public:
-    Handler(const std::string& tag, const BlackholeSettings& settings);
+    explicit Handler(const BlackholeSettings& settings);
 
     net::awaitable<OutboundProcessResult> Process(
-        net::io_context& io_context,
-        const tcp::endpoint* inbound_local_addr,
         session::Context& ctx,
-        const TimeoutsConfig& timeouts,
         transport::Link inbound,
+        OutboundDialer& dialer,
+        const TimeoutsConfig& timeouts,
         StatsShard& stats,
         const RelayConfig& relay_config,
-        buf::MultiBuffer first_payload,
+        buf::MultiBufferBatch first_payload,
         std::chrono::seconds relay_idle_timeout,
         std::chrono::seconds relay_write_timeout) override;
 
-    std::string_view Tag() const noexcept override { return tag_; }
-
 private:
-    std::string tag_;
-    BlackholeSettings settings_;
+    bool http_response_;
 };
 
-}  // namespace acpp::proxy::blackhole::outbound
+}  // namespace proxy::blackhole::outbound

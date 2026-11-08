@@ -1,6 +1,6 @@
 #include "config_semantics.hpp"
 
-#include "acppnode/core/naming.hpp"
+#include "core/naming.hpp"
 
 #include <format>
 #include <stdexcept>
@@ -10,7 +10,6 @@
 #include <unordered_set>
 #include <vector>
 
-namespace acpp {
 
 ConfigSemanticValidation ValidateOutboundSelectionSemantics(
     std::span<const infra::OutboundSourceConfig> outbounds,
@@ -83,33 +82,6 @@ ConfigSemanticValidation ValidateOutboundSelectionSemantics(
     return {};
 }
 
-std::vector<IgnoredRouteRule> IgnoreUnknownRoutingRules(
-    std::span<const infra::OutboundSourceConfig> outbounds,
-    std::vector<RouteRuleConfig>& rules) {
-    std::unordered_set<std::string_view> tags;
-    tags.reserve(outbounds.size());
-    for (const auto& outbound : outbounds) {
-        tags.insert(outbound.tag);
-    }
-
-    std::vector<IgnoredRouteRule> ignored;
-    ignored.reserve(rules.size());
-    size_t index = 0;
-    std::erase_if(rules, [&](const RouteRuleConfig& rule) {
-        const bool unknown = !rule.outbound_tag.empty() &&
-                             !tags.contains(rule.outbound_tag);
-        if (unknown) {
-            ignored.push_back(IgnoredRouteRule{
-                .index = index,
-                .tag = rule.outbound_tag,
-            });
-        }
-        ++index;
-        return unknown;
-    });
-    return ignored;
-}
-
 std::string StaticInboundSemanticValidation::Message() const {
     switch (error) {
         case StaticInboundSemanticError::None: return {};
@@ -143,28 +115,42 @@ StaticInboundSemanticValidation ValidateStaticInboundSemantics(
             };
         }
 
-        std::string tag = inbound.tags.empty()
-            ? naming::BuildProtocolPortTag(inbound.protocol, inbound.port)
-            : inbound.tags.front();
-        if (tag.empty()) {
-            return {
-                .error = StaticInboundSemanticError::EmptyTag,
-                .index = i,
-                .conflicting_index = 0,
-                .detail = {},
-            };
-        }
-        if (tag.starts_with(naming::kPanelNodeTagPrefix)) {
-            return {.error = StaticInboundSemanticError::ReservedTag,
-                    .index = i, .conflicting_index = 0, .detail = std::move(tag)};
-        }
-        if (const auto [it, inserted] = tags.emplace(tag, i); !inserted) {
-            return {
-                .error = StaticInboundSemanticError::DuplicateTag,
-                .index = i,
-                .conflicting_index = it->second,
-                .detail = std::move(tag),
-            };
+        auto validate_tag = [&](std::string tag) -> StaticInboundSemanticValidation {
+            if (tag.empty()) {
+                return {
+                    .error = StaticInboundSemanticError::EmptyTag,
+                    .index = i,
+                    .conflicting_index = 0,
+                    .detail = {},
+                };
+            }
+            if (tag.starts_with(naming::kPanelNodeTagPrefix)) {
+                return {.error = StaticInboundSemanticError::ReservedTag,
+                        .index = i, .conflicting_index = 0, .detail = std::move(tag)};
+            }
+            if (const auto [it, inserted] = tags.emplace(std::move(tag), i); !inserted) {
+                return {
+                    .error = StaticInboundSemanticError::DuplicateTag,
+                    .index = i,
+                    .conflicting_index = it->second,
+                    .detail = it->first,
+                };
+            }
+            return {};
+        };
+
+        if (inbound.tags.empty()) {
+            if (auto err = validate_tag(
+                    naming::BuildProtocolPortTag(inbound.protocol, inbound.port));
+                !err.Ok()) {
+                return err;
+            }
+        } else {
+            for (const auto& tag : inbound.tags) {
+                if (auto err = validate_tag(tag); !err.Ok()) {
+                    return err;
+                }
+            }
         }
 
         for (size_t previous = 0; previous < i; ++previous) {
@@ -183,4 +169,3 @@ StaticInboundSemanticValidation ValidateStaticInboundSemantics(
     return {};
 }
 
-}  // namespace acpp
