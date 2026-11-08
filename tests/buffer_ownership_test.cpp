@@ -192,7 +192,7 @@ void InitialMatrix() {
             auto expected = mode == 2 ? std::vector<uint8_t>{} : before;
             expected.insert(expected.end(), added.begin(), added.end());
             const bool matched = Matches(payload, expected);
-            auto moved = payload.MoveToMultiBuffer();
+            auto moved = std::move(payload).MoveToMultiBuffer();
             return unchanged && matched && payload.empty() && Flatten(moved) == expected && Consistent(moved);
         });
     }
@@ -382,7 +382,7 @@ void EdgeCases() {
     buf::MultiBuffer transferred;
     Check(Inject(0, [&] {
         InitialPayload from_stream{std::move(owned)};
-        transferred = from_stream.MoveToMultiBuffer();
+        transferred = std::move(from_stream).MoveToMultiBuffer();
         return from_stream.empty();
     }) && owned.empty() && *transferred.begin() == original_buffer &&
           Flatten(transferred) == owned_bytes, "logical stream remainder transfers without allocation or payload copy");
@@ -534,7 +534,7 @@ TEST(BufferOwnership, EmptyUdpMessageSurvivesTransfersAndChecksEveryTarget) {
     InitialPayload initial(std::move(packet));
     EXPECT_FALSE(initial.empty());
     EXPECT_EQ(initial.size(), 0);
-    auto moved = initial.MoveToMultiBuffer();
+    auto moved = std::move(initial).MoveToMultiBuffer();
     moved.ReleaseIfIdle();
     EXPECT_TRUE(initial.empty());
     {
@@ -629,4 +629,46 @@ TEST(BufferOwnership, PacketStreamRetiresPartiallyAppendedInputOnRequiredAllocat
     EXPECT_TRUE(output.empty());
     EXPECT_THROW(stream.Append({}), IoSystemError);
     EXPECT_THROW(stream.Finish(), IoSystemError);
+}
+
+TEST(BufferOwnership, TruncatedPacketStreamCannotResumeAfterEof) {
+    const std::array<uint8_t, 5> wire{0, 3, 0x11, 0x22, 0x33};
+    for (size_t cut = 1; cut < wire.size(); ++cut) {
+        SCOPED_TRACE(cut);
+        buf::LengthPrefixedPacketBuffer stream;
+        stream.Append(Packet(std::span(wire).first(cut)));
+        buf::MultiBuffer output;
+        ASSERT_EQ(stream.Pop(output), buf::LengthPrefixedPacketBuffer::PopResult::NeedMore);
+        EXPECT_THROW(stream.Finish(), IoSystemError);
+        EXPECT_EQ(stream.PendingBytes(), 0);
+        EXPECT_THROW(stream.Append(Packet(std::span(wire).subspan(cut))), IoSystemError);
+        EXPECT_EQ(stream.Pop(output), buf::LengthPrefixedPacketBuffer::PopResult::Invalid);
+        EXPECT_TRUE(output.empty());
+        EXPECT_THROW(stream.Finish(), IoSystemError);
+        stream.Reset();
+        stream.Append(Packet(wire));
+        ASSERT_EQ(stream.Pop(output), buf::LengthPrefixedPacketBuffer::PopResult::Packet);
+        EXPECT_EQ(Flatten(output), std::vector<uint8_t>({0x11, 0x22, 0x33}));
+        stream.Finish();
+    }
+}
+
+TEST(BufferOwnership, CleanPacketStreamEofRequiresExplicitResetBeforeReuse) {
+    const std::array<uint8_t, 3> wire{0, 1, 0x73};
+    buf::LengthPrefixedPacketBuffer stream;
+    stream.Append(Packet(wire));
+    buf::MultiBuffer output;
+    ASSERT_EQ(stream.Pop(output), buf::LengthPrefixedPacketBuffer::PopResult::Packet);
+    EXPECT_EQ(Flatten(output), std::vector<uint8_t>({0x73}));
+    stream.Finish();
+    stream.Finish();
+    EXPECT_THROW(stream.Append({}), IoSystemError);
+    EXPECT_THROW(stream.Append(Packet(wire)), IoSystemError);
+    EXPECT_EQ(stream.Pop(output), buf::LengthPrefixedPacketBuffer::PopResult::Finished);
+    EXPECT_TRUE(output.empty());
+    stream.Reset();
+    stream.Append(Packet(wire));
+    ASSERT_EQ(stream.Pop(output), buf::LengthPrefixedPacketBuffer::PopResult::Packet);
+    EXPECT_EQ(Flatten(output), std::vector<uint8_t>({0x73}));
+    stream.Finish();
 }

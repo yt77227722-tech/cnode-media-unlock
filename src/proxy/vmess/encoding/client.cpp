@@ -2,6 +2,7 @@
 #include "common/error.hpp"
 #include "common/address_codec.hpp"
 #include "common/byte_reader.hpp"
+#include <asio/this_coro.hpp>
 #include <openssl/mem.h>
 #include <openssl/rand.h>
 #include <chrono>
@@ -148,8 +149,20 @@ ClientSession::ClientSession(const MemoryAccount& user,
                         keys_.request, keys_.response) {}
 
 net::awaitable<VMessHandshakeResult> ClientSession::EncodeRequestHeader(AsyncStream& stream) {
+    if (request_encoder_.Failed()) {
+        co_return tl::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
+    }
     if (request_header_sent_) {
         co_return VMessHandshakeResult{};
+    }
+    try {
+        request_encoder_.CheckWritable();
+    } catch (const transport::WriteClosed&) {
+        co_return tl::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
+    }
+    if ((co_await net::this_coro::cancellation_state).cancelled() !=
+        net::cancellation_type::none) {
+        co_return tl::unexpected(ErrorCode::CANCELLED);
     }
     std::array<uint8_t, kRequestPacketMax> packet{};
     struct PacketCleanseGuard {
@@ -159,22 +172,33 @@ net::awaitable<VMessHandshakeResult> ClientSession::EncodeRequestHeader(AsyncStr
     auto built = BuildRequestHeaderPacket(
         *user_, *auth_id_key_, *target_, security_, command_, keys_.request,
         keys_.response_header, forwarded_, packet);
-    forwarded_ = {};
-    OPENSSL_cleanse(keys_.request.key.data(), keys_.request.key.size());
-    OPENSSL_cleanse(keys_.request.iv.data(), keys_.request.iv.size());
     if (!built) {
         co_return tl::unexpected(built.error());
     }
+    forwarded_ = {};
+    OPENSSL_cleanse(keys_.request.key.data(), keys_.request.key.size());
+    OPENSSL_cleanse(keys_.request.iv.data(), keys_.request.iv.size());
+    auto fail_request = [&]() {
+        request_encoder_.Abort();
+        stream.CloseAbortive();
+    };
     try {
         const std::array<net::const_buffer, 1> buffers{net::buffer(packet.data(), *built)};
         co_await stream.WriteBuffers(buffers);
+    } catch (const transport::WriteClosed&) {
+        request_encoder_.Finish();
+        co_return tl::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
     } catch (const transport::LinkError& e) {
+        fail_request();
         co_return tl::unexpected(e.code());
     } catch (const std::bad_alloc&) {
+        fail_request();
         co_return tl::unexpected(ErrorCode::RESOURCE_EXHAUSTED);
     } catch (const IoSystemError& e) {
+        fail_request();
         co_return tl::unexpected(MapAsioError(e.code()));
     } catch (...) {
+        fail_request();
         co_return tl::unexpected(ErrorCode::SOCKET_WRITE_FAILED);
     }
     request_header_sent_ = true;
@@ -188,35 +212,90 @@ net::awaitable<VMessHandshakeResult> ClientSession::EncodeRequestHeader(AsyncStr
 net::awaitable<void> ClientSession::EncodeRequestBody(
     AsyncStream& stream,
     buf::MultiBuffer mb) {
-    buf::MultiBuffer chunks;
-    request_encoder_.Encode(mb, chunks);
-    mb.clear();
-    if (chunks.byte_size() != 0) {
-        co_await stream.WriteMultiBuffer(std::move(chunks));
+    request_encoder_.CheckWritable();
+    if ((co_await net::this_coro::cancellation_state).cancelled() !=
+        net::cancellation_type::none) {
+        throw IoSystemError(io_error::operation_aborted,
+                            "VMess request write cancelled before start");
+    }
+    bool write_started = false;
+    try {
+        buf::MultiBuffer chunks;
+        request_encoder_.Encode(mb, chunks);
+        mb.clear();
+        if (chunks.byte_size() != 0) {
+            write_started = true;
+            co_await stream.WriteMultiBuffer(std::move(chunks));
+        }
+    } catch (const transport::WriteClosed&) {
+        request_encoder_.Finish();
+        throw;
+    } catch (...) {
+        if (write_started || request_encoder_.Failed()) {
+            request_encoder_.Abort();
+            stream.CloseAbortive();
+        }
+        throw;
     }
 }
 
 net::awaitable<void> ClientSession::EncodeRequestBody(
     AsyncStream& stream,
     std::span<const net::const_buffer> buffers) {
-    buf::MultiBuffer chunks;
-    request_encoder_.Encode(buffers, chunks);
-    if (chunks.byte_size() != 0) {
-        co_await stream.WriteMultiBuffer(std::move(chunks));
+    request_encoder_.CheckWritable();
+    if ((co_await net::this_coro::cancellation_state).cancelled() !=
+        net::cancellation_type::none) {
+        throw IoSystemError(io_error::operation_aborted,
+                            "VMess request write cancelled before start");
+    }
+    bool write_started = false;
+    try {
+        buf::MultiBuffer chunks;
+        request_encoder_.Encode(buffers, chunks);
+        if (chunks.byte_size() != 0) {
+            write_started = true;
+            co_await stream.WriteMultiBuffer(std::move(chunks));
+        }
+    } catch (const transport::WriteClosed&) {
+        request_encoder_.Finish();
+        throw;
+    } catch (...) {
+        if (write_started || request_encoder_.Failed()) {
+            request_encoder_.Abort();
+            stream.CloseAbortive();
+        }
+        throw;
     }
 }
 
 net::awaitable<void> ClientSession::EncodeRequestBodyEOF(AsyncStream& stream) {
-    if (request_eof_sent_) {
-        co_return;
+    if (request_encoder_.Finished()) co_return;
+    request_encoder_.CheckWritable();
+    if ((co_await net::this_coro::cancellation_state).cancelled() !=
+        net::cancellation_type::none) {
+        throw IoSystemError(io_error::operation_aborted,
+                            "VMess request EOF cancelled before start");
     }
-    std::array<uint8_t, 128> eof_chunk{};
-    const size_t eof_len = request_encoder_.EncodeEndTo(eof_chunk);
-    const std::array<net::const_buffer, 1> buffers{
-        net::buffer(eof_chunk.data(), eof_len),
-    };
-    co_await stream.WriteBuffers(buffers);
-    request_eof_sent_ = true;
+    bool write_started = false;
+    try {
+        std::array<uint8_t, 128> eof_chunk{};
+        const size_t eof_len = request_encoder_.EncodeEndTo(eof_chunk);
+        if (eof_len == 0) co_return;
+        const std::array<net::const_buffer, 1> buffers{
+            net::buffer(eof_chunk.data(), eof_len),
+        };
+        write_started = true;
+        co_await stream.WriteBuffers(buffers);
+    } catch (const transport::WriteClosed&) {
+        request_encoder_.Finish();
+        throw;
+    } catch (...) {
+        if (write_started || request_encoder_.Failed()) {
+            request_encoder_.Abort();
+            stream.CloseAbortive();
+        }
+        throw;
+    }
 }
 
 net::awaitable<void> ClientSession::DecodeResponseHeader(AsyncStream& stream) {
@@ -225,15 +304,17 @@ net::awaitable<void> ClientSession::DecodeResponseHeader(AsyncStream& stream) {
         response_length_read_ = 0;
         response_header_read_ = 0;
     };
-    auto fail = [&]() {
+    auto fail_response = [&]() noexcept {
+        response_decoder_.Abort();
         reset_header_state();
-        ThrowResponseHeaderError();
+        OPENSSL_cleanse(keys_.response.key.data(), keys_.response.key.size());
+        OPENSSL_cleanse(keys_.response.iv.data(), keys_.response.iv.size());
     };
     try {
         if (response_header_sealed_.empty()) {
             if (!co_await response_decoder_.ReadExact(
                     stream, response_length_, response_length_read_)) {
-                fail();
+                ThrowResponseHeaderError();
             }
             const auto length_key = ResponseHeaderLengthKey(keys_.response.key, keys_.response.iv);
             std::array<uint8_t, 2> length{};
@@ -244,18 +325,18 @@ net::awaitable<void> ClientSession::DecodeResponseHeader(AsyncStream& stream) {
                                     nullptr, 0,
                                     length.data(), length.size(), length_size) ||
                 length_size != length.size()) {
-                fail();
+                ThrowResponseHeaderError();
             }
             const size_t header_len = (static_cast<size_t>(length[0]) << 8) | length[1];
             if (header_len < 4 || header_len > kResponseHeaderMax) {
-                fail();
+                ThrowResponseHeaderError();
             }
             response_header_sealed_.resize(header_len + 16);
         }
 
         if (!co_await response_decoder_.ReadExact(
                 stream, response_header_sealed_, response_header_read_)) {
-            fail();
+            ThrowResponseHeaderError();
         }
         const auto payload_key = ResponseHeaderPayloadKey(keys_.response.key, keys_.response.iv);
         const size_t header_len = response_header_sealed_.size() - 16;
@@ -267,7 +348,7 @@ net::awaitable<void> ClientSession::DecodeResponseHeader(AsyncStream& stream) {
                                 response_header_sealed_.data(), header_len, opened) ||
             opened != header_len ||
             response_header_sealed_[0] != keys_.response_header) {
-            fail();
+            ThrowResponseHeaderError();
         }
         response_header_received_ = true;
         OPENSSL_cleanse(keys_.response.key.data(), keys_.response.key.size());
@@ -275,11 +356,11 @@ net::awaitable<void> ClientSession::DecodeResponseHeader(AsyncStream& stream) {
         reset_header_state();
     } catch (const IoSystemError& error) {
         if (error.code() != io_error::operation_aborted) {
-            reset_header_state();
+            fail_response();
         }
         throw;
     } catch (...) {
-        reset_header_state();
+        fail_response();
         throw;
     }
 }

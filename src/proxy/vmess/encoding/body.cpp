@@ -125,7 +125,21 @@ BodyEncoder::BodyEncoder(const BodyOptions& options,
                                   size_t{buf::Buffer::kSize} - reserved);
 }
 
+void BodyEncoder::CheckWritable() const {
+    if (state_ == State::Failed) {
+        ThrowWriteError("VMess body writer is failed");
+    }
+    if (state_ == State::Finished) {
+        throw transport::WriteClosed();
+    }
+}
+
 void BodyEncoder::Encode(const buf::MultiBuffer& payload, buf::MultiBuffer& out) {
+    CheckWritable();
+    if (&payload == &out) {
+        throw IoSystemError(io_error::invalid_argument,
+                            "VMess body input and output must be distinct");
+    }
     if (PacketMode() &&
         (payload.byte_size() != 0 || buf::InspectUdpDatagram(payload).Valid())) {
         const buf::ContiguousBufferView packet(payload);
@@ -143,6 +157,7 @@ void BodyEncoder::Encode(const buf::MultiBuffer& payload, buf::MultiBuffer& out)
 }
 
 void BodyEncoder::Encode(std::span<const net::const_buffer> payload, buf::MultiBuffer& out) {
+    CheckWritable();
     if (PacketMode()) {
         const buf::ContiguousBufferView packet(payload);
         EncodePacket(packet.Bytes(), out);
@@ -162,7 +177,10 @@ void BodyEncoder::Encode(std::span<const net::const_buffer> payload, buf::MultiB
 }
 
 void BodyEncoder::EncodeEnd(buf::MultiBuffer& out) {
+    if (state_ == State::Finished) return;
+    CheckWritable();
     EncodeChunk({}, out);
+    Finish();
 }
 
 void BodyEncoder::EncodeStream(std::span<const uint8_t> bytes, buf::MultiBuffer& out) {
@@ -174,26 +192,34 @@ void BodyEncoder::EncodeStream(std::span<const uint8_t> bytes, buf::MultiBuffer&
 }
 
 size_t BodyEncoder::EncodeEndTo(std::span<uint8_t, 128> out) {
-    const size_t padding = cipher_.NextPaddingSize();
-    const size_t length_size = cipher_.LengthSize();
-    const size_t capacity = length_size + cipher_.Overhead() + padding;
-    if (capacity > out.size()) {
-        ThrowWriteError("VMess EOF chunk exceeds inline buffer");
+    if (state_ == State::Finished) return 0;
+    CheckWritable();
+    try {
+        const size_t padding = cipher_.NextPaddingSize();
+        const size_t length_size = cipher_.LengthSize();
+        const size_t capacity = length_size + cipher_.Overhead() + padding;
+        if (capacity > out.size()) {
+            ThrowWriteError("VMess EOF chunk exceeds inline buffer");
+        }
+        uint8_t* dst = out.data();
+        const ssize_t sealed = cipher_.Payload().Encrypt(nullptr, 0, dst + length_size);
+        if (sealed < 0) {
+            ThrowWriteError("VMess body encrypt failed");
+        }
+        const size_t chunk_size = static_cast<size_t>(sealed) + padding;
+        if (!cipher_.EncodeLength(chunk_size, dst)) {
+            ThrowWriteError("VMess body length encode failed");
+        }
+        if (padding > 0 &&
+            RAND_bytes(dst + length_size + sealed, static_cast<int>(padding)) != 1) {
+            ThrowWriteError("VMess body padding generation failed");
+        }
+        Finish();
+        return length_size + chunk_size;
+    } catch (...) {
+        Abort();
+        throw;
     }
-    uint8_t* dst = out.data();
-    const ssize_t sealed = cipher_.Payload().Encrypt(nullptr, 0, dst + length_size);
-    if (sealed < 0) {
-        ThrowWriteError("VMess body encrypt failed");
-    }
-    const size_t chunk_size = static_cast<size_t>(sealed) + padding;
-    if (!cipher_.EncodeLength(chunk_size, dst)) {
-        ThrowWriteError("VMess body length encode failed");
-    }
-    if (padding > 0 &&
-        RAND_bytes(dst + length_size + sealed, static_cast<int>(padding)) != 1) {
-        ThrowWriteError("VMess body padding generation failed");
-    }
-    return length_size + chunk_size;
 }
 
 void BodyEncoder::EncodePacket(std::span<const uint8_t> bytes, buf::MultiBuffer& out) {
@@ -209,7 +235,7 @@ void BodyEncoder::EncodePacket(std::span<const uint8_t> bytes, buf::MultiBuffer&
     EncodeChunk(bytes, out);
 }
 
-void BodyEncoder::EncodeChunk(std::span<const uint8_t> bytes, buf::MultiBuffer& out) {
+void BodyEncoder::EncodeChunk(std::span<const uint8_t> bytes, buf::MultiBuffer& out) try {
     const size_t padding = cipher_.NextPaddingSize();
     const size_t length_size = cipher_.LengthSize();
     const size_t capacity = length_size + bytes.size() + cipher_.Overhead() + padding;
@@ -233,6 +259,9 @@ void BodyEncoder::EncodeChunk(std::span<const uint8_t> bytes, buf::MultiBuffer& 
     }
 
     encoded.AppendTo(length_size + chunk_size, out);
+} catch (...) {
+    Abort();
+    throw;
 }
 
 // ============================================================================
@@ -247,6 +276,12 @@ BodyDecoder::BodyDecoder(const BodyOptions& options,
 net::awaitable<bool> BodyDecoder::ReadExact(transport::MultiBufferReader& src,
                                             std::span<uint8_t> out,
                                             size_t& filled) {
+    if (state_ == State::Failed) {
+        Fail("VMess body reader is failed");
+    }
+    if (state_ == State::Finished) {
+        co_return false;
+    }
     while (filled < out.size()) {
         if (pending_read_.byte_size() == 0) {
             pending_read_.ReleaseIfIdle();
@@ -262,13 +297,12 @@ net::awaitable<bool> BodyDecoder::ReadExact(transport::MultiBufferReader& src,
 }
 
 net::awaitable<buf::MultiBuffer> BodyDecoder::Read(transport::MultiBufferReader& src) {
-    if (cipher_.PacketMode()) {
-        co_return co_await ReadChunk(src);
-    }
-
     // A later chunk in a stream batch can suspend after earlier chunks decoded.
     // Keep that output owned by the decoder until this invocation returns it.
     try {
+        if (cipher_.PacketMode()) {
+            co_return co_await ReadChunk(src);
+        }
         while (pending_output_chunks_ < kStreamReadBatchChunks) {
             if (pending_output_.byte_size() != 0 && !header_decoded_ && header_read_ == 0 &&
                 pending_read_.byte_size() == 0) {
@@ -281,23 +315,24 @@ net::awaitable<buf::MultiBuffer> BodyDecoder::Read(transport::MultiBufferReader&
             chunk.MoveTo(pending_output_);
             ++pending_output_chunks_;
         }
+        pending_output_chunks_ = 0;
+        co_return std::move(pending_output_);
     } catch (const IoSystemError& error) {
         if (error.code() != io_error::operation_aborted) {
-            pending_output_.clear();
-            pending_output_chunks_ = 0;
+            Abort();
         }
         throw;
     } catch (...) {
-        pending_output_.clear();
-        pending_output_chunks_ = 0;
+        Abort();
         throw;
     }
-    pending_output_chunks_ = 0;
-    co_return std::move(pending_output_);
 }
 
 net::awaitable<buf::MultiBuffer> BodyDecoder::ReadChunk(transport::MultiBufferReader& src) {
-    if (eof_) {
+    if (state_ == State::Failed) {
+        Fail("VMess body reader is failed");
+    }
+    if (state_ == State::Finished) {
         co_return buf::MultiBuffer{};
     }
 
@@ -309,7 +344,7 @@ net::awaitable<buf::MultiBuffer> BodyDecoder::ReadChunk(transport::MultiBufferRe
             if (header_read_ != 0) {
                 Fail("VMess body length truncated");
             }
-            eof_ = true;
+            state_ = State::Finished;
             FinishRecord();
             co_return buf::MultiBuffer{};
         }
@@ -340,7 +375,7 @@ net::awaitable<buf::MultiBuffer> BodyDecoder::ReadChunk(transport::MultiBufferRe
             cipher_.Payload().Decrypt(header_.data(), overhead, header_.data()) != 0) {
             Fail("VMess body EOF authentication failed");
         }
-        eof_ = true;
+        state_ = State::Finished;
         FinishRecord();
         co_return buf::MultiBuffer{};
     }
@@ -377,9 +412,16 @@ net::awaitable<buf::MultiBuffer> BodyDecoder::ReadChunk(transport::MultiBufferRe
     co_return out;
 }
 
-void BodyDecoder::Fail(const char* what) {
-    eof_ = true;
+void BodyDecoder::Abort() noexcept {
+    state_ = State::Failed;
+    pending_read_.clear();
+    pending_output_.clear();
+    pending_output_chunks_ = 0;
     FinishRecord();
+}
+
+void BodyDecoder::Fail(const char* what) {
+    Abort();
     throw IoSystemError(io_error::connection_reset, what);
 }
 
