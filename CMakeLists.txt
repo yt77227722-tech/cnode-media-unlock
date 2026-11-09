@@ -2,6 +2,7 @@ cmake_minimum_required(VERSION 3.24)
 
 # Manifest features must be selected before project() loads the vcpkg toolchain.
 option(BUILD_TESTING "Configure unit and E2E tests (build with target cnode_tests)" OFF)
+option(BUILD_BENCHMARKS "Configure opt-in benchmarks (requires BUILD_TESTING)" OFF)
 if(BUILD_TESTING)
     list(APPEND VCPKG_MANIFEST_FEATURES tests)
 endif()
@@ -278,8 +279,8 @@ set_property(SOURCE src/app/bootstrap.cpp src/app/bootstrap_cli.cpp
     BUILD_CHANNEL="$<IF:$<CONFIG:Debug>,debug,release>")
 
 add_executable(cnode src/main.cpp)
-# Only the daemon overrides malloc/new. Tests retain their allocation-failure hooks;
-# their explicit mi_* calls still use the same mimalloc API through build_options.
+# The daemon and allocation/executor/TCP send benchmarks override malloc/new.
+# Regression tests retain allocation-failure hooks; explicit mi_* calls use the same API.
 target_link_libraries(cnode PRIVATE
     "$<LINK_LIBRARY:WHOLE_ARCHIVE,cnode_core,mimalloc-static>")
 
@@ -394,10 +395,13 @@ cnode_unit(relay_initial_payload LIBRARY cnode_test_core)
 cnode_unit(router)
 cnode_unit(routing_ip_network)
 cnode_unit(rule_lifecycle)
+cnode_unit(runtime_sampling LIBRARY "$<LINK_LIBRARY:WHOLE_ARCHIVE,cnode_core>")
 cnode_unit(session_access_log)
 cnode_unit(session_group_executor)
+cnode_unit(shadowsocks_identity INCLUDES src/proxy/shadowsocks)
 cnode_unit(shadowsocks_stream_crypto LIBRARY cnode_build_options SOURCES src/proxy/shadowsocks/shadowsocks_protocol.cpp INCLUDES src/proxy/shadowsocks)
 cnode_unit(shadowsocks_udp_datagram INCLUDES src/proxy/shadowsocks)
+cnode_unit(shadowsocks_udp_identity INCLUDES src/proxy/shadowsocks)
 cnode_unit(sniff_config)
 cnode_unit(ss_outbound_credentials INCLUDES src/proxy/shadowsocks)
 cnode_unit(ss_outbound_uot INCLUDES src/proxy/shadowsocks/outbound)
@@ -406,6 +410,7 @@ cnode_unit(startup_inbounds INCLUDES src/app)
 cnode_unit(stream_settings)
 cnode_unit(substream_inbound_lifecycle LIBRARY cnode_test_core INCLUDES src/proxy/anytls/inbound src/proxy/mux/inbound)
 cnode_unit(target_address)
+cnode_unit(tcp_read LIBRARY cnode_test_core)
 cnode_unit(thread_memory_pool LIBRARY cnode_build_options)
 cnode_unit(timeout_scheduler LIBRARY cnode_build_options SOURCES tests/timeout_scheduler_new.cpp src/transport/internet/timeout_scheduler.cpp src/app/session_group_executor.cpp src/infra/runtime_failure.cpp src/infra/log.cpp)
 cnode_unit(tls_client_certificate INCLUDES src/transport/internet)
@@ -504,8 +509,70 @@ function(cnode_e2e name source)
         TEST_PREFIX "e2e.${name}." PROPERTIES LABELS e2e TIMEOUT ${timeout})
 endfunction()
 
+if(BUILD_BENCHMARKS)
+    add_custom_target(cnode_benchmarks)
+    add_executable(cnode_allocator_append_benchmark EXCLUDE_FROM_ALL
+        tests/allocator_append_benchmark.cpp)
+    target_link_libraries(cnode_allocator_append_benchmark PRIVATE
+        cnode_build_options "$<LINK_LIBRARY:WHOLE_ARCHIVE,mimalloc-static>" GTest::gtest_main)
+    add_executable(cnode_tls_throughput_benchmark EXCLUDE_FROM_ALL
+        tests/e2e/tls_throughput_benchmark.cpp)
+    target_link_libraries(cnode_tls_throughput_benchmark PRIVATE
+        cnode_e2e_support GTest::gtest_main)
+    add_dependencies(cnode_tls_throughput_benchmark cnode)
+    add_executable(cnode_tcp_receive_benchmark EXCLUDE_FROM_ALL
+        tests/tcp_receive_benchmark.cpp)
+    target_link_libraries(cnode_tcp_receive_benchmark PRIVATE
+        cnode_core GTest::gtest_main)
+    add_executable(cnode_executor_benchmark EXCLUDE_FROM_ALL
+        tests/executor_benchmark.cpp)
+    target_link_libraries(cnode_executor_benchmark PRIVATE
+        "$<LINK_LIBRARY:WHOLE_ARCHIVE,cnode_core,mimalloc-static>" GTest::gtest_main)
+    add_executable(cnode_tcp_send_benchmark EXCLUDE_FROM_ALL
+        tests/tcp_send_benchmark.cpp)
+    target_link_libraries(cnode_tcp_send_benchmark PRIVATE
+        "$<LINK_LIBRARY:WHOLE_ARCHIVE,cnode_core,mimalloc-static>" GTest::gtest_main)
+    add_executable(cnode_udp_send_benchmark EXCLUDE_FROM_ALL
+        tests/udp_send_benchmark.cpp)
+    target_link_libraries(cnode_udp_send_benchmark PRIVATE
+        "$<LINK_LIBRARY:WHOLE_ARCHIVE,cnode_core,mimalloc-static>" GTest::gtest_main)
+    add_executable(cnode_shadowsocks_identity_benchmark EXCLUDE_FROM_ALL
+        tests/shadowsocks_identity_benchmark.cpp)
+    target_include_directories(cnode_shadowsocks_identity_benchmark PRIVATE
+        src/proxy/shadowsocks)
+    target_link_libraries(cnode_shadowsocks_identity_benchmark PRIVATE
+        cnode_core "$<LINK_LIBRARY:WHOLE_ARCHIVE,mimalloc-static>" GTest::gtest_main)
+    add_executable(cnode_shadowsocks_udp_identity_benchmark EXCLUDE_FROM_ALL
+        tests/shadowsocks_udp_identity_benchmark.cpp)
+    target_include_directories(cnode_shadowsocks_udp_identity_benchmark PRIVATE
+        src/proxy/shadowsocks)
+    target_link_libraries(cnode_shadowsocks_udp_identity_benchmark PRIVATE
+        cnode_core "$<LINK_LIBRARY:WHOLE_ARCHIVE,mimalloc-static>" GTest::gtest_main)
+    add_executable(cnode_runtime_sampling_benchmark EXCLUDE_FROM_ALL
+        tests/runtime_sampling_benchmark.cpp)
+    target_link_libraries(cnode_runtime_sampling_benchmark PRIVATE
+        "$<LINK_LIBRARY:WHOLE_ARCHIVE,cnode_core,mimalloc-static>" GTest::gtest_main)
+    foreach(target IN ITEMS cnode_udp_send_benchmark cnode_shadowsocks_identity_benchmark
+                            cnode_shadowsocks_udp_identity_benchmark cnode_runtime_sampling_benchmark)
+        target_sources(${target} PRIVATE tests/benchmark_memory.cpp)
+        target_link_options(${target} PRIVATE
+            "-Wl,--wrap=_Znwm" "-Wl,--wrap=_Znam"
+            "-Wl,--wrap=_ZnwmSt11align_val_t" "-Wl,--wrap=_ZnamSt11align_val_t"
+            "-Wl,--wrap=mi_malloc_aligned")
+    endforeach()
+    foreach(target IN ITEMS cnode_allocator_append_benchmark cnode_tls_throughput_benchmark
+                            cnode_tcp_receive_benchmark cnode_executor_benchmark
+                            cnode_tcp_send_benchmark cnode_udp_send_benchmark cnode_shadowsocks_identity_benchmark
+                            cnode_shadowsocks_udp_identity_benchmark cnode_runtime_sampling_benchmark)
+        target_compile_options(${target} PRIVATE -UNDEBUG)
+        add_dependencies(cnode_benchmarks ${target})
+        gtest_discover_tests(${target} DISCOVERY_MODE PRE_TEST
+            TEST_PREFIX "benchmark." PROPERTIES LABELS benchmark RUN_SERIAL TRUE TIMEOUT 180)
+    endforeach()
+endif()
+
 file(GLOB e2e_sources CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/tests/e2e/*.cpp")
-list(FILTER e2e_sources EXCLUDE REGEX "/(support|reference_[^/]+|anytls_sessions_reference)\\.cpp$")
+list(FILTER e2e_sources EXCLUDE REGEX "/(support|reference_[^/]+|anytls_sessions_reference|[^/]+_benchmark)\\.cpp$")
 foreach(source IN LISTS e2e_sources)
     get_filename_component(name "${source}" NAME_WE)
     cnode_e2e("${name}" "${source}")

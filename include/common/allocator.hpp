@@ -244,11 +244,7 @@ public:
     void Purge() noexcept {
         DrainRemoteFrees();
         if (!pooling_ || !pooling_->idle_head) return;
-        const auto now = Clock::now();
-        while (pooling_->idle_head &&
-               now - pooling_->idle_head->idle_at >= kThreadMemoryPoolPurgeDelay) {
-            ReleaseChunk(*pooling_->idle_head);
-        }
+        ReleaseExpiredChunks(Clock::now());
     }
 
     void PurgeIdle() noexcept {
@@ -472,13 +468,27 @@ private:
             head, &header, std::memory_order_release, std::memory_order_relaxed));
     }
     void DrainRemoteFrees() noexcept {
+        // The probe only tests emptiness; ReclaimRemoteBatch acquires QueueRemote's release.
+        // A push after an empty probe remains queued for the next drain.
+        if (remote_frees_.load(std::memory_order_relaxed) == nullptr) return;
         if (owner_token_ != 0 && owner_token_ != detail::CurrentThreadToken()) return;
+        ReclaimRemoteBatch();
+    }
+    // Keep the nonempty batch walk out of local allocation and return callers.
+    [[gnu::noinline]] void ReclaimRemoteBatch() noexcept {
         auto* current = remote_frees_.exchange(nullptr, std::memory_order_acquire);
         while (current) {
             auto* next = current->next_free;
             auto* chunk = reinterpret_cast<Chunk*>(current->owner);
             DeallocateLocal(*current, *chunk);
             current = next;
+        }
+    }
+    // Keep expiry scanning shared; reuse the phase clock without re-entering remote drains.
+    [[gnu::noinline]] void ReleaseExpiredChunks(Clock::time_point now) noexcept {
+        while (pooling_->idle_head &&
+               now - pooling_->idle_head->idle_at >= kThreadMemoryPoolPurgeDelay) {
+            ReleaseChunk(*pooling_->idle_head);
         }
     }
     void DeallocateLocal(SlotHeader& header, Chunk& chunk) noexcept {
@@ -493,7 +503,7 @@ private:
                 } else {
                     const bool first_idle = pooling_->idle_head == nullptr;
                     MarkLargeIdle(chunk);
-                    if (!first_idle) Purge();
+                    if (!first_idle) ReleaseExpiredChunks(chunk.idle_at);
                     if (first_idle && wakeup_) wakeup_->OnPoolIdle();
                 }
             } else {
@@ -504,7 +514,7 @@ private:
                 chunk.bump = reinterpret_cast<std::byte*>(&chunk) + ChunkLead();
                 const bool first_idle = pooling_->idle_head == nullptr;
                 MarkIdle(chunk);
-                if (!first_idle) Purge();
+                if (!first_idle) ReleaseExpiredChunks(chunk.idle_at);
                 if (first_idle && wakeup_) wakeup_->OnPoolIdle();
             }
             return;
@@ -1082,6 +1092,14 @@ inline void CollectBurst() noexcept {
 
 template <class T>
 class ThreadLocalAllocator {
+    template <class U>
+    struct UsesAllocatorConstruction
+        : std::uses_allocator<U, std::pmr::polymorphic_allocator<T>> {};
+    // [allocator.uses.construction] propagates into pair members even though
+    // uses_allocator<pair<...>> itself is false.
+    template <class First, class Second>
+    struct UsesAllocatorConstruction<std::pair<First, Second>> : std::true_type {};
+
 public:
     using value_type = T;
     using propagate_on_container_move_assignment = std::true_type;
@@ -1131,9 +1149,11 @@ public:
         std::pmr::polymorphic_allocator<T>(resource_).deallocate(pointer, count);
     }
     template <class U, class... Args>
+        requires (UsesAllocatorConstruction<std::remove_cv_t<U>>::value)
     void construct(U* pointer, Args&&... args) {
         auto lifetime = PinResource();
-        // Preserve uses-allocator construction for nested strings/containers.
+        // Ordinary elements use allocator_traits' construct_at fallback without
+        // touching the resource; only allocator-consuming construction pins it.
         std::pmr::polymorphic_allocator<T>(resource_).construct(
             pointer, std::forward<Args>(args)...);
     }
@@ -1383,7 +1403,7 @@ public:
 private:
     template <class... Args>
     void ConstructAt(T* ptr, Args&&... args) {
-        auto lifetime = PinResource();
+        // The live backing allocation already retains its domain resource.
         std::pmr::polymorphic_allocator<T>(resource_).construct(
             ptr, std::forward<Args>(args)...);
     }
@@ -1398,14 +1418,15 @@ private:
         }
     }
 
-    void ReleaseStorage() noexcept {
-        if (data_) {
-            auto lifetime = PinResource();
-            resource_->deallocate(data_, capacity_ * sizeof(T), alignof(T));
-            data_ = nullptr;
-            capacity_ = 0;
-        }
+    // Keep the shared drain path out of callers to bound executable footprint.
+    [[gnu::noinline]] void ReleaseStorage() noexcept {
+        auto* data = std::exchange(data_, nullptr);
+        const auto capacity = std::exchange(capacity_, 0);
         head_ = 0;
+        if (data) {
+            // Detach storage before releasing its last domain lifetime.
+            resource_->deallocate(data, capacity * sizeof(T), alignof(T));
+        }
     }
 
     void Reserve(std::size_t min_cap) {
@@ -1447,8 +1468,9 @@ private:
         capacity_ = next_cap;
     }
 
+    // Keep allocation and relocation out of the common insertion path.
     template <typename... Args>
-    T& GrowEmplace(bool at_back, Args&&... args) {
+    [[gnu::noinline]] T& GrowEmplace(bool at_back, Args&&... args) {
         if (capacity_ > (std::numeric_limits<std::size_t>::max() / sizeof(T)) / 2) {
             throw std::bad_alloc();
         }

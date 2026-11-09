@@ -128,6 +128,8 @@ public:
     };
 
     struct ShadowsocksUsersView {
+        // Identity-enabled vectors are ordered by key length, key bytes, then
+        // PSK hash; others retain input order. Indices are snapshot-local hints.
         std::shared_ptr<const ShadowsocksUserList> users;
 
         [[nodiscard]] bool empty() const noexcept { return !users || users->empty(); }
@@ -135,6 +137,11 @@ public:
         [[nodiscard]] const ShadowsocksCredential& operator[](size_t index) const noexcept {
             return (*users)[index];
         }
+        // Queries require a canonical snapshot and a valid index/range within
+        // one identity-key group. Hash lookup is not authentication.
+        [[nodiscard]] size_t IdentityGroupEnd(size_t begin) const noexcept;
+        [[nodiscard]] size_t IdentityHashLowerBound(
+            size_t begin, size_t end, const std::array<uint8_t, 16>& hash) const noexcept;
         [[nodiscard]] std::shared_ptr<const ShadowsocksCredential>
         Share(const ShadowsocksCredential& user) const noexcept {
             return users

@@ -366,6 +366,25 @@ std::shared_ptr<ExecutionDomain> ExecutionDomain::Current() noexcept {
 bool ExecutionDomain::CanExecuteInline() const noexcept {
     return current_domain == this && !validating_domain;
 }
+ExecutionDomain::LocalLease::LocalLease(ExecutionDomain& domain) noexcept {
+    if (current_domain || validating_domain) return;
+    const auto* route = domain.state_->route.load(std::memory_order_acquire);
+    if (!route->target.reactor->get_executor().running_in_this_thread() ||
+        domain.state_->frozen.load(std::memory_order_seq_cst))
+        return;
+    // A handoff can publish a new route only after freezing on the old owner.
+    // Recheck the route after frozen: an old-owner callback may observe thaw
+    // following a completed handoff, but must not borrow the new owner's shard.
+    if (domain.state_->route.load(std::memory_order_acquire) != route) return;
+    domain_ = &domain;
+    current_domain = domain_;
+    domain_->state_->hooks->Enter();
+}
+ExecutionDomain::LocalLease::~LocalLease() {
+    if (!domain_) return;
+    domain_->state_->hooks->Leave();
+    current_domain = nullptr;
+}
 ExecutionDomain::NativeResource::~NativeResource() {
     if (domain_) domain_->UnregisterResource(*this);
 }
@@ -403,7 +422,15 @@ void ExecutionDomain::Notify(bool force) noexcept {
     if (!force && was_notified) return;
     auto* route = state_->route.load(std::memory_order_acquire);
     try {
-        net::post(route->target.executor, [self = shared_from_this(), route] { self->Run(route); });
+        auto notification = [self = shared_from_this(), route] { self->Run(route); };
+        // Native reactors need no second function-erasure allocation. Preserve
+        // custom executor semantics, deferred delivery and the captured route.
+        if (const auto* native =
+                route->target.executor.target<net::io_context::executor_type>()) {
+            net::post(*native, std::move(notification));
+        } else {
+            net::post(route->target.executor, std::move(notification));
+        }
     } catch (...) {
         FailRuntime("session-domain", "cannot deliver reserved readiness notification");
     }
